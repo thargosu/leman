@@ -171,7 +171,7 @@ before encryption).
 + ~export_keys~/~import_keys~: room key export files.
 + Verification commands (emoji/QR SAS via MSC4108).
 
-* E2: encrypting outgoing events (specified, in development)
+* E2: encrypting outgoing events (implemented 2026-09-13)
 
 ** ~encrypt_room_event~
 
@@ -231,7 +231,7 @@ bounded (e.g. 3 attempts) to avoid loops.
 6. Pump outgoing requests once more (key distribution continues in
    the background for newly seen devices).
 
-* E3: device verification (specified, in development)
+* E3: device verification (implemented 2026-09-13; emoji SAS)
 
 Verification uses the state machine's interactive verification
 (SAS/emoji).  All verification traffic is to-device events: they

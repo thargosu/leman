@@ -99,9 +99,20 @@ Phasing:
      homeserver.
    + Follow-up: encrypt reactions (m.reaction) and other non-message
      event types in encrypted rooms.
-3. *Verification* ("E3"): emoji/QR verification via the state
-   machine; key import/export (export file GPG-encrypted by elisp).
-   Until then, other clients warn that leman's device is not verified.
+3. *Verification* ("E3"): emoji SAS verification of devices.
+   DONE 2026-09-13 (emoji; QR and key import/export are follow-ups).
+   + Working: the full SAS dance over to-device events —
+     ~devices~, ~request_verification~/~verification_requests~,
+     ~accept_verification~, ~start_sas~, ~accept_sas~,
+     ~verification_sas~ (emoji), ~confirm_sas~,
+     ~cancel_verification~ — plus the interactive ~leman-e2ee-verify~
+     command (accepts incoming requests, shows the emoji prompt,
+     confirms or cancels, pumps outgoing requests throughout).
+     A round-trip test drives both sides of the dance through the
+     protocol (agent <-> an in-process second machine).
+   + Until the user verifies, other clients still show the
+     "device not verified" warning; after verification it goes away.
+   + Follow-ups: QR verification, key import/export.
 4. *Key backup* ("E4"): SSSS for cross-device history.
 
 TDD workflow (tests before code; monorepo, agent in ~e2ee/~):

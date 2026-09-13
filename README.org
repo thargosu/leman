@@ -74,9 +74,10 @@ Current support:
 + Room keys and sessions persisted in a local SQLite store
   (~$XDG_DATA_HOME/leman/crypto/~)
 
-Not yet (planned, see ~ROADMAP.org~): device verification (until
-then, other clients will show warnings such as "encrypted by a
-device not verified by its owner"), key backup, and encrypting
++ Emoji SAS device verification (~M-x leman-e2ee-verify~): after
+  verifying, other clients' "device not verified" warnings go away
+
+Not yet (planned, see ~ROADMAP.org~): key backup, and encrypting
 reactions in encrypted rooms.
 
 * Development

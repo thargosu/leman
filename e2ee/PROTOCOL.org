@@ -468,7 +468,7 @@ or null when there is nothing to back up.
 {"id": 24, "cmd": "backup_room_keys"}
 {"id": 24, "ok": {"request": {
   "id": "<txn-id>",
-  "path": "/room_keys/keys/<version>",
+  "path": "/_matrix/client/v3/room_keys/keys/<version>",
   "body": "{...}"}}}
 #+end_src
 

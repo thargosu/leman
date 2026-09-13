@@ -508,6 +508,88 @@ An alist with ~accepted~, ~can_be_presented~, ~done~,
                       (list (cons 'user_id user-id)
                             (cons 'flow_id flow-id))))
 
+(defun leman-e2ee-backup-create (agent)
+  "Generate a fresh backup key on AGENT.
+Return an alist with ~recovery_key~, ~algorithm~, and ~auth_data~
+keys; the client creates the backup version on the homeserver
+with them."
+  (leman-e2ee-request agent "backup_create"))
+
+(defun leman-e2ee-backup-enable (agent recovery-key version)
+  "Import RECOVERY-KEY on AGENT and back up future room keys to VERSION."
+  (leman-e2ee-request agent "backup_enable"
+                      (list (cons 'recovery_key recovery-key)
+                            (cons 'version version))))
+
+(defun leman-e2ee-backup-verify (agent recovery-key backup-info)
+  "Check whether RECOVERY-KEY matches BACKUP-INFO on AGENT.
+BACKUP-INFO is the m.room_key.backup account-data content.
+Return the ~matches~ flag."
+  (alist-get 'matches
+             (leman-e2ee-request agent "backup_verify"
+                                 (list (cons 'recovery_key recovery-key)
+                                       (cons 'backup_info backup-info)))))
+
+(defun leman-e2ee-backup-status (agent)
+  "Return AGENT's backup status.
+An alist with ~enabled~, ~version~, and ~room_key_counts~ keys."
+  (leman-e2ee-request agent "backup_status"))
+
+(defun leman-e2ee-backup-room-keys (agent)
+  "Return the next backup request AGENT wants performed, or nil.
+The request is an alist with ~id~, ~path~, and ~body~ keys (the
+body is a pre-encoded JSON string); the client POSTs it to the
+path and reports the id with
+`leman-e2ee-backup-mark-as-sent'."
+  (alist-get 'request (leman-e2ee-request agent "backup_room_keys")))
+
+(defun leman-e2ee-backup-mark-as-sent (agent request-id)
+  "Tell AGENT that backup request REQUEST-ID was performed."
+  (leman-e2ee-request agent "backup_mark_as_sent"
+                      (list (cons 'id request-id))))
+
+(defun leman-e2ee-backup-import (agent recovery-key rooms)
+  "Import downloaded backup ROOMS into AGENT with RECOVERY-KEY.
+ROOMS is the ~rooms~ value of the GET /room_keys/keys response.
+Return an alist with ~imported~ and ~total~ counts."
+  (leman-e2ee-request agent "backup_import"
+                      (list (cons 'recovery_key recovery-key)
+                            (cons 'rooms rooms))))
+
+(defun leman-e2ee-ssss-create (agent)
+  "Generate the secret storage default key on AGENT.
+Return an alist with ~key_id~, ~recovery_key~, and ~content~ keys
+(the content is the m.secret_storage.key.<key_id> account-data
+content)."
+  (leman-e2ee-request agent "ssss_create"))
+
+(defun leman-e2ee-ssss-encrypt-secret (agent key-id recovery-key key-content name secret)
+  "Encrypt SECRET (base64) named NAME with AGENT's SSSS key KEY-ID.
+RECOVERY-KEY unlocks the key; KEY-CONTENT is the
+m.secret_storage.key.<key_id> account-data content.  Return the
+encrypted data (an alist with ~iv~, ~ciphertext~, and ~mac~)."
+  (leman-e2ee-request agent "ssss_encrypt_secret"
+                      (list (cons 'key_id key-id)
+                            (cons 'recovery_key recovery-key)
+                            (cons 'key_content key-content)
+                            (cons 'name name)
+                            (cons 'secret secret))))
+
+(defun leman-e2ee-ssss-decrypt-secret (agent key-id recovery-key key-content name iv ciphertext mac)
+  "Decrypt the secret data named NAME on AGENT.
+IV, CIPHERTEXT, and MAC are the encrypted data's parts;
+RECOVERY-KEY and KEY-CONTENT rebuild the SSSS key KEY-ID.  Return
+the plaintext secret, base64-encoded."
+  (alist-get 'secret
+             (leman-e2ee-request agent "ssss_decrypt_secret"
+                                 (list (cons 'key_id key-id)
+                                       (cons 'recovery_key recovery-key)
+                                       (cons 'key_content key-content)
+                                       (cons 'name name)
+                                       (cons 'iv iv)
+                                       (cons 'ciphertext ciphertext)
+                                       (cons 'mac mac)))))
+
 ;;;; Footer
 
 (provide 'leman-e2ee)

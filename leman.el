@@ -648,7 +648,8 @@ requests are performed."
       (leman-e2ee-error
        (leman-message "Leman E2EE: processing sync changes failed: %S" (cdr err))))
     (leman-e2ee--process-outgoing-requests session)
-    (leman-e2ee--announce-requests session agent)))
+    (leman-e2ee--announce-requests session agent)
+    (leman-e2ee--backup-pump session agent)))
 
 (defun leman-e2ee--announce-requests (session agent)
   "Tell the user about incoming verification requests for SESSION.
@@ -733,9 +734,188 @@ When it succeeds, report the response to the agent."
                          (leman-e2ee-error
                           (leman-message "Leman E2EE: marking request as sent failed: %S"
                                          (cdr err)))))
-               :else (lambda (plz-error)
-                       (leman-message "Leman E2EE: request %s failed: %S"
-                                      endpoint plz-error)))))
+                :else (lambda (plz-error)
+                        (leman-message "Leman E2EE: request %s failed: %S"
+                                       endpoint plz-error)))))
+
+(defun leman-e2ee--account-data-endpoint (session type)
+  "Return the account-data endpoint of TYPE on SESSION."
+  (format "user/%s/account_data/%s"
+          (url-hexify-string (leman-user-id (leman-session-user session)))
+          (url-hexify-string type)))
+
+(defun leman-e2ee--backup-pump (session agent)
+  "Back up SESSION's room keys that are not backed up yet.
+Asynchronously drain the agent's pending backup requests,
+performing one at a time until there is nothing left to back up."
+  (condition-case err
+      (let ((request (leman-e2ee-backup-room-keys agent)))
+        (when request
+          (pcase-let* (((map ('id id) ('path path) ('body body)) request)
+                       (`(,version ,endpoint) (leman-e2ee--split-path path)))
+            (leman-api session endpoint
+                       :method 'post
+                       :version version
+                       :data body
+                       :then (lambda (_data)
+                               (leman-e2ee-backup-mark-as-sent agent id)
+                               (leman-e2ee--backup-pump session agent))
+                       :else (lambda (plz-error)
+                               (leman-message "Leman E2EE: backing up room keys failed: %S"
+                                              plz-error))))))
+    (leman-e2ee-error
+     (leman-message "Leman E2EE: backing up room keys failed: %S" (cdr err)))))
+
+(defun leman-e2ee--account-data-get (session type)
+  "Return the global account data of TYPE on SESSION, synchronously.
+Signal `user-error' when it does not exist."
+  (condition-case err
+      (leman-api session (leman-e2ee--account-data-endpoint session type)
+                 :version "v3"
+                 :then 'sync
+                 :else nil)
+    (plz-error (user-error "Leman E2EE: no %s configured (%S)" type (cdr err)))))
+
+(defun leman-e2ee--account-data-put (session type data)
+  "Store the global account data DATA under TYPE on SESSION."
+  (leman-api session (leman-e2ee--account-data-endpoint session type)
+             :method 'put
+             :version "v3"
+             :data (json-encode data)
+             :then 'sync
+             :else nil))
+
+(defun leman-e2ee-setup-backup (session)
+  "Set up key backup and secret storage for SESSION.
+Create a new backup version from a fresh recovery key, enable
+backups, generate the secret storage default key, store the
+backup's recovery key in it as the m.megolm_backup.v1 secret, and
+back up the existing room keys.  Both recovery keys are displayed
+for the user to save: the secret-storage key unlocks the backup's
+key on a new device."
+  (interactive (list (leman-complete-session)))
+  (let ((agent (leman-session-e2ee session)))
+    (unless agent
+      (user-error "Leman E2EE: no agent running (try reconnecting)"))
+    (condition-case err
+        (let* ((created (leman-e2ee-backup-create agent))
+               (recovery-key (alist-get 'recovery_key created))
+               (version (alist-get 'version
+                                   (leman-api session "room_keys/version"
+                                              :method 'post
+                                              :version "v3"
+                                              :data (json-encode
+                                                     `((algorithm . ,(alist-get 'algorithm created))
+                                                       (auth_data . ,(alist-get 'auth_data created))))
+                                              :then 'sync
+                                              :else nil))))
+          (leman-e2ee-backup-enable agent recovery-key version)
+          (let* ((ssss (leman-e2ee-ssss-create agent))
+                 (key-id (alist-get 'key_id ssss))
+                 (ssss-recovery (alist-get 'recovery_key ssss))
+                 (content (alist-get 'content ssss))
+                 (encrypted (leman-e2ee-ssss-encrypt-secret
+                             agent key-id ssss-recovery content
+                             "m.megolm_backup.v1"
+                             (base64-encode-string recovery-key t))))
+            (leman-e2ee--account-data-put
+             session (format "m.secret_storage.key.%s" key-id) content)
+            (leman-e2ee--account-data-put
+             session "m.secret_storage.default_key" `((key . ,key-id)))
+            (leman-e2ee--account-data-put
+             session "m.secret_storage.secret.m.megolm_backup.v1"
+             `((encrypted . ((,key-id . ,encrypted)))))
+            (leman-e2ee--backup-pump session agent)
+            (with-output-to-temp-buffer "*Leman key backup*"
+              (princ (format "Key backup is set up.  Save these recovery keys somewhere safe
+\(e.g. a password manager); they cannot be shown again.
+
+Secret storage recovery key (the one to enter on a new device
+to restore old messages):
+
+    %s
+
+Backup recovery key (also stored in secret storage):
+
+    %s
+
+The room keys are being backed up in the background.
+" ssss-recovery recovery-key)))))
+      (leman-e2ee-error
+       (user-error "Leman E2EE: setting up key backup failed: %s" (cdr err)))
+      (plz-error
+       (user-error "Leman E2EE: setting up key backup failed: %S" (cdr err))))))
+
+(defun leman-e2ee-restore-keys (session)
+  "Restore SESSION's message history from the server-side key backup.
+Ask for the secret-storage recovery key, unlock the backup's
+decryption key stored in secret storage, enable the backup, and
+import its room keys."
+  (interactive (list (leman-complete-session)))
+  (let ((agent (leman-session-e2ee session)))
+    (unless agent
+      (user-error "Leman E2EE: no agent running (try reconnecting)"))
+    (condition-case err
+        (let* ((default-key (leman-e2ee--account-data-get
+                             session "m.secret_storage.default_key"))
+               (key-id (alist-get 'key default-key))
+               (key-content (leman-e2ee--account-data-get
+                             session (format "m.secret_storage.key.%s" key-id)))
+               (secret (leman-e2ee--account-data-get
+                        session "m.secret_storage.secret.m.megolm_backup.v1"))
+               (data (alist-get key-id (alist-get 'encrypted secret) nil nil #'equal))
+               (recovery-key (read-string "Secret storage recovery key: "))
+               (backup-recovery
+                (decode-coding-string
+                 (base64-decode-string
+                  (leman-e2ee-ssss-decrypt-secret
+                   agent key-id recovery-key key-content
+                   "m.megolm_backup.v1"
+                   (alist-get 'iv data)
+                   (alist-get 'ciphertext data)
+                   (alist-get 'mac data)))
+                 'utf-8))
+               (version-info (leman-api session "room_keys/version"
+                                        :version "v3"
+                                        :then 'sync
+                                        :else nil))
+               (backup-info `((algorithm . ,(alist-get 'algorithm version-info))
+                              (auth_data . ,(alist-get 'auth_data version-info)))))
+          (unless (equal (leman-e2ee-backup-verify agent backup-recovery backup-info) t)
+            (user-error "Leman E2EE: the recovery key does not match the backup"))
+          (leman-e2ee-backup-enable agent backup-recovery (alist-get 'version version-info))
+          (let* ((downloaded (leman-api session "room_keys/keys"
+                                        :version "v3"
+                                        :params (list (list "version"
+                                                            (alist-get 'version version-info)))
+                                        :then 'sync
+                                        :else nil))
+                 (result (leman-e2ee-backup-import
+                          agent backup-recovery (alist-get 'rooms downloaded))))
+            (leman-message
+             "Leman E2EE: restored %s of %s room keys from backup"
+             (alist-get 'imported result) (alist-get 'total result))
+            (leman-e2ee--backup-pump session agent)))
+      (leman-e2ee-error
+       (user-error "Leman E2EE: restoring keys failed: %s" (cdr err)))
+      (plz-error
+       (user-error "Leman E2EE: restoring keys failed: %S" (cdr err))))))
+
+(defun leman-e2ee-backup-info (session)
+  "Display SESSION's key backup status."
+  (interactive (list (leman-complete-session)))
+  (let ((agent (leman-session-e2ee session)))
+    (unless agent
+      (user-error "Leman E2EE: no agent running (try reconnecting)"))
+    (let ((status (leman-e2ee-backup-status agent))
+          (counts (alist-get 'room_key_counts (leman-e2ee-backup-status agent))))
+      (if (alist-get 'enabled status)
+          (leman-message
+           "Leman E2EE: key backup enabled (version %s): %s of %s room keys backed up"
+           (alist-get 'version status)
+           (alist-get 'backed_up counts)
+           (alist-get 'total counts))
+        (leman-message "Leman E2EE: key backup is not enabled (try M-x leman-e2ee-setup-backup)")))))
 
 (defun leman-e2ee--encrypt-content (session room content)
   "Encrypt CONTENT for ROOM on SESSION, for sending.

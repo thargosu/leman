@@ -1032,6 +1032,85 @@ to the agent, newest first."
     ;; No source available (e.g. a PATH lookup): not stale.
     (should-not (leman-e2ee--agent-stale-p binary (make-temp-file "leman-none-" 'dir)))))
 
+;;;; Key backup and SSSS
+
+(ert-deftest leman-e2ee-backup-wrappers ()
+  (pcase-let* ((fake (leman-e2ee-tests--fake-agent
+                      `((backup_create . ((recovery_key . "AbC")
+                                          (algorithm . "m.megolm_backup.v1.curve25519-aes-sha2")
+                                          (auth_data . ((public_key . "pk")))))
+                        (backup_status . ((enabled . t) (version . "1")))
+                        (backup_room_keys . ((request . ((id . "t1")))))
+                        (backup_verify . ((matches . t)))
+                        (backup_import . ((imported . 2) (total . 2)))
+                        (ssss_create . ((key_id . "k1") (recovery_key . "Rk")
+                                        (content . ((algorithm . "m.secret_storage.v1.aes-hmac-sha2")))))
+                        (ssss_encrypt_secret . ((iv . "iv") (ciphertext . "ct") (mac . "mac")))
+                        (ssss_decrypt_secret . ((secret . "c2VjcmV0"))))))
+                   (agent (car fake))
+                   (sent (cdr fake)))
+    ;; Creators return the full ok object.
+    (should (equal (alist-get 'recovery_key (leman-e2ee-backup-create agent)) "AbC"))
+    (should (equal (alist-get 'version (leman-e2ee-backup-status agent)) "1"))
+    (should (equal (alist-get 'id (leman-e2ee-backup-room-keys agent)) "t1"))
+    (should (equal (alist-get 'imported (leman-e2ee-backup-import agent "Rk" '((rooms)))) 2))
+    (should (equal (alist-get 'key_id (leman-e2ee-ssss-create agent)) "k1"))
+    (should (equal (alist-get 'ciphertext (leman-e2ee-ssss-encrypt-secret agent "k1" "Rk" nil "n" "c2M=")) "ct"))
+    (should (equal (leman-e2ee-ssss-decrypt-secret agent "k1" "Rk" nil "n" "iv" "ct" "mac") "c2VjcmV0"))
+    ;; Extractors return just the interesting field.
+    (should (equal (leman-e2ee-backup-verify agent "AbC" nil) t))
+    ;; Enabling and marking as sent pass their params.
+    (leman-e2ee-backup-enable agent "AbC" "1")
+    (leman-e2ee-backup-mark-as-sent agent "t1")
+    ;; The params reach the agent.
+    (let ((lines (mapcar (lambda (line) (leman-e2ee--decode line)) sent)))
+      (should (equal (alist-get 'params (seq-find (lambda (r) (equal (alist-get 'cmd r) "backup_enable")) lines))
+                     '((recovery_key . "AbC") (version . "1"))))
+      (should (equal (alist-get 'params (seq-find (lambda (r) (equal (alist-get 'cmd r) "backup_mark_as_sent")) lines))
+                     '((id . "t1")))))))
+
+(ert-deftest leman-e2ee-backup-room-keys-nil-when-nothing-to-do ()
+  (pcase-let* ((fake (leman-e2ee-tests--fake-agent '((backup_room_keys . nil))))
+               (agent (car fake)))
+    (should-not (leman-e2ee-backup-room-keys agent))))
+
+(ert-deftest leman-e2ee--backup-pump-drains-requests ()
+  (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
+         (requests (list '((id . "t1")
+                           (path . "/_matrix/client/v3/room_keys/keys/1")
+                           (body . "{\"rooms\":{}}"))
+                         nil))
+         (posts nil)
+         (marked nil))
+    (cl-letf (((symbol-function #'leman-e2ee-backup-room-keys)
+               (lambda (_agent) (pop requests)))
+              ((symbol-function #'leman-api)
+               (lambda (_session endpoint &rest args)
+                 (push (cons endpoint args) posts)
+                 (funcall (plist-get args :then) '((etag . "x")))))
+              ((symbol-function #'leman-e2ee-backup-mark-as-sent)
+               (lambda (_agent id) (push id marked))))
+      (leman-e2ee--backup-pump nil agent)
+      (should (equal (mapcar #'car posts) (list "room_keys/keys/1")))
+      (should (equal (plist-get (cdr (car posts)) :method) 'post))
+      (should (equal (plist-get (cdr (car posts)) :data) "{\"rooms\":{}}"))
+      (should (equal marked '("t1")))
+      ;; Nothing more to back up: no second request was performed.
+      (should (= (length posts) 1)))))
+
+(ert-deftest leman-e2ee--backup-pump-survives-agent-errors ()
+  ;; The pump must not break the sync loop when the agent errors (e.g.
+  ;; no backup enabled yet).
+  (let ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
+        (messages nil))
+    (cl-letf (((symbol-function #'leman-e2ee-request)
+               (lambda (&rest _args) (signal 'leman-e2ee-error (list "no backup"))))
+              ((symbol-function #'leman-message)
+               (lambda (format-string &rest args)
+                 (push (apply #'format format-string args) messages))))
+      (leman-e2ee--backup-pump nil agent)
+      (should messages))))
+
 ;;;; Footer
 
 (provide 'leman-e2ee-tests)

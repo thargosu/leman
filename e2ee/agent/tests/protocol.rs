@@ -741,6 +741,168 @@ async fn test_initialize_does_not_inherit_foreign_legacy_store() {
     assert_eq!(initialize["ok"]["identity_keys"], identity_keys);
 }
 
+/// E4: device A creates a backup, backs up a room key it received,
+/// stores the backup key as an SSSS secret; device B (fresh store)
+/// restores the backup with the SSSS recovery key and decrypts the
+/// same event.
+#[tokio::test]
+async fn test_backup_restore_round_trip() {
+    let store_a = TempDir::new().unwrap();
+    let mut agent_a = TestAgent::spawn();
+    assert!(
+        agent_a
+            .request(
+                "initialize",
+                json!({"user_id": "@bob:example.org", "device_id": "BOBDEVICE",
+                       "store_path": store_a.path().to_str().unwrap()})
+            )["ok"]
+            .is_object()
+    );
+
+    let alice =
+        OlmMachine::new(ruma::user_id!("@alice:example.org"), ruma::device_id!("ALICEDEVICE")).await;
+    let encrypted_event = exchange_and_encrypt(&mut agent_a, &alice).await;
+    // The agent must have decrypted (and thus hold) the room key.
+    agent_a
+        .request(
+            "decrypt_room_event",
+            json!({"room_id": "!room:example.org", "event": encrypted_event}),
+        );
+
+    // Setup: create the backup and enable it.
+    let created = agent_a.request("backup_create", json!({}));
+    let recovery_key = created["ok"]["recovery_key"].as_str().unwrap().to_owned();
+    let auth_data = created["ok"]["auth_data"].clone();
+    assert_eq!(
+        created["ok"]["algorithm"],
+        json!("m.megolm_backup.v1.curve25519-aes-sha2")
+    );
+    assert!(auth_data["public_key"].as_str().is_some());
+    agent_a.request(
+        "backup_enable",
+        json!({"recovery_key": recovery_key, "version": "1"}),
+    );
+
+    // Back up the room key: one request, then nothing more.
+    let backup = agent_a.request("backup_room_keys", json!({}));
+    let request = &backup["ok"]["request"];
+    assert!(request["id"].as_str().is_some(), "{backup}");
+    assert!(
+        request["path"].as_str().unwrap().contains("room_keys/keys/1"),
+        "{backup}"
+    );
+    let uploaded: Value =
+        serde_json::from_str(request["body"].as_str().unwrap()).unwrap();
+    agent_a
+        .request("backup_mark_as_sent", json!({"id": request["id"]}));
+    let after = agent_a.request("backup_status", json!({}));
+    assert_eq!(
+        after["ok"]["room_key_counts"]["backed_up"],
+        after["ok"]["room_key_counts"]["total"],
+        "all keys backed up: {after}"
+    );
+    assert_eq!(after["ok"]["version"], json!("1"));
+
+    // SSSS: store the backup recovery key as a secret.
+    let ssss = agent_a.request("ssss_create", json!({}));
+    let key_id = ssss["ok"]["key_id"].as_str().unwrap().to_owned();
+    let ssss_recovery = ssss["ok"]["recovery_key"].as_str().unwrap().to_owned();
+    assert!(!ssss_recovery.is_empty());
+    assert_eq!(
+        ssss["ok"]["content"]["algorithm"],
+        json!("m.secret_storage.v1.aes-hmac-sha2")
+    );
+    let secret_b64 = base64_encode(recovery_key.as_bytes());
+    let encrypted = agent_a.request(
+        "ssss_encrypt_secret",
+        json!({"key_id": key_id, "recovery_key": ssss_recovery,
+               "key_content": ssss["ok"]["content"],
+               "name": "m.megolm_backup.v1", "secret": secret_b64}),
+    );
+
+    // Restore: a fresh device of the same user with the SSSS
+    // recovery key.
+    let store_b = TempDir::new().unwrap();
+    let mut agent_b = TestAgent::spawn();
+    assert!(
+        agent_b
+            .request(
+                "initialize",
+                json!({"user_id": "@bob:example.org", "device_id": "BOBDEVICE2",
+                       "store_path": store_b.path().to_str().unwrap()})
+            )["ok"]
+            .is_object()
+    );
+    let decrypted_secret = agent_b.request(
+        "ssss_decrypt_secret",
+        json!({"key_id": key_id, "recovery_key": ssss_recovery,
+               "key_content": ssss["ok"]["content"],
+               "name": "m.megolm_backup.v1",
+               "iv": encrypted["ok"]["iv"],
+               "ciphertext": encrypted["ok"]["ciphertext"],
+               "mac": encrypted["ok"]["mac"]}),
+    );
+    assert_eq!(
+        decrypted_secret["ok"]["secret"],
+        json!(secret_b64),
+        "the secret must survive the SSSS round trip: {decrypted_secret}"
+    );
+    let backup_recovery = String::from_utf8(
+        base64_decode(decrypted_secret["ok"]["secret"].as_str().unwrap()),
+    )
+    .unwrap();
+
+    // The restored backup key must match the backup's auth data...
+    let verified = agent_b.request(
+        "backup_verify",
+        json!({"recovery_key": backup_recovery,
+               "backup_info": {"algorithm": "m.megolm_backup.v1.curve25519-aes-sha2",
+                               "auth_data": auth_data}}),
+    );
+    assert_eq!(verified["ok"]["matches"], json!(true));
+    // ...and after enabling it, the downloaded backup decrypts.
+    agent_b.request(
+        "backup_enable",
+        json!({"recovery_key": backup_recovery, "version": "1"}),
+    );
+    let rooms = uploaded["rooms"].clone();
+    let imported =
+        agent_b.request("backup_import", json!({"recovery_key": backup_recovery, "rooms": rooms}));
+    assert_eq!(
+        imported["ok"]["imported"],
+        json!(1),
+        "one room key imported: {imported}"
+    );
+    let decrypted = agent_b.request(
+        "decrypt_room_event",
+        json!({"room_id": "!room:example.org", "event": encrypted_event}),
+    );
+    assert_eq!(
+        decrypted["ok"]["event"]["content"]["body"],
+        json!("It's a secret to everybody."),
+        "the restored device decrypts old history"
+    );
+    agent_a.request("quit", json!({}));
+    agent_b.request("quit", json!({}));
+}
+
+
+fn base64_encode(data: &[u8]) -> String {
+    use std::io::Write;
+    let mut out = Vec::new();
+    {
+        let mut encoder =
+            base64::write::EncoderWriter::new(&mut out, &base64::engine::general_purpose::STANDARD);
+        encoder.write_all(data).unwrap();
+    }
+    String::from_utf8(out).unwrap()
+}
+
+fn base64_decode(data: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.decode(data).unwrap()
+}
+
 /// The current time as a to-device event origin_server_ts (the fake
 /// homeserver stamps events like a real one would).
 fn now_ts() -> Value {    json!(std::time::SystemTime::now()

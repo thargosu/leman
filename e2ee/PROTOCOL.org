@@ -263,7 +263,7 @@ users, so most commands take both ~user_id~ and ~flow_id~.
 Lists a user's known devices (the machine's own user by default).
 
 #+begin_src json
-{"id": 10, "cmd": "devices", "params": {"user_id": "@vv:hobeika.fr"}}
+{"id": 10, "cmd": "devices", "params": {"user_id": "@user:example.com"}}
 {"id": 10, "ok": {"devices": [
   {"device_id": "ABC", "display_name": "Element X",
    "verified": false, "deleted": false}]}}
@@ -280,7 +280,7 @@ machine's own user).  The ~m.key.verification.request~ flows out via
 
 #+begin_src json
 {"id": 11, "cmd": "request_verification", "params": {
-  "user_id": "@vv:hobeika.fr", "device_id": "ABC"}}
+  "user_id": "@user:example.com", "device_id": "ABC"}}
 {"id": 11, "ok": {"flow_id": "<flow-id>"}}
 #+end_src
 
@@ -293,7 +293,7 @@ has been received).
 #+begin_src json
 {"id": 12, "cmd": "verification_requests"}
 {"id": 12, "ok": {"requests": [{
-  "flow_id": "<flow-id>", "user_id": "@vv:hobeika.fr",
+  "flow_id": "<flow-id>", "user_id": "@user:example.com",
   "device_id": "ABC", "state": "ready", "we_started": false,
   "sas": false}]}}
 #+end_src
@@ -307,7 +307,7 @@ Accepts an incoming request (sends ~m.key.verification.ready~).
 
 #+begin_src json
 {"id": 13, "cmd": "accept_verification", "params": {
-  "user_id": "@vv:hobeika.fr", "flow_id": "<flow-id>"}}
+  "user_id": "@user:example.com", "flow_id": "<flow-id>"}}
 {"id": 13, "ok": {}}
 #+end_src
 
@@ -320,7 +320,7 @@ then just reports it.
 
 #+begin_src json
 {"id": 14, "cmd": "start_sas", "params": {
-  "user_id": "@vv:hobeika.fr", "flow_id": "<flow-id>"}}
+  "user_id": "@user:example.com", "flow_id": "<flow-id>"}}
 {"id": 14, "ok": {"flow_id": "<flow-id>"}}
 #+end_src
 
@@ -332,7 +332,7 @@ once both sides have exchanged keys and the emoji can be shown;
 
 #+begin_src json
 {"id": 15, "cmd": "verification_sas", "params": {
-  "user_id": "@vv:hobeika.fr", "flow_id": "<flow-id>"}}
+  "user_id": "@user:example.com", "flow_id": "<flow-id>"}}
 {"id": 15, "ok": {"can_be_presented": true, "accepted": true,
                   "done": false, "cancelled": false,
                   "emoji": [{"number": 49, "symbol": "🦋",
@@ -348,7 +348,7 @@ needed for flows where they started the SAS.
 
 #+begin_src json
 {"id": 16, "cmd": "accept_sas", "params": {
-  "user_id": "@vv:hobeika.fr", "flow_id": "<flow-id>"}}
+  "user_id": "@user:example.com", "flow_id": "<flow-id>"}}
 {"id": 16, "ok": {}}
 #+end_src
 
@@ -360,7 +360,7 @@ Confirms the short authentication string matches (sends
 
 #+begin_src json
 {"id": 17, "cmd": "confirm_sas", "params": {
-  "user_id": "@vv:hobeika.fr", "flow_id": "<flow-id>"}}
+  "user_id": "@user:example.com", "flow_id": "<flow-id>"}}
 {"id": 17, "ok": {}}
 #+end_src
 
@@ -370,7 +370,7 @@ Cancels the request or SAS.
 
 #+begin_src json
 {"id": 18, "cmd": "cancel_verification", "params": {
-  "user_id": "@vv:hobeika.fr", "flow_id": "<flow-id>"}}
+  "user_id": "@user:example.com", "flow_id": "<flow-id>"}}
 {"id": 18, "ok": {}}
 #+end_src
 
@@ -438,13 +438,14 @@ backup for restoring.
 
 ** ~backup_verify~
 
-Checks whether a recovery key matches a backup's auth data (the
-~m.room_key.backup~ account data).  The client calls this before
-adopting a backup.
+Checks whether a recovery key matches a backup (the full
+~m.room_key.backup~ account-data content, ~algorithm~ + ~auth_data~).
+The client calls this before adopting a backup.
 
 #+begin_src json
 {"id": 22, "cmd": "backup_verify", "params": {
-  "recovery_key": "<base58>", "auth_data": {...}}}
+  "recovery_key": "<base58>",
+  "backup_info": {"algorithm": "...", "auth_data": {...}}}
 {"id": 22, "ok": {"matches": true}}
 #+end_src
 
@@ -484,10 +485,12 @@ Reports that a backup request was performed.
 
 Imports room keys downloaded with
 ~GET /room_keys/keys?version=<version>~ (the ~rooms~ object of the
-response, as JSON).
+response, as JSON).  The recovery key decrypts the sessions' session
+data.
 
 #+begin_src json
-{"id": 26, "cmd": "backup_import", "params": {"rooms": {...}}}
+{"id": 26, "cmd": "backup_import", "params": {
+  "recovery_key": "<base58>", "rooms": {...}}}
 {"id": 26, "ok": {"imported": 30, "total": 30}}
 #+end_src
 

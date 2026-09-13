@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use anyhow::{anyhow, Context, Result};
 use matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent;
 use matrix_sdk_crypto::{
+    secret_storage::{AesHmacSha2EncryptedData, SecretStorageKey},
+    store::types::BackupDecryptionKey,
     types::events::room::encrypted::EncryptedEvent,
     types::requests::{AnyOutgoingRequest, OutgoingVerificationRequest},
     DecryptionSettings, EncryptionSettings, EncryptionSyncChanges, OlmMachine,
@@ -13,7 +15,14 @@ use matrix_sdk_crypto::{
 };
 use ruma::{
     api::client as client_api,
-    events::{AnyToDeviceEvent, MessageLikeEventContent},
+    events::{
+        secret::request::SecretName,
+        secret_storage::key::{
+            SecretStorageEncryptionAlgorithm, SecretStorageKeyEventContent,
+            SecretStorageV1AesHmacSha2Properties,
+        },
+        AnyToDeviceEvent, MessageLikeEventContent,
+    },
     serde::Raw,
     OneTimeKeyAlgorithm, OwnedDeviceId, OwnedTransactionId, OwnedUserId, UInt,
 };
@@ -162,6 +171,16 @@ impl Agent {
             "accept_sas" => self.accept_sas(params).await,
             "confirm_sas" => self.confirm_sas(params).await,
             "cancel_verification" => self.cancel_verification(params).await,
+            "backup_create" => self.backup_create().await,
+            "backup_enable" => self.backup_enable(params).await,
+            "backup_verify" => self.backup_verify(params).await,
+            "backup_status" => self.backup_status().await,
+            "backup_room_keys" => self.backup_room_keys().await,
+            "backup_mark_as_sent" => self.backup_mark_as_sent(params).await,
+            "backup_import" => self.backup_import(params).await,
+            "ssss_create" => self.ssss_create().await,
+            "ssss_encrypt_secret" => self.ssss_encrypt_secret(params).await,
+            "ssss_decrypt_secret" => self.ssss_decrypt_secret(params).await,
             other => Err(AgentError::UnknownCommand(other.to_owned())),
         }
     }
@@ -829,6 +848,235 @@ impl Agent {
         Ok(json!({}))
     }
 
+    /// Generate a fresh backup decryption key and the signed auth data
+    /// for a new Megolm v1 backup version.
+    async fn backup_create(&self) -> CommandResult {
+        let machine = self.machine()?;
+
+        let key = BackupDecryptionKey::new();
+
+        let mut info = key.to_backup_info();
+        machine
+            .backup_machine()
+            .sign_backup(&mut info)
+            .await
+            .map_err(crypto_error)?;
+        let matrix_sdk_crypto::types::RoomKeyBackupInfo::MegolmBackupV1Curve25519AesSha2(
+            auth_data,
+        ) = info else {
+            return Err(crypto_error("unexpected backup algorithm"));
+        };
+
+        Ok(json!({
+            "recovery_key": key.to_base58(),
+            "algorithm": "m.megolm_backup.v1.curve25519-aes-sha2",
+            "auth_data": serde_json::to_value(&auth_data).map_err(crypto_error)?,
+        }))
+    }
+
+    /// Import a backup decryption key (base58) and enable backing up
+    /// future room keys for the given version.  Also used by a new
+    /// device to adopt a backup for restoring.
+    async fn backup_enable(&self, params: Value) -> CommandResult {
+        let machine = self.machine()?;
+        let recovery_key = param_str(&params, "recovery_key")?;
+        let version = param_str(&params, "version")?.to_owned();
+
+        let key = BackupDecryptionKey::from_base58(recovery_key).map_err(crypto_error)?;
+        let megolm_key = key.megolm_v1_public_key();
+        megolm_key.set_version(version.clone());
+
+        let backup_machine = machine.backup_machine();
+        backup_machine
+            .save_decryption_key(Some(key), Some(version.clone()))
+            .await
+            .map_err(crypto_error)?;
+        backup_machine.enable_backup_v1(megolm_key).await.map_err(crypto_error)?;
+        Ok(json!({}))
+    }
+
+    /// Check whether a recovery key matches a backup (the full
+    /// m.room_key.backup account-data content).
+    async fn backup_verify(&self, params: Value) -> CommandResult {
+        let recovery_key = param_str(&params, "recovery_key")?;
+        let info: matrix_sdk_crypto::types::RoomKeyBackupInfo = serde_json::from_value(
+            params.get("backup_info").cloned().unwrap_or(json!({})),
+        )
+        .map_err(crypto_error)?;
+        let key = BackupDecryptionKey::from_base58(recovery_key).map_err(crypto_error)?;
+        Ok(json!({"matches": key.backup_key_matches(&info)}))
+    }
+
+    async fn backup_status(&self) -> CommandResult {
+        let machine = self.machine()?;
+        let backup_machine = machine.backup_machine();
+        let enabled = backup_machine.enabled().await;
+        let version = backup_machine.backup_version().await;
+        let counts = backup_machine.room_key_counts().await.map_err(crypto_error)?;
+        Ok(json!({
+            "enabled": enabled,
+            "version": version,
+            "room_key_counts": {"total": counts.total, "backed_up": counts.backed_up},
+        }))
+    }
+
+    /// Encrypt the not-yet-backed-up room keys.  The returned request
+    /// is for POST /room_keys/keys/{version}; the client reports it
+    /// with `backup_mark_as_sent`, which lets the machine clear its
+    /// pending backup (the same request is returned until then).
+    async fn backup_room_keys(&mut self) -> CommandResult {
+        let machine = self.machine()?;
+        let request = machine.backup_machine().backup().await.map_err(crypto_error)?;
+        let Some((txn_id, keys_backup)) = request else {
+            return Ok(json!({"request": Value::Null}));
+        };
+        let body = json!({"version": keys_backup.version, "rooms": keys_backup.rooms});
+        Ok(json!({"request": {
+            "id": txn_id.as_str(),
+            "path": format!("/room_keys/keys/{}", keys_backup.version),
+            "body": body.to_string(),
+        }}))
+    }
+
+    async fn backup_mark_as_sent(&self, params: Value) -> CommandResult {
+        let machine = self.machine()?;
+        let request_id = param_str(&params, "id")?.to_owned();
+        let txn_id = OwnedTransactionId::from(request_id);
+        let typed = client_api::backup::add_backup_keys::v3::Response::new(
+            String::new(),
+            UInt::from(0u32),
+        );
+        machine.mark_request_as_sent(&txn_id, &typed).await.map_err(crypto_error)?;
+        Ok(json!({}))
+    }
+
+    /// Import room keys downloaded with
+    /// GET /room_keys/keys?version={version} (the "rooms" value of the
+    /// response).  Each session's encrypted session data is decrypted
+    /// with the backup decryption key, so it must already be enabled
+    /// (or passed here) for the backup the keys came from.
+    async fn backup_import(&self, params: Value) -> CommandResult {
+        use matrix_sdk_crypto::olm::BackedUpRoomKey;
+        use ruma::api::client::backup::KeyBackupData;
+        let machine = self.machine()?;
+        let recovery_key = param_str(&params, "recovery_key")?;
+        let key = BackupDecryptionKey::from_base58(recovery_key).map_err(crypto_error)?;
+
+        let rooms_value = params.get("rooms").cloned().unwrap_or(json!({}));
+        let mut parsed: BTreeMap<ruma::OwnedRoomId, BTreeMap<String, BackedUpRoomKey>> =
+            BTreeMap::new();
+        let Some(rooms) = rooms_value.as_object() else {
+            return Err(crypto_error("missing or invalid param \"rooms\""));
+        };
+        for (room_id, room) in rooms {
+            let room_id: ruma::OwnedRoomId = room_id.parse().map_err(crypto_error)?;
+            let mut sessions = BTreeMap::new();
+            if let Some(map) = room.get("sessions").and_then(Value::as_object) {
+                for (session_id, data) in map {
+                    let backup_data: KeyBackupData =
+                        serde_json::from_value(data.clone()).map_err(crypto_error)?;
+                    let room_key = key
+                        .decrypt_session_data(backup_data.session_data)
+                        .map_err(crypto_error)?;
+                    sessions.insert(session_id.clone(), room_key);
+                }
+            }
+            parsed.insert(room_id, sessions);
+        }
+
+        let version = machine.backup_machine().backup_version().await;
+        let exported_keys = parsed
+            .into_iter()
+            .flat_map(|(room_id, sessions)| {
+                sessions.into_iter().map(move |(session_id, room_key)| {
+                    matrix_sdk_crypto::olm::ExportedRoomKey::from_backed_up_room_key(
+                        room_id.clone(),
+                        session_id,
+                        room_key,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let result = machine
+            .store()
+            .import_room_keys(exported_keys, version.as_deref(), |_, _| {})
+            .await
+            .map_err(crypto_error)?;
+        Ok(json!({"imported": result.imported_count, "total": result.total_count}))
+    }
+
+    /// Generate the secret storage default key.
+    async fn ssss_create(&self) -> CommandResult {
+        let key = SecretStorageKey::new();
+        Ok(json!({
+            "key_id": key.key_id(),
+            "recovery_key": key.to_base58(),
+            "content": serde_json::to_value(key.event_content()).map_err(crypto_error)?,
+        }))
+    }
+
+    /// Rebuild the SSSS key from the recovery key, its id and the
+    /// m.secret_storage.key.<key_id> account-data content.
+    fn ssss_key_from_params(&self, params: &Value) -> Result<SecretStorageKey, AgentError> {
+        let recovery_key = param_str(params, "recovery_key")?;
+        let key_id = param_str(params, "key_id")?.to_owned();
+        let content = params
+            .get("key_content")
+            .cloned()
+            .unwrap_or(json!({}));
+        let iv: ruma::serde::Base64 = serde_json::from_value(
+            content
+                .get("iv")
+                .cloned()
+                .ok_or_else(|| crypto_error("missing key_content.iv"))?,
+        )
+        .map_err(crypto_error)?;
+        let mac: ruma::serde::Base64 = serde_json::from_value(
+            content
+                .get("mac")
+                .cloned()
+                .ok_or_else(|| crypto_error("missing key_content.mac"))?,
+        )
+        .map_err(crypto_error)?;
+        let content = SecretStorageKeyEventContent::new(
+            key_id,
+            SecretStorageEncryptionAlgorithm::V1AesHmacSha2(
+                SecretStorageV1AesHmacSha2Properties::new(Some(iv), Some(mac)),
+            ),
+        );
+        SecretStorageKey::from_account_data(recovery_key, content).map_err(crypto_error)
+    }
+
+    async fn ssss_encrypt_secret(&self, params: Value) -> CommandResult {
+        let key = self.ssss_key_from_params(&params)?;
+        let name: SecretName = param_str(&params, "name")?.to_owned().into();
+        let secret_b64 = param_str(&params, "secret")?;
+        let plaintext = base64_decode(secret_b64).map_err(crypto_error)?;
+        let data = key.encrypt(plaintext, &name);
+        serde_json::to_value(&data).map_err(crypto_error)
+    }
+
+    async fn ssss_decrypt_secret(&self, params: Value) -> CommandResult {
+        let key = self.ssss_key_from_params(&params)?;
+        let name: SecretName = param_str(&params, "name")?.to_owned().into();
+        let iv = base64_decode(param_str(&params, "iv")?)
+            .map_err(crypto_error)?
+            .try_into()
+            .map_err(|_| crypto_error("invalid IV length"))?;
+        let mac = base64_decode(param_str(&params, "mac")?)
+            .map_err(crypto_error)?
+            .try_into()
+            .map_err(|_| crypto_error("invalid MAC length"))?;
+        let ciphertext = base64_decode(param_str(&params, "ciphertext")?).map_err(crypto_error)?;
+        let data = AesHmacSha2EncryptedData {
+            iv,
+            ciphertext: ruma::serde::Base64::new(ciphertext),
+            mac,
+        };
+        let plaintext = key.decrypt(&data, &name).map_err(crypto_error)?;
+        Ok(json!({"secret": base64_encode(&plaintext)}))
+    }
+
     /// Fetch the live SAS object of a flow.
     fn verification_sas_for(
         &self,
@@ -907,6 +1155,28 @@ where
 {
     let raw_value = serde_json::value::RawValue::from_string(serde_json::to_string(value)?)?;
     Ok(Raw::from_json(raw_value))
+}
+
+// Base64 in the Matrix ecosystem uses the standard alphabet, unpadded
+// when encoding (matching ruma's Base64 type), and accepts both padded
+// and unpadded input when decoding.
+fn base64_encode(data: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD_NO_PAD.encode(data)
+}
+
+fn base64_decode(data: &str) -> Result<Vec<u8>, anyhow::Error> {
+    use base64::{
+        Engine as _,
+        engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig},
+    };
+    let engine = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        GeneralPurposeConfig::new()
+            .with_decode_allow_trailing_bits(true)
+            .with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    );
+    Ok(engine.decode(data)?)
 }
 
 

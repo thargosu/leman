@@ -485,8 +485,95 @@ fetched with the whoami API first."
                (leman-e2ee-device-id agent)
                (buffer-name (leman-e2ee-log-buffer agent))))))
 
-(defun leman-e2ee--decrypt-event (session event &optional room-id)
-  "Decrypt EVENT (from ROOM-ID) with SESSION's E2EE agent.
+(defun leman-e2ee--format-emoji (emoji)
+  "Format the EMOJI list for comparing with the other device."
+  (mapconcat (lambda (item)
+               (format "%s %s" (alist-get 'symbol item)
+                       (alist-get 'description item)))
+             emoji "   "))
+
+(defun leman-e2ee-verify (session)
+  "Verify a device with SESSION's E2EE agent (emoji SAS).
+Pick a device, run the interactive verification dance, and
+compare the short auth string with the other device.  An incoming
+verification request for the device is accepted; otherwise a new
+one is started."
+  (interactive (list (leman-complete-session)))
+  (let ((agent (leman-session-e2ee session)))
+    (unless agent
+      (user-error "Leman E2EE: no agent running (try reconnecting)"))
+    (let* ((own-user (leman-user-id (leman-session-user session)))
+           (user-id (read-string
+                     (format "Verify a device of user (default %s): " own-user)
+                     nil nil own-user))
+           (devices (leman-e2ee-devices agent user-id))
+           (choices (mapcar (lambda (device)
+                              (cons (alist-get 'device_id device)
+                                    (alist-get 'display_name device)))
+                            devices))
+           (device-id (completing-read "Device: " choices nil t)))
+      (when (equal (alist-get 'verified
+                              (seq-find (lambda (device)
+                                          (equal (alist-get 'device_id device) device-id))
+                                        devices))
+                    t)
+        (user-error "Leman E2EE: device %s is already verified" device-id))
+      (let* ((existing (seq-find (lambda (request)
+                                   (equal (alist-get 'device_id request) device-id))
+                                 (leman-e2ee-verification-requests agent user-id)))
+             (flow-id (if (and existing
+                               (not (alist-get 'we_started existing))
+                               (member (alist-get 'state existing) '("created" "ready")))
+                          (progn
+                            (leman-e2ee-accept-verification
+                             agent user-id (alist-get 'flow_id existing))
+                            (alist-get 'flow_id existing))
+                        (leman-e2ee-request-verification agent user-id device-id))))
+        (message "Leman E2EE: verifying %s of %s; accept the request on the other device."
+                 device-id user-id)
+        ;; The dance's to-device events travel with the session's
+        ;; syncs; pump the agent's outgoing requests each round.
+        (catch 'finished
+          (cl-loop for round from 1 upto 90
+                   do (leman-e2ee--process-outgoing-requests-sync session)
+                      (let* ((request (seq-find (lambda (request)
+                                                  (equal (alist-get 'flow_id request) flow-id))
+                                                (leman-e2ee-verification-requests agent user-id)))
+                             (state (alist-get 'state request)))
+                        (cond
+                         ((equal state "done")
+                          (message "Leman E2EE: device %s is verified." device-id)
+                          (throw 'finished t))
+                         ((equal state "cancelled")
+                          (message "Leman E2EE: verification of %s was cancelled." device-id)
+                          (throw 'finished t))
+                         ((and (equal state "ready") (not (alist-get 'sas request)))
+                          (leman-e2ee-start-sas agent user-id flow-id))
+                         (t
+                          (when-let ((sas (ignore-errors
+                                            (leman-e2ee-verification-sas agent user-id flow-id))))
+                            (cond
+                             ((alist-get 'cancelled sas)
+                              (message "Leman E2EE: verification of %s was cancelled." device-id)
+                              (throw 'finished t))
+                             ((alist-get 'done sas)
+                              (message "Leman E2EE: device %s is verified." device-id)
+                              (throw 'finished t))
+                             ((alist-get 'can_be_presented sas)
+                              (let ((emoji (alist-get 'emoji sas)))
+                                (if (y-or-n-p
+                                     (format "Leman E2EE: compare with the other device: %s -- do the emoji match?"
+                                             (leman-e2ee--format-emoji emoji)))
+                                    (leman-e2ee-confirm-sas agent user-id flow-id)
+                                  (leman-e2ee-cancel-verification agent user-id flow-id)
+                                  (message "Leman E2EE: verification of %s cancelled." device-id)
+                                  (throw 'finished t)))))))))
+                      (sleep-for 2)
+                   finally (message "Leman E2EE: verification of %s timed out; run `M-x leman-e2ee-verify' again."
+                                    device-id)))
+        (leman-e2ee--process-outgoing-requests-sync session)))))
+
+(defun leman-e2ee--decrypt-event (session event &optional room-id)  "Decrypt EVENT (from ROOM-ID) with SESSION's E2EE agent.
 If EVENT is not encrypted, the agent is unavailable, or
 decryption fails, return EVENT unchanged."
   (let ((agent (leman-session-e2ee session)))

@@ -19,6 +19,7 @@
 (declare-function leman--push-joined-room-events "leman")
 (declare-function leman-e2ee--decrypt-event "leman")
 (declare-function leman-e2ee--encrypt-content "leman")
+(declare-function leman-e2ee--format-emoji "leman")
 (declare-function leman-e2ee--perform-outgoing-request "leman")
 (declare-function leman-e2ee--process-outgoing-requests "leman")
 (declare-function leman-e2ee--process-outgoing-requests-sync "leman")
@@ -532,6 +533,110 @@ to the agent, newest first."
       (should (string-match-p "/send/m.room.encrypted/" (car request)))
       (should (string-match-p "opaque" (cdr request)))
       (should-not (string-match-p "\"body\"" (cdr request))))))
+
+;;;; Verification (E3)
+
+(ert-deftest leman-e2ee-verification-commands-speak-the-protocol ()
+  ;; Each verification wrapper sends its documented command and
+  ;; returns the documented part of the response.
+  (let* ((fake (leman-e2ee-tests--fake-agent
+                (list (cons 'devices
+                            (list (cons 'devices
+                                        (vector (list (cons 'device_id "ABC")
+                                                      (cons 'display_name "Element")
+                                                      (cons 'verified nil)
+                                                      (cons 'deleted nil))))))
+                      (cons 'request_verification
+                            (list (cons 'flow_id "flow1")))
+                      (cons 'verification_requests
+                            (list (cons 'requests
+                                        (vector (list (cons 'flow_id "flow1")
+                                                      (cons 'user_id "@vv:x.org")
+                                                      (cons 'device_id "ABC")
+                                                      (cons 'state "ready")
+                                                      (cons 'we_started nil)
+                                                      (cons 'sas nil))))))
+                      (cons 'verification_sas
+                            (list (cons 'can_be_presented t)
+                                  (cons 'accepted t)
+                                  (cons 'done nil)
+                                  (cons 'cancelled nil)
+                                  (cons 'emoji
+                                        (vector (list (cons 'number 49)
+                                                      (cons 'symbol "🦋")
+                                                      (cons 'description "butterfly")))))))))
+         (agent (car fake))
+         (sent (lambda ()
+                 (mapcar #'leman-e2ee--decode (cdr (cdr fake))))))
+    (should (equal (leman-e2ee-devices agent)
+                   (vector (list (cons 'device_id "ABC")
+                                 (cons 'display_name "Element")
+                                 (cons 'verified nil)
+                                 (cons 'deleted nil)))))
+    ;; Devices called without a user ID sends no params.
+    (should (null (alist-get 'params (car (funcall sent)))))
+    (should (equal (leman-e2ee-request-verification agent "@vv:x.org" "ABC") "flow1"))
+    (should (equal (alist-get 'params (car (funcall sent)))
+                   '((user_id . "@vv:x.org") (device_id . "ABC"))))
+    (should (equal (leman-e2ee-verification-requests agent)
+                   (vector (list (cons 'flow_id "flow1")
+                                 (cons 'user_id "@vv:x.org")
+                                 (cons 'device_id "ABC")
+                                 (cons 'state "ready")
+                                 (cons 'we_started nil)
+                                 (cons 'sas nil)))))
+    (should (equal (leman-e2ee-accept-verification agent "@vv:x.org" "flow1")
+                   nil))
+    (should (equal (alist-get 'params (car (funcall sent)))
+                   '((user_id . "@vv:x.org") (flow_id . "flow1"))))
+    (should (equal (leman-e2ee-start-sas agent "@vv:x.org" "flow1") nil))
+    (should (equal (leman-e2ee-verification-sas agent "@vv:x.org" "flow1")
+                   (list (cons 'can_be_presented t)
+                         (cons 'accepted t)
+                         (cons 'done nil)
+                         (cons 'cancelled nil)
+                         (cons 'emoji
+                               (vector (list (cons 'number 49)
+                                             (cons 'symbol "🦋")
+                                             (cons 'description "butterfly")))))))
+    (should (equal (leman-e2ee-accept-sas agent "@vv:x.org" "flow1") nil))
+    (should (equal (leman-e2ee-confirm-sas agent "@vv:x.org" "flow1") nil))
+    (should (equal (leman-e2ee-cancel-verification agent "@vv:x.org" "flow1") nil))
+    ;; Every verification command carries user_id and flow_id.
+    (let ((lines (mapcar #'leman-e2ee--decode (cdr (cdr fake)))))
+      (dolist (cmd '("accept_verification" "start_sas" "verification_sas"
+                     "accept_sas" "confirm_sas" "cancel_verification"))
+        (let ((params (alist-get 'params
+                                 (seq-find (lambda (line)
+                                             (equal (alist-get 'cmd line) cmd))
+                                           lines))))
+          (should (equal (alist-get 'user_id params) "@vv:x.org"))
+          (should (equal (alist-get 'flow_id params) "flow1")))))))
+
+(ert-deftest leman-e2ee-devices-passes-user-id ()
+  (let* ((fake (leman-e2ee-tests--fake-agent
+                (list (cons 'devices (list (cons 'devices (vector)))))))
+         (agent (car fake)))
+    (leman-e2ee-devices agent "@vv:x.org")
+    (should (equal (alist-get 'params
+                              (leman-e2ee--decode (car (cdr (cdr fake)))))
+                   '((user_id . "@vv:x.org"))))))
+
+(ert-deftest leman-e2ee-verification-commands-propagate-errors ()
+  (let* ((fake (leman-e2ee-tests--fake-agent
+                (list (cons 'verification_sas '(err "crypto" "no SAS for flow flow1")))))
+         (agent (car fake)))
+    (should (equal (condition-case err
+                       (progn (leman-e2ee-verification-sas agent "@vv:x.org" "flow1")
+                              nil)
+                     (leman-e2ee-error (cdr err)))
+                   '("crypto" "no SAS for flow flow1")))))
+
+(ert-deftest leman-e2ee--format-emoji ()
+  (should (equal (leman-e2ee--format-emoji
+                  (vector (list (cons 'symbol "🦋") (cons 'description "butterfly"))
+                          (list (cons 'symbol "🐟") (cons 'description "fish"))))
+                 "🦋 butterfly   🐟 fish")))
 
 ;;;; Footer
 

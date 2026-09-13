@@ -394,6 +394,74 @@ requests, then retry).  Signal `leman-e2ee-error' on failure."
                             (cons 'content content)
                             (cons 'users (vconcat users)))))
 
+;;;; Verification (E3)
+
+(defun leman-e2ee-devices (agent &optional user-id)
+  "Return the devices AGENT knows for USER-ID (the agent's own
+user by default).  Each device is an alist with ~device_id~,
+~display_name~, ~verified~, and ~deleted~ keys."
+  (alist-get 'devices
+             (leman-e2ee-request
+              agent "devices"
+              (when user-id (list (cons 'user_id user-id))))))
+
+(defun leman-e2ee-request-verification (agent user-id device-id)
+  "Start verifying DEVICE-ID of USER-ID with AGENT.
+Return the verification flow ID."
+  (alist-get 'flow_id
+             (leman-e2ee-request
+              agent "request_verification"
+              (list (cons 'user_id user-id)
+                    (cons 'device_id device-id)))))
+
+(defun leman-e2ee-verification-requests (agent &optional user-id)
+  "Return AGENT's verification requests for USER-ID.
+Each request is an alist with ~flow_id~, ~user_id~, ~device_id~,
+~state~ (created/ready/done/cancelled), ~we_started~, and ~sas~
+keys."
+  (alist-get 'requests
+             (leman-e2ee-request
+              agent "verification_requests"
+              (when user-id (list (cons 'user_id user-id))))))
+
+(defun leman-e2ee-accept-verification (agent user-id flow-id)
+  "Accept the incoming verification FLOW-ID of USER-ID on AGENT."
+  (leman-e2ee-request agent "accept_verification"
+                      (list (cons 'user_id user-id)
+                            (cons 'flow_id flow-id))))
+
+(defun leman-e2ee-start-sas (agent user-id flow-id)
+  "Start SAS for the verification FLOW-ID of USER-ID on AGENT."
+  (leman-e2ee-request agent "start_sas"
+                      (list (cons 'user_id user-id)
+                            (cons 'flow_id flow-id))))
+
+(defun leman-e2ee-verification-sas (agent user-id flow-id)
+  "Return the SAS state for FLOW-ID of USER-ID on AGENT.
+An alist with ~accepted~, ~can_be_presented~, ~done~,
+~cancelled~, and (when presentable) ~emoji~ keys."
+  (leman-e2ee-request agent "verification_sas"
+                      (list (cons 'user_id user-id)
+                            (cons 'flow_id flow-id))))
+
+(defun leman-e2ee-accept-sas (agent user-id flow-id)
+  "Accept their SAS start for FLOW-ID of USER-ID on AGENT."
+  (leman-e2ee-request agent "accept_sas"
+                      (list (cons 'user_id user-id)
+                            (cons 'flow_id flow-id))))
+
+(defun leman-e2ee-confirm-sas (agent user-id flow-id)
+  "Confirm the short auth string for FLOW-ID of USER-ID on AGENT."
+  (leman-e2ee-request agent "confirm_sas"
+                      (list (cons 'user_id user-id)
+                            (cons 'flow_id flow-id))))
+
+(defun leman-e2ee-cancel-verification (agent user-id flow-id)
+  "Cancel the verification FLOW-ID of USER-ID on AGENT."
+  (leman-e2ee-request agent "cancel_verification"
+                      (list (cons 'user_id user-id)
+                            (cons 'flow_id flow-id))))
+
 ;;;; Footer
 
 (provide 'leman-e2ee)

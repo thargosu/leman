@@ -635,10 +635,115 @@ async fn test_restart_persistence() {
     );
 }
 
+/// A store opened with a different device ID than the one it was
+/// created for must be refused: a device's crypto identity may not be
+/// reused under a different device.
+#[tokio::test]
+async fn test_initialize_rejects_device_mismatch() {
+    let store = TempDir::new().unwrap();
+    {
+        let mut agent = TestAgent::spawn();
+        let initialize = agent.request("initialize", initialize_params(&store));
+        assert!(initialize["ok"].is_object());
+        agent.request("quit", json!({}));
+    }
+    let mut agent = TestAgent::spawn();
+    let mut params = initialize_params(&store);
+    params["device_id"] = json!("OTHERDEVICE");
+    let initialize = agent.request("initialize", params);
+    assert!(initialize["err"].is_object(), "mismatch must fail: {initialize}");
+    assert!(
+        initialize["err"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("doesn't match the account in the constructor"),
+        "error should mention the account mismatch: {initialize}"
+    );
+}
+
+/// A per-device store path nested under a legacy (user-level) store
+/// directory inherits the legacy database when it belongs to the same
+/// device (identity keys are preserved).
+#[tokio::test]
+async fn test_initialize_migrates_legacy_store() {
+    let root = TempDir::new().unwrap();
+    let legacy = root.path().join("_bob_example.org");
+    let per_device = legacy.join("BOBDEVICE");
+    let identity_keys;
+    {
+        let mut agent = TestAgent::spawn();
+        let initialize = agent.request(
+            "initialize",
+            json!({"user_id": "@bob:example.org", "device_id": "BOBDEVICE",
+                   "store_path": legacy.to_str().unwrap()}),
+        );
+        identity_keys = initialize["ok"]["identity_keys"].clone();
+        agent.request("quit", json!({}));
+    }
+    // Reopen with the per-device path: the legacy database is moved.
+    let mut agent = TestAgent::spawn();
+    let initialize = agent.request(
+        "initialize",
+        json!({"user_id": "@bob:example.org", "device_id": "BOBDEVICE",
+               "store_path": per_device.to_str().unwrap()}),
+    );
+    assert_eq!(
+        initialize["ok"]["identity_keys"],
+        identity_keys,
+        "identity keys must survive the migration"
+    );
+    agent.request("quit", json!({}));
+    assert!(
+        !legacy.join("matrix-sdk-crypto.sqlite3").exists(),
+        "the legacy database must have been moved"
+    );
+    assert!(per_device.join("matrix-sdk-crypto.sqlite3").exists());
+}
+
+/// A legacy store belonging to a DIFFERENT device is left alone: the
+/// new device gets a fresh store (a device's crypto identity may not
+/// be inherited from another device).
+#[tokio::test]
+async fn test_initialize_does_not_inherit_foreign_legacy_store() {
+    let root = TempDir::new().unwrap();
+    let legacy = root.path().join("_bob_example.org");
+    {
+        let mut agent = TestAgent::spawn();
+        let initialize = agent.request(
+            "initialize",
+            json!({"user_id": "@bob:example.org", "device_id": "BOBDEVICE",
+                   "store_path": legacy.to_str().unwrap()}),
+        );
+        assert!(initialize["ok"].is_object());
+        agent.request("quit", json!({}));
+    }
+    // A fresh login on the same account gets a new device ID: its
+    // store must NOT inherit the old device's keys.
+    let per_device = legacy.join("NEWDEVICE");
+    let mut agent = TestAgent::spawn();
+    let initialize = agent.request(
+        "initialize",
+        json!({"user_id": "@bob:example.org", "device_id": "NEWDEVICE",
+               "store_path": per_device.to_str().unwrap()}),
+    );
+    assert!(initialize["ok"].is_object(), "{initialize}");
+    let identity_keys = initialize["ok"]["identity_keys"].clone();
+    agent.request("quit", json!({}));
+    // The legacy database is untouched...
+    assert!(legacy.join("matrix-sdk-crypto.sqlite3").exists());
+    // ...and the new device has its own fresh identity.
+    let mut agent = TestAgent::spawn();
+    let initialize = agent.request(
+        "initialize",
+        json!({"user_id": "@bob:example.org", "device_id": "NEWDEVICE",
+               "store_path": per_device.to_str().unwrap()}),
+    );
+    assert_eq!(initialize["ok"]["identity_keys"], identity_keys);
+}
+
 /// The current time as a to-device event origin_server_ts (the fake
 /// homeserver stamps events like a real one would).
-fn now_ts() -> Value {
-    json!(std::time::SystemTime::now()
+fn now_ts() -> Value {    json!(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64)

@@ -172,6 +172,7 @@ impl Agent {
             .map_err(crypto_error)?;
         let device_id = OwnedDeviceId::from(param_str(&params, "device_id")?);
         let store_path = param_str(&params, "store_path")?;
+        Self::migrate_legacy_store(&store_path, &user_id, &device_id).await?;
         tokio::fs::create_dir_all(store_path)
             .await
             .context("creating store directory")?;
@@ -193,6 +194,56 @@ impl Agent {
         });
         self.machine = Some(machine);
         Ok(response)
+    }
+
+    /// Move a legacy (user-level) crypto store into its per-device
+    /// path when it belongs to the same user and device.  A legacy
+    /// store belonging to a DIFFERENT device is left alone: a
+    /// device's crypto identity may not be inherited by another
+    /// device (e.g. after a fresh login on a fresh device ID).
+    async fn migrate_legacy_store(
+        store_path: &str,
+        user_id: &ruma::UserId,
+        device_id: &ruma::DeviceId,
+    ) -> anyhow::Result<()> {
+        let path = std::path::Path::new(store_path);
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        let legacy_db = parent.join("matrix-sdk-crypto.sqlite3");
+        let target_db = path.join("matrix-sdk-crypto.sqlite3");
+        if !legacy_db.exists() || target_db.exists() {
+            return Ok(());
+        }
+        let parent_str = parent
+            .to_str()
+            .ok_or_else(|| anyhow!("non-UTF-8 legacy store path"))?
+            .to_owned();
+        let store = matrix_sdk_sqlite::SqliteCryptoStore::open(parent_str, None)
+            .await
+            .context("opening legacy crypto store")?;
+        use matrix_sdk_crypto::store::CryptoStore as _;
+        let migratable = match store.load_account().await? {
+            Some(account) => {
+                account.user_id() == user_id && account.device_id() == device_id
+            }
+            None => false,
+        };
+        drop(store);
+        if !migratable {
+            return Ok(());
+        }
+        std::fs::create_dir_all(path).context("creating per-device store directory")?;
+        for entry in std::fs::read_dir(parent).context("reading legacy store directory")? {
+            let entry = entry.context("reading legacy store directory entry")?;
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+            if name.starts_with("matrix-sdk-crypto.sqlite3") {
+                std::fs::rename(entry.path(), path.join(&*file_name))
+                    .context("moving legacy crypto store file")?;
+            }
+        }
+        Ok(())
     }
 
     async fn outgoing_requests(&mut self) -> CommandResult {

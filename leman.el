@@ -212,14 +212,19 @@ It shouldn't usually be necessary to change this."
                                               ;; Just to be extra careful:
                                               (or user-login-name "[unknown user-login-name]")
                                               (or (system-name) "[unknown system-name]")))
-         (device-id (secure-hash 'sha256 initial-device-display-name)))
+         ;; NOTE: A fresh login must NOT claim a device ID (e.g. a
+         ;; deterministic one): a fresh login is a new device
+         ;; identity, and reusing a removed device's ID would
+         ;; resurrect its verified keys.  The server mints the ID;
+         ;; only session restoration reuses a device.
+         (device-id nil))
     (make-leman-session :user user :server server :transaction-id transaction-id
                         :device-id device-id :initial-device-display-name initial-device-display-name
                         :events (make-hash-table :test #'equal))))
 
 (defun leman--password-login (session &optional password)
   "Log in to SESSION using PASSWORD, prompting if not given."
-  (pcase-let* (((cl-struct leman-session user device-id initial-device-display-name) session)
+  (pcase-let* (((cl-struct leman-session user initial-device-display-name) session)
                ((cl-struct leman-user id) user)
                (data (leman-alist "type" "m.login.password"
                                   "identifier"
@@ -227,7 +232,7 @@ It shouldn't usually be necessary to change this."
                                                "user" id)
                                   "password" (or password
                                                  (read-passwd (format "Password for %s: " id)))
-                                  "device_id" device-id
+                                  ;; No device_id: the server mints one.
                                   "initial_device_display_name" initial-device-display-name)))
     ;; TODO: Clear password in callback (if we decide to hold on to it for retrying login timeouts).
     (leman-api session "login" :method 'post :data (json-encode data)
@@ -236,14 +241,14 @@ It shouldn't usually be necessary to change this."
 
 (defun leman--sso-login-with-token (token session)
   "Submit SSO login TOKEN for SESSION."
-  (pcase-let* (((cl-struct leman-session user device-id initial-device-display-name) session)
+  (pcase-let* (((cl-struct leman-session user initial-device-display-name) session)
                ((cl-struct leman-user id) user)
                (data (leman-alist
                       "type" "m.login.token"
                       "identifier" (leman-alist "type" "m.id.user"
                                                 "user" id)
                       "token" token
-                      "device_id" device-id
+                      ;; No device_id: the server mints one.
                       "initial_device_display_name" initial-device-display-name)))
     (leman-api session "login" :method 'post
       :data (json-encode data)
@@ -902,7 +907,8 @@ PLZ-ERROR is the error passed by `plz'."
     (cond ((when (leman--response-revoked-p plz-error)
              ;; The token is gone (e.g. the session was removed from
              ;; another device): don't retry, report and clean up.
-             (leman--session-revoked session)
+             (leman--session-revoked
+              session (leman--response-soft-logout-p plz-error))
              (signal 'leman-api-session-revoked
                      (list "Leman: sync stopped: session signed out")))
            (setf reason "signed out"))
@@ -1316,9 +1322,12 @@ Writes Leman session to disk when enabled."
 
 ;;;;; Session revocation
 
-(defun leman--session-revoked-cleanup (session)
+(defun leman--session-revoked-cleanup (session &optional soft-logout)
   "Stop SESSION's background work after its token was revoked.
-Added to `leman-session-revoked-hook'."
+Added to `leman-session-revoked-hook'.  On a hard logout (the
+default), also discard SESSION's E2EE crypto store: the spec
+requires that persisted encryption keys and device information
+are not reused after the server has destroyed the session."
   ;; Stop an outstanding sync (the failing sync already deregistered
   ;; itself; be safe).
   (when-let ((process (map-elt leman-syncs session)))
@@ -1339,6 +1348,12 @@ Added to `leman-session-revoked-hook'."
   (when-let ((agent (leman-session-e2ee session)))
     (leman-e2ee-stop agent)
     (setf (leman-session-e2ee session) nil))
+  ;; On a hard logout, discard the crypto store (spec: persisted
+  ;; encryption keys and device information must not be reused).
+  (unless soft-logout
+    (when-let* ((user-id (leman-user-id (leman-session-user session)))
+                (device-id (leman-session-device-id session)))
+      (leman-e2ee--discard-store user-id device-id)))
   ;; Forget the dead token so restarts don't reuse it.
   (setf (leman-session-token session) nil)
   (when leman-save-sessions

@@ -281,15 +281,42 @@ that cargo must be found on the `exec-path'."
     (let ((default-directory agent-dir))
       (compilation-start "cargo build"))))
 
-(defun leman-e2ee--store-path (user-id)
-  "Return the crypto store directory for USER-ID, creating it.
-The directory is restricted to the current user."
-  (let* ((sanitized (replace-regexp-in-string "[^[:alnum:]._-]" "_" user-id))
-         (path (expand-file-name (concat "crypto/" sanitized "/")
-                                 leman-e2ee-data-directory)))
+(defun leman-e2ee--sanitize-name (name)
+  "Return NAME with characters unsafe for file names replaced."
+  (replace-regexp-in-string "[^[:alnum:]._-]" "_" name))
+
+(defun leman-e2ee--store-path (user-id device-id)
+  "Return the crypto store directory for USER-ID and DEVICE-ID.
+The store is kept per device: a device's crypto identity must
+never be reused under another device.  The directory is created
+and restricted to the current user."
+  (let* ((user-dir (expand-file-name
+                    (concat "crypto/" (leman-e2ee--sanitize-name user-id) "/")
+                    leman-e2ee-data-directory))
+         (path (expand-file-name
+                (concat (leman-e2ee--sanitize-name device-id) "/")
+                user-dir)))
     (make-directory path t)
     (set-file-modes (directory-file-name path) #o700)
     path))
+
+(defun leman-e2ee--discard-store (user-id device-id)
+  "Delete the crypto store of USER-ID's DEVICE-ID.
+Used when the session is signed out (hard logout): the spec
+requires that persisted encryption keys and device information
+are not reused.  Also removes legacy user-level store files
+belonging to a former single-store layout."
+  (let* ((user-dir (expand-file-name
+                    (concat "crypto/" (leman-e2ee--sanitize-name user-id) "/")
+                    leman-e2ee-data-directory))
+         (device-dir (expand-file-name
+                      (leman-e2ee--sanitize-name device-id) user-dir)))
+    (when (file-directory-p device-dir)
+      (delete-directory device-dir 'recursive))
+    ;; Legacy layout: the store database used to live directly in the
+    ;; user directory.
+    (dolist (file (directory-files user-dir t "\\`matrix-sdk-crypto\\.sqlite3"))
+      (ignore-errors (delete-file file)))))
 
 (defun leman-e2ee-start (user-id device-id &optional store-path)
   "Start an E2EE agent for USER-ID and DEVICE-ID.
@@ -299,7 +326,7 @@ initialized; the crypto store (STORE-PATH or under
 `leman-e2ee' object."
   (let* ((program (or (leman-e2ee--agent-program)
                       (error "Leman E2EE agent program not found; see `leman-e2ee-agent-program'")))
-         (store-path (or store-path (leman-e2ee--store-path user-id)))
+         (store-path (or store-path (leman-e2ee--store-path user-id device-id)))
          (agent (leman-e2ee--create :user-id user-id :device-id device-id))
          (buffer (get-buffer-create (format " *Leman E2EE agent[%s]*" user-id)))
          (process (make-process

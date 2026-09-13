@@ -44,6 +44,24 @@ Creates or reopens the OlmMachine for the user's device, backed by a
 SQLite crypto store.  The store directory is created if missing.  The
 agent holds exactly one machine.
 
+Identity rules (a device's crypto identity must never be reused under
+another device):
+
++ The STORE PATH IS PER DEVICE (the client passes
+  ~crypto/<user>/<device-id>/~).  If the store at that path belongs to
+  a different user or device, ~initialize~ fails
+  (~MismatchedAccount~).
++ A legacy store (a database directly in the parent directory)
+  belonging to the SAME user and device is migrated into the per-device
+  path automatically.  A legacy store belonging to a different device
+  is left alone (the new device gets a fresh store).
++ Fresh client logins MUST NOT claim a device ID: a fresh login is a
+  new device identity, and re-claiming a removed device's ID would
+  resurrect its verified keys.  Only session restoration (resuming a
+  saved session, or a soft logout) reuses a device identity.  After a
+  hard logout (a revoked token with ~soft_logout: false~), the client
+  discards the device's store.
+
 #+begin_src json
 {"id": 2, "cmd": "initialize", "params": {
   "user_id": "@bob:example.org", "device_id": "BOBDEVICE",

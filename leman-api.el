@@ -108,7 +108,8 @@ usually the DATA argument should be passed through
         (let ((callback else))
           (setf else (lambda (plz-error)
                        (when (leman--response-revoked-p plz-error)
-                         (leman--session-revoked session))
+                         (leman--session-revoked
+                          session (leman--response-soft-logout-p plz-error)))
                        (if (eq callback #'leman-api-error)
                            (leman-api-error plz-error url)
                          (funcall callback plz-error))))))
@@ -139,20 +140,35 @@ list.")
 
 (defcustom leman-session-revoked-hook nil
   "Hooks run when a session's access token is found revoked.
-Each hook function receives the session."
+Each hook function receives the session and a SOFT-LOGOUT flag:
+non-nil when the server allows the client to reuse its persisted
+state (e.g. the crypto store), nil for a hard logout where all
+persisted state must be discarded."
   :type 'hook
   :group 'leman)
 
-(defun leman--session-revoked (session)
+(defun leman--session-revoked (session &optional soft-logout)
   "Record that SESSION's access token was revoked and warn the user.
-Idempotent: only the first call for a session takes effect."
+SOFT-LOGOUT is the server's `soft_logout' flag (nil for a hard
+logout).  Idempotent: only the first call for a session takes
+effect."
   (unless (gethash session leman--revoked-sessions)
     (puthash session t leman--revoked-sessions)
     (display-warning
      'leman
      (format "Leman: the session of %s was signed out (its access token was revoked, e.g. the session was removed from another device's session list).  Reconnect with `M-x leman-connect'."
              (leman-user-id (leman-session-user session))))
-    (run-hook-with-args 'leman-session-revoked-hook session)))
+    (run-hook-with-args 'leman-session-revoked-hook session soft-logout)))
+
+(defun leman--response-soft-logout-p (plz-error)
+  "Return the `soft_logout' flag of a revoked PLZ-ERROR response.
+Defaults to nil (a hard logout) when the flag is absent."
+  (pcase-let (((cl-struct plz-error response) plz-error))
+    (when (plz-response-p response)
+      (let ((json-object (ignore-errors
+                           (json-read-from-string
+                            (plz-response-body response)))))
+        (alist-get 'soft_logout json-object)))))
 
 (defun leman--response-revoked-p (plz-error)
   "Return non-nil if PLZ-ERROR reports a revoked access token."

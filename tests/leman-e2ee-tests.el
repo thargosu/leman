@@ -18,8 +18,12 @@
 (declare-function leman--initial-transaction-id "leman")
 (declare-function leman--push-joined-room-events "leman")
 (declare-function leman-e2ee--announce-requests "leman")
+(declare-function leman-e2ee--discard-store "leman-e2ee")
+(declare-function leman-e2ee--store-path "leman-e2ee")
 (declare-function leman--response-revoked-p "leman-api")
+(declare-function leman--response-soft-logout-p "leman-api")
 (declare-function leman--session-revoked "leman-api")
+(declare-function leman--session-revoked-cleanup "leman")
 (declare-function leman-session-revoked-p "leman-api")
 (declare-function leman--sync-failed "leman")
 (declare-function leman-api-session-revoked-p "leman-api")
@@ -846,13 +850,18 @@ to the agent, newest first."
 (ert-deftest leman--session-revoked-runs-hook-once ()
   (let* ((session (make-leman-session :user (make-leman-user :id "@vv:x.org")))
          (calls 0)
+         (soft-logout-seen 'unset)
          (warnings 0)
          leman-session-revoked-hook)
-    (add-hook 'leman-session-revoked-hook (lambda (_) (cl-incf calls)))
+    (add-hook 'leman-session-revoked-hook
+              (lambda (_session soft-logout)
+                (cl-incf calls)
+                (setf soft-logout-seen soft-logout)))
     (cl-letf (((symbol-function #'display-warning) (lambda (&rest _) (cl-incf warnings))))
-      (leman--session-revoked session)
-      (leman--session-revoked session))
+      (leman--session-revoked session 'soft)
+      (leman--session-revoked session nil))
     (should (= 1 calls))
+    (should (eq soft-logout-seen 'soft))
     (should (= 1 warnings))
     (should (leman-session-revoked-p session))))
 
@@ -870,7 +879,7 @@ to the agent, newest first."
   (let* ((session (make-leman-session :user (make-leman-user :id "@vv:x.org")))
          (calls 0)
          leman-session-revoked-hook)
-    (add-hook 'leman-session-revoked-hook (lambda (_) (cl-incf calls)))
+    (add-hook 'leman-session-revoked-hook (lambda (_session _soft-logout) (cl-incf calls)))
     (cl-letf (((symbol-function #'leman--sync)
                (lambda (&rest _) (error "must not resync")))
               ((symbol-function #'display-warning) #'ignore))
@@ -898,6 +907,92 @@ to the agent, newest first."
       (leman-room--send-typing session room))
     (should (= 1 canceled))
     (should (null leman-room-typing-timer))))
+
+;;;; Store identity (per-device paths, hard-logout discard)
+
+(ert-deftest leman-e2ee--store-path-per-device ()
+  (let ((leman-e2ee-data-directory (make-temp-file "leman-store-test-" 'directory)))
+    (let ((path (leman-e2ee--store-path "@vv:x.org" "ABC")))
+      (should (string-match-p "crypto/_vv_x\\.org/ABC/\\'" path))
+      (should (file-directory-p path))
+      (should (= #o700 (file-modes path))))
+    ;; A second device gets its own directory.
+    (let ((path (leman-e2ee--store-path "@vv:x.org" "DEF")))
+      (should-not (equal path
+                         (leman-e2ee--store-path "@vv:x.org" "ABC"))))))
+
+(ert-deftest leman-e2ee--discard-store-removes-device-store-and-legacy-files ()
+  (let* ((leman-e2ee-data-directory (make-temp-file "leman-store-test-" 'dir))
+         (device-dir (leman-e2ee--store-path "@vv:x.org" "ABC")))
+    (write-region "db" nil (expand-file-name "matrix-sdk-crypto.sqlite3" device-dir))
+    ;; Legacy layout files in the user directory.
+    (write-region "old" nil
+                  (expand-file-name "crypto/_vv_x.org/matrix-sdk-crypto.sqlite3"
+                                    leman-e2ee-data-directory))
+    (leman-e2ee--discard-store "@vv:x.org" "ABC")
+    (should-not (file-directory-p device-dir))
+    (should-not (file-exists-p
+                 (expand-file-name "crypto/_vv_x.org/matrix-sdk-crypto.sqlite3"
+                                   leman-e2ee-data-directory)))))
+
+(ert-deftest leman-e2ee--discard-store-keeps-other-devices ()
+  (let* ((leman-e2ee-data-directory (make-temp-file "leman-store-test-" 'dir))
+         (abc (leman-e2ee--store-path "@vv:x.org" "ABC"))
+         (def (leman-e2ee--store-path "@vv:x.org" "DEF")))
+    (write-region "db" nil (expand-file-name "matrix-sdk-crypto.sqlite3" abc))
+    (write-region "db" nil (expand-file-name "matrix-sdk-crypto.sqlite3" def))
+    (leman-e2ee--discard-store "@vv:x.org" "ABC")
+    (should-not (file-directory-p abc))
+    (should (file-directory-p def))))
+
+(ert-deftest leman--response-soft-logout-p ()
+  (should (leman--response-soft-logout-p
+           (make-plz-error :response
+                           (make-plz-response :status 401
+                                              :body "{\"errcode\":\"M_UNKNOWN_TOKEN\",\"soft_logout\":true}"))))
+  (should-not (leman--response-soft-logout-p
+               (make-plz-error :response
+                               (make-plz-response :status 401
+                                                  :body "{\"errcode\":\"M_UNKNOWN_TOKEN\"}")))))
+
+(ert-deftest leman--session-revoked-cleanup-discards-store-on-hard-logout ()
+  (let* ((leman-e2ee-data-directory (make-temp-file "leman-store-test-" 'dir))
+         (session (make-leman-session
+                   :user (make-leman-user :id "@vv:x.org")
+                   :device-id "ABC"))
+         (fake (leman-e2ee-tests--fake-agent nil))
+         (leman--revoked-sessions (make-hash-table :weakness 'key :test #'eq))
+         (device-dir (leman-e2ee--store-path "@vv:x.org" "ABC")))
+    (setf (leman-session-e2ee session) (car fake))
+    (write-region "db" nil (expand-file-name "matrix-sdk-crypto.sqlite3" device-dir))
+    (cl-letf (((symbol-function #'display-warning) #'ignore)
+              ((symbol-function #'leman--write-sessions) #'ignore)
+              (leman-room-typing-timer nil)
+              (leman-read-receipt-idle-timer nil)
+              (leman-syncs (make-hash-table :test #'eq)))
+      (leman--session-revoked-cleanup session)
+      (should-not (file-directory-p device-dir)))
+    (should (null (leman-session-e2ee session)))
+    (should (null (leman-session-token session)))))
+
+(ert-deftest leman--session-revoked-cleanup-keeps-store-on-soft-logout ()
+  (let* ((leman-e2ee-data-directory (make-temp-file "leman-store-test-" 'dir))
+         (session (make-leman-session
+                   :user (make-leman-user :id "@vv:x.org")
+                   :device-id "ABC"))
+         (fake (leman-e2ee-tests--fake-agent nil))
+         (leman--revoked-sessions (make-hash-table :weakness 'key :test #'eq))
+         (device-dir (leman-e2ee--store-path "@vv:x.org" "ABC")))
+    (setf (leman-session-e2ee session) (car fake))
+    (write-region "db" nil (expand-file-name "matrix-sdk-crypto.sqlite3" device-dir))
+    (cl-letf (((symbol-function #'display-warning) #'ignore)
+              ((symbol-function #'leman--write-sessions) #'ignore)
+              (leman-room-typing-timer nil)
+              (leman-read-receipt-idle-timer nil)
+              (leman-syncs (make-hash-table :test #'eq)))
+      (leman--session-revoked-cleanup session 'soft)
+      (should (file-directory-p device-dir)))
+    (should (null (leman-session-e2ee session)))))
 
 ;;;; Footer
 

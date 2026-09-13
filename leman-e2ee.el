@@ -548,6 +548,11 @@ path and reports the id with
   (leman-e2ee-request agent "backup_mark_as_sent"
                       (list (cons 'id request-id))))
 
+(defun leman-e2ee-backup-recovery-key (agent)
+  "Return the backup decryption key AGENT has saved (base58), or nil."
+  (alist-get 'recovery_key
+             (leman-e2ee-request agent "backup_recovery_key")))
+
 (defun leman-e2ee-backup-import (agent recovery-key rooms)
   "Import downloaded backup ROOMS into AGENT with RECOVERY-KEY.
 ROOMS is the ~rooms~ value of the GET /room_keys/keys response.

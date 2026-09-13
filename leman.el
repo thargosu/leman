@@ -873,9 +873,10 @@ backup version's info comes from the homeserver."
 (defun leman-e2ee--re-store-backup-secret (session agent recovery-key backup-recovery)
   "Store BACKUP-RECOVERY under SESSION's default secret-storage key.
 When the m.megolm_backup.v1 secret has no entry for the current
-default key and RECOVERY-KEY unlocks that key's content, encrypt
-BACKUP-RECOVERY under it and add the entry (other clients expect
-the secret under the default key)."
+default key, encrypt BACKUP-RECOVERY under it and add the entry
+(other clients expect the secret under the default key).  The
+default key is unlocked with RECOVERY-KEY; when that fails, ask
+for the default key's recovery key (empty answer skips)."
   (let* ((default-key-id (ignore-errors
                            (alist-get 'key
                                       (leman-e2ee--account-data-get
@@ -889,17 +890,24 @@ the secret under the default key)."
       (let ((content (ignore-errors
                        (leman-e2ee--account-data-get
                         session (format "m.secret_storage.key.%s" default-key-id)))))
-        (when (and content
-                   (leman-e2ee-ssss-check-key agent default-key-id recovery-key content))
-          (let ((encrypted (leman-e2ee-ssss-encrypt-secret
-                            agent default-key-id recovery-key content
-                            "m.megolm_backup.v1"
-                            (base64-encode-string backup-recovery t))))
-            (leman-e2ee--account-data-put
-             session "m.secret_storage.secret.m.megolm_backup.v1"
-             `((encrypted . ,(append stored `((,default-key-id . ,encrypted))))))
-            (leman-message
-             "Leman E2EE: stored the backup key under the current default secret-storage key")))))))
+        (when content
+          (let ((default-recovery
+                 (if (leman-e2ee-ssss-check-key agent default-key-id recovery-key content)
+                     recovery-key
+                   (read-string
+                    (format "The backup key is not stored under the current default key %s; enter that key's recovery key to make it available to other clients (empty to skip): "
+                            default-key-id)))))
+            (when (and (> (length default-recovery) 0)
+                       (leman-e2ee-ssss-check-key agent default-key-id default-recovery content))
+              (let ((encrypted (leman-e2ee-ssss-encrypt-secret
+                                agent default-key-id default-recovery content
+                                "m.megolm_backup.v1"
+                                (base64-encode-string backup-recovery t))))
+                (leman-e2ee--account-data-put
+                 session "m.secret_storage.secret.m.megolm_backup.v1"
+                 `((encrypted . ,(append stored `((,default-key-id . ,encrypted))))))
+                (leman-message
+                 "Leman E2EE: stored the backup key under the current default secret-storage key")))))))))
 
 (defun leman-e2ee--restore-backup (session agent &optional adopt)
   "Unlock and adopt the server-side key backup for SESSION.
@@ -1068,6 +1076,30 @@ after the default key was changed in another client)."
            (alist-get 'backed_up counts)
            (alist-get 'total counts))
         (leman-message "Leman E2EE: key backup is not enabled (try M-x leman-e2ee-setup-backup)")))))
+
+(defun leman-e2ee-publish-backup-key (session)
+  "Store SESSION's backup decryption key under the default key.
+For when the backup is already enabled (leman holds its
+decryption key) but the m.megolm_backup.v1 secret has no entry
+for the account's current default secret-storage key (e.g. after
+another client changed the recovery key): asks for that key's
+recovery key and adds the encrypted entry, so other clients can
+unlock the backup again."
+  (interactive (list (leman-complete-session)))
+  (let ((agent (leman-session-e2ee session)))
+    (unless agent
+      (user-error "Leman E2EE: no agent running (try reconnecting)"))
+    (condition-case err
+        (let ((backup-recovery (leman-e2ee-backup-recovery-key agent)))
+          (unless backup-recovery
+            (user-error "Leman E2EE: the agent has no backup decryption key (restore the backup first)"))
+          (leman-e2ee--re-store-backup-secret session agent "" backup-recovery)
+          (leman-message
+           "Leman E2EE: backup key published under the current default secret-storage key (or it was already stored)"))
+      (leman-e2ee-error
+       (user-error "Leman E2EE: publishing the backup key failed: %s" (cdr err)))
+      (plz-error
+       (user-error "Leman E2EE: publishing the backup key failed: %S" (cdr err))))))
 
 (defun leman-e2ee-backup-dump--key (session key-id)
   "Describe the secret-storage key KEY-ID of SESSION in the dump."

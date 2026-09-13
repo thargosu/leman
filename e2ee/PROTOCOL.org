@@ -548,6 +548,18 @@ existing secret-storage setup.
 {"id": 30, "ok": {"valid": true}}
 #+end_src
 
+** ~backup_recovery_key~
+
+Returns the backup decryption key the machine has saved (its
+base58 recovery key), or null when none is saved.  Lets the
+client re-store the key under another secret-storage key without
+asking the user to type it again.
+
+#+begin_src json
+{"id": 31, "cmd": "backup_recovery_key"}
+{"id": 31, "ok": {"recovery_key": "<base58>"}}
+#+end_src
+
 ** Client flows
 
 Setup (a device that has room keys):

@@ -782,6 +782,13 @@ async fn test_backup_restore_round_trip() {
         "backup_enable",
         json!({"recovery_key": recovery_key, "version": "1"}),
     );
+    // The machine can export the decryption key it has saved.
+    let exported = agent_a.request("backup_recovery_key", json!({}));
+    assert_eq!(
+        exported["ok"]["recovery_key"],
+        json!(recovery_key),
+        "{exported}"
+    );
 
     // Back up the room key: one request, then nothing more.
     let backup = agent_a.request("backup_room_keys", json!({}));
@@ -848,13 +855,16 @@ async fn test_backup_restore_round_trip() {
             )["ok"]
             .is_object()
     );
-    // On the new device the recovery key verifies before use.
+    // On the new device the recovery key verifies before use, and no
+    // backup decryption key is saved yet.
     let checked_b = agent_b.request(
         "ssss_check_key",
         json!({"key_id": key_id, "recovery_key": ssss_recovery,
                "key_content": ssss["ok"]["content"]}),
     );
     assert_eq!(checked_b["ok"]["valid"], json!(true));
+    let none_saved = agent_b.request("backup_recovery_key", json!({}));
+    assert!(none_saved["ok"]["recovery_key"].is_null(), "{none_saved}");
     let decrypted_secret = agent_b.request(
         "ssss_decrypt_secret",
         json!({"key_id": key_id, "recovery_key": ssss_recovery,
@@ -886,6 +896,12 @@ async fn test_backup_restore_round_trip() {
     agent_b.request(
         "backup_enable",
         json!({"recovery_key": backup_recovery, "version": "1"}),
+    );
+    let exported_b = agent_b.request("backup_recovery_key", json!({}));
+    assert_eq!(
+        exported_b["ok"]["recovery_key"],
+        json!(backup_recovery),
+        "{exported_b}"
     );
     let rooms = uploaded["rooms"].clone();
     let imported =

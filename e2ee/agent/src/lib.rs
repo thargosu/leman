@@ -175,6 +175,7 @@ impl Agent {
             "backup_enable" => self.backup_enable(params).await,
             "backup_verify" => self.backup_verify(params).await,
             "backup_status" => self.backup_status().await,
+            "backup_recovery_key" => self.backup_recovery_key().await,
             "backup_room_keys" => self.backup_room_keys().await,
             "backup_mark_as_sent" => self.backup_mark_as_sent(params).await,
             "backup_import" => self.backup_import(params).await,
@@ -918,6 +919,23 @@ impl Agent {
             "enabled": enabled,
             "version": version,
             "room_key_counts": {"total": counts.total, "backed_up": counts.backed_up},
+        }))
+    }
+
+    /// Return the backup decryption key the machine has saved (its
+    /// base58 recovery key), or null when none is saved.  Lets the
+    /// client re-store the key under another secret-storage key
+    /// without asking the user to type it again.
+    async fn backup_recovery_key(&self) -> CommandResult {
+        use matrix_sdk_crypto::store::types::BackupKeys;
+        let machine = self.machine()?;
+        let keys: BackupKeys = machine.backup_machine().get_backup_keys().await
+            .map_err(crypto_error)?;
+        Ok(json!({
+            "recovery_key": match keys.decryption_key {
+                Some(key) => json!(key.to_base58()),
+                None => Value::Null,
+            }
         }))
     }
 

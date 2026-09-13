@@ -919,16 +919,18 @@ already has one, e.g. from Element)."
                            (alist-get 'key
                                       (leman-e2ee--account-data-get
                                        session "m.secret_storage.default_key"))))
-         (recovery-key (read-string
-                        (if default-key-id
-                            (format "Secret storage recovery key (of key %s): " default-key-id)
-                          "Secret storage recovery key: ")))
-         (unlock-reason nil)
+         (recovery-key
+          (read-string
+           (if default-key-id
+               (format "Secret storage recovery key (the account's recovery key, e.g. Element's \"Recovery key\", for secret-storage key %s): "
+                       default-key-id)
+             "Secret storage recovery key: ")))
+         (reasons nil)
          (backup-recovery
           (or (condition-case err
                   (leman-e2ee--unlock-backup-secret
                    session agent recovery-key encrypted default-key-id)
-                (user-error (setq unlock-reason (apply #'format (cdr err))) nil))
+                (user-error (setq reasons (cons (apply #'format (cdr err)) reasons)) nil))
               ;; Fall back to the backup's own recovery key (Es...).
               (condition-case err
                   (let* ((version-info (leman-e2ee--backup-version-info session))
@@ -939,11 +941,12 @@ already has one, e.g. from Element)."
                                    t)
                       (user-error "the recovery key does not match the current backup version"))
                     recovery-key)
-                (user-error (setq unlock-reason (apply #'format (cdr err))) nil)
-                (leman-e2ee-error (setq unlock-reason (cadr err)) nil)
-                (plz-error (setq unlock-reason "no key backup exists on the homeserver") nil)))))
+                (user-error (setq reasons (cons (apply #'format (cdr err)) reasons)) nil)
+                (leman-e2ee-error (setq reasons (cons (cadr err) reasons)) nil)
+                (plz-error (setq reasons (cons "no key backup exists on the homeserver" reasons)) nil)))))
     (unless backup-recovery
-      (user-error "Leman E2EE: %s" unlock-reason))
+      (user-error "Leman E2EE: %s (see M-x leman-e2ee-backup-dump for the stored state)"
+                  (string-join (nreverse reasons) "; ")))
     (leman-e2ee--enable-backup-and-import session agent backup-recovery)
     (leman-e2ee--re-store-backup-secret session agent recovery-key backup-recovery)
     (leman-e2ee--backup-pump session agent)
@@ -1065,6 +1068,88 @@ after the default key was changed in another client)."
            (alist-get 'backed_up counts)
            (alist-get 'total counts))
         (leman-message "Leman E2EE: key backup is not enabled (try M-x leman-e2ee-setup-backup)")))))
+
+(defun leman-e2ee-backup-dump--key (session key-id)
+  "Describe the secret-storage key KEY-ID of SESSION in the dump."
+  (let ((content (ignore-errors
+                   (leman-e2ee--account-data-get
+                    session (format "m.secret_storage.key.%s" key-id)))))
+    (if (not content)
+        (princ (format "  key %s: NOT STORED on the account (no content)\n" key-id))
+      (princ (format "  key %s: algorithm %s%s%s\n"
+                     key-id
+                     (or (alist-get 'algorithm content) "?")
+                     (if (alist-get 'passphrase content)
+                         ", passphrase-based (enter the recovery key, not the passphrase)"
+                       "")
+                     (if (and (alist-get 'iv content) (alist-get 'mac content))
+                         ", iv/mac present"
+                       ", NO iv/mac (its recovery key cannot be verified)"))))))
+
+(defun leman-e2ee-backup-dump (session)
+  "Dump SESSION's key-backup and secret-storage state.
+Shows the account's secret-storage keys, the encrypted entries of
+the m.megolm_backup.v1 secret (one entry per key that encrypted
+it), the homeserver's current backup version and its public key,
+and the agent's backup status.  Non-interactive diagnostics for
+untangling key-backup state after other clients changed it."
+  (interactive (list (leman-complete-session)))
+  (let ((agent (leman-session-e2ee session)))
+    (unless agent
+      (user-error "Leman E2EE: no agent running (try reconnecting)"))
+    (with-output-to-temp-buffer "*Leman backup state*"
+      (princ (format "Key backup state for %s\n\n" (leman-user-id (leman-session-user session))))
+      (let ((default (ignore-errors
+                       (leman-e2ee--account-data-get
+                        session "m.secret_storage.default_key")))
+            (secret (ignore-errors
+                      (leman-e2ee--account-data-get
+                       session "m.secret_storage.secret.m.megolm_backup.v1")))
+            (default-key-id nil))
+        (if (not default)
+            (princ "Default secret-storage key: none\n")
+          (setq default-key-id (alist-get 'key default))
+          (princ (format "Default secret-storage key: %s\n" default-key-id))
+          (leman-e2ee-backup-dump--key session default-key-id))
+        (princ "\n")
+        (if (not secret)
+            (princ "m.megolm_backup.v1 secret: NOT STORED (the backup's decryption key is not in secret storage)\n")
+          (let ((entries (alist-get 'encrypted secret)))
+            (princ (format "m.megolm_backup.v1 secret: %d encrypted entr%s\n"
+                           (length entries)
+                           (if (= (length entries) 1) "y" "ies")))
+            (if (null entries)
+                (princ "  (no entries)\n")
+              (dolist (entry entries)
+                (let ((key-id (format "%s" (car entry))))
+                  (princ (format "  - entry encrypted for key %s\n" key-id))
+                  (leman-e2ee-backup-dump--key session key-id))))))
+        (princ "\n")
+        (let ((version (ignore-errors (leman-e2ee--backup-version-info session))))
+          (if (not version)
+              (princ "Current backup version: none on the homeserver\n")
+            (princ (format "Current backup version: %s (%s)\n  backup public key: %s\n"
+                           (alist-get 'version version)
+                           (or (alist-get 'algorithm version) "?")
+                           (alist-get 'public_key (alist-get 'auth_data version))))))
+        (princ "\n")
+        (let ((status (ignore-errors (leman-e2ee-backup-status agent))))
+          (if (not status)
+              (princ "Agent backup status: unavailable\n")
+            (princ (format "Agent: backup %s (version %s), %s of %s room keys backed up\n"
+                           (if (alist-get 'enabled status) "ENABLED" "disabled")
+                           (or (alist-get 'version status) "-")
+                           (alist-get 'backed_up (alist-get 'room_key_counts status))
+                           (alist-get 'total (alist-get 'room_key_counts status))))))
+        (princ "
+The recovery key asked for by setup/restore is the account's
+secret-storage recovery key (a ~48 character Es... string, shown
+as \"Recovery key\" by Element for the default key above).  The
+backup public key of the current version must match the key
+inside the m.megolm_backup.v1 secret; if the current version's
+public key belongs to no stored entry, that version's key is not
+recoverable from secret storage and the backup must be reset (in
+Element: Settings -> Encryption) before a fresh setup.\n")))))
 
 (defun leman-e2ee--encrypt-content (session room content)
   "Encrypt CONTENT for ROOM on SESSION, for sending.

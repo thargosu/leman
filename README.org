@@ -78,9 +78,12 @@ Current support:
   verifying, other clients' "device not verified" warnings go away
 + Key backup (Megolm backup + secret storage): ~M-x
   leman-e2ee-setup-backup~ creates the backup and displays both
-  recovery keys; ~M-x leman-e2ee-restore-keys~ restores old message
+  recovery keys (or adopts an existing setup from another client,
+  e.g. Element); ~M-x leman-e2ee-restore-keys~ restores old message
   history on a new device; room keys are backed up automatically
-  after syncs (~M-x leman-e2ee-backup-info~ shows the status)
+  after syncs (~M-x leman-e2ee-backup-info~ shows the status,
+  ~M-x leman-e2ee-backup-dump~ the full stored state for
+  diagnostics)
 
 Not yet (planned, see ~ROADMAP.org~): encrypting reactions in
 encrypted rooms.

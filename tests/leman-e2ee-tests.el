@@ -42,6 +42,7 @@
 (declare-function leman-e2ee--unlock-backup-secret "leman")
 (declare-function leman-e2ee--re-store-backup-secret "leman")
 (declare-function leman-e2ee-ssss-check-key "leman-e2ee")
+(declare-function leman-e2ee-backup-dump "leman")
 
 ;;;; Helpers
 
@@ -1204,7 +1205,7 @@ to the agent, newest first."
          (puts nil)
          (account-data `(("m.secret_storage.default_key" . ((key . "kd")))
                          ("m.secret_storage.secret.m.megolm_backup.v1"
-                          . ((encrypted . ((kd . ((iv . "i"))))))))))
+                          . ((encrypted . (("kd" . ((iv . "i"))))))))))
     (cl-letf (((symbol-function #'leman-e2ee--account-data-get)
                (lambda (_session type)
                  (alist-get type account-data nil nil #'equal)))
@@ -1216,6 +1217,60 @@ to the agent, newest first."
                (lambda (&rest _args) nil)))
       (leman-e2ee--re-store-backup-secret nil agent "EsK" "EsBACKUP")
       (should-not puts))))
+
+(ert-deftest leman-e2ee-backup-dump ()
+  (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
+         (fake (leman-e2ee-tests--fake-agent
+                '((backup_status . ((enabled . t) (version . "3")
+                                    (room_key_counts . ((total . 5) (backed_up . 4))))))))
+         (session (make-leman-session :user (make-leman-user :id "@vv:x.org")))
+         (account-data `(("m.secret_storage.default_key" . ((key . "kDef")))
+                         ("m.secret_storage.key.kDef"
+                          . ((algorithm . "m.secret_storage.v1.aes-hmac-sha2")
+                             (iv . "i") (mac . "m")))
+                         ("m.secret_storage.secret.m.megolm_backup.v1"
+                          . ((encrypted . (("kDef" . ((iv . "i") (ciphertext . "c")
+                                                       (mac . "m"))))))))))
+    (setf (leman-session-e2ee session) (car fake))
+    (cl-letf (((symbol-function #'leman-e2ee--account-data-get)
+               (lambda (_session type)
+                 (alist-get type account-data nil nil #'equal)))
+              ((symbol-function #'leman-api)
+               (lambda (_session _endpoint &rest _args)
+                 '((version . "3")
+                   (algorithm . "m.megolm_backup.v1.curve25519-aes-sha2")
+                   (auth_data . ((public_key . "pk1")))))))
+      (leman-e2ee-backup-dump session)
+      (with-current-buffer "*Leman backup state*"
+        (let ((text (buffer-string)))
+          (should (string-search "Default secret-storage key: kDef" text))
+          (should (string-search "entry encrypted for key kDef" text))
+          (should (string-search "Current backup version: 3" text))
+          (should (string-search "backup public key: pk1" text))
+          (should (string-search "4 of 5 room keys backed up" text))
+          (should (string-search "Recovery key" text))))
+      (kill-buffer "*Leman backup state*"))))
+
+(ert-deftest leman-e2ee-backup-dump-missing-pieces ()
+  ;; Absent account data and no backup version must not error; the
+  ;; dump reports them.
+  (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
+         (fake (leman-e2ee-tests--fake-agent '((backup_status . nil))))
+         (session (make-leman-session :user (make-leman-user :id "@vv:x.org"))))
+    (setf (leman-session-e2ee session) (car fake))
+    (cl-letf (((symbol-function #'leman-e2ee--account-data-get)
+               (lambda (_session _type)
+                 (signal 'user-error (list "not found"))))
+              ((symbol-function #'leman-api)
+               (lambda (_session _endpoint &rest _args)
+                 (signal 'plz-error (list "404")))))
+      (leman-e2ee-backup-dump session)
+      (with-current-buffer "*Leman backup state*"
+        (let ((text (buffer-string)))
+          (should (string-search "Default secret-storage key: none" text))
+          (should (string-search "NOT STORED" text))
+          (should (string-search "Current backup version: none" text))))
+      (kill-buffer "*Leman backup state*"))))
 
 ;;;; Footer
 

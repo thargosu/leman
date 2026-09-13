@@ -899,7 +899,14 @@ PLZ-ERROR is the error passed by `plz'."
   ;; signaled in `plz--sentinel'...
   (pcase-let* (((cl-struct plz-error curl-error response) plz-error)
                (reason))
-    (cond ((when response
+    (cond ((when (leman--response-revoked-p plz-error)
+             ;; The token is gone (e.g. the session was removed from
+             ;; another device): don't retry, report and clean up.
+             (leman--session-revoked session)
+             (signal 'leman-api-session-revoked
+                     (list "Leman: sync stopped: session signed out")))
+           (setf reason "signed out"))
+          ((when response
              (pcase (plz-response-status response)
                ((or 429 502) (setf reason "failed")))))
           ((pcase curl-error
@@ -1306,6 +1313,38 @@ Writes Leman session to disk when enabled."
     (when (and leman-save-sessions
                leman-sessions)
       (leman--write-sessions leman-sessions))))
+
+;;;;; Session revocation
+
+(defun leman--session-revoked-cleanup (session)
+  "Stop SESSION's background work after its token was revoked.
+Added to `leman-session-revoked-hook'."
+  ;; Stop an outstanding sync (the failing sync already deregistered
+  ;; itself; be safe).
+  (when-let ((process (map-elt leman-syncs session)))
+    (when (process-live-p process)
+      (delete-process process))
+    (setf (map-elt leman-syncs session) nil))
+  ;; Typing notifications repeat on a timer.
+  (when leman-room-typing-timer
+    (when (timerp leman-room-typing-timer)
+      (cancel-timer leman-room-typing-timer))
+    (setf leman-room-typing-timer nil))
+  ;; Read receipts repeat on an idle timer.
+  (when leman-read-receipt-idle-timer
+    (when (timerp leman-read-receipt-idle-timer)
+      (cancel-timer leman-read-receipt-idle-timer))
+    (setf leman-read-receipt-idle-timer nil))
+  ;; The E2EE agent is useless without a session.
+  (when-let ((agent (leman-session-e2ee session)))
+    (leman-e2ee-stop agent)
+    (setf (leman-session-e2ee session) nil))
+  ;; Forget the dead token so restarts don't reuse it.
+  (setf (leman-session-token session) nil)
+  (when leman-save-sessions
+    (leman--write-sessions leman-sessions)))
+
+(add-hook 'leman-session-revoked-hook #'leman--session-revoked-cleanup)
 
 ;;;;; Event handlers
 

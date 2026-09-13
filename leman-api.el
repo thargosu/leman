@@ -93,17 +93,28 @@ usually the DATA argument should be passed through
                      (url-parse-make-urlobj type nil nil host portspec filename nil data t)))
                (headers (leman-alist "Content-Type" content-type))
                (plz-args))
-     (when token
-       ;; Almost every request will require a token (only a few, like checking login flows, don't),
-       ;; so we simplify the API by using the token automatically when the session has one.
-       (push (cons "Authorization" (concat "Bearer " token)) headers))
-     ;; Annotate the error with the request URL, so it's clear which request failed.
-     (when (eq else #'leman-api-error)
-       (setf else (lambda (plz-error)
-                    (leman-api-error plz-error url))))
-     (setf plz-args (list method url :headers headers :body data :body-type data-type
-                          :as json-read-fn :then then :else else
-                          :connect-timeout connect-timeout :timeout timeout :noquery t))
+      (when token
+        ;; Almost every request will require a token (only a few, like checking login flows, don't),
+        ;; so we simplify the API by using the token automatically when the session has one.
+        (push (cons "Authorization" (concat "Bearer " token)) headers))
+      ;; A revoked session (e.g. signed out from another device) must
+      ;; not produce any more network traffic.
+      (when (leman-session-revoked-p session)
+        (signal 'leman-api-session-revoked
+                (list "Leman: session signed out (access token revoked); reconnect with M-x leman-connect")))
+      ;; Detect revoked tokens on every response path, then run the
+      ;; caller's handler.
+      (when else
+        (let ((callback else))
+          (setf else (lambda (plz-error)
+                       (when (leman--response-revoked-p plz-error)
+                         (leman--session-revoked session))
+                       (if (eq callback #'leman-api-error)
+                           (leman-api-error plz-error url)
+                         (funcall callback plz-error))))))
+      (setf plz-args (list method url :headers headers :body data :body-type data-type
+                           :as json-read-fn :then then :else else
+                           :connect-timeout connect-timeout :timeout timeout :noquery t))
     ;; Omit `then' from debugging because if it's a partially applied
     ;; function on the session object, which may be very large, it
     ;; will take a very long time to print into the warnings buffer.
@@ -114,6 +125,45 @@ usually the DATA argument should be passed through
       (apply #'plz plz-args))))
 
 (define-error 'leman-api-error "Leman API error" 'error)
+
+(define-error 'leman-api-session-revoked "Leman session signed out" 'leman-api-error)
+
+(defvar leman--revoked-sessions (make-hash-table :weakness 'key :test #'eq)
+  "Sessions whose access token was revoked.
+E.g. the session was signed out from another device's session
+list.")
+
+(defun leman-session-revoked-p (session)
+  "Return non-nil if SESSION's access token was revoked."
+  (and session (gethash session leman--revoked-sessions)))
+
+(defcustom leman-session-revoked-hook nil
+  "Hooks run when a session's access token is found revoked.
+Each hook function receives the session."
+  :type 'hook
+  :group 'leman)
+
+(defun leman--session-revoked (session)
+  "Record that SESSION's access token was revoked and warn the user.
+Idempotent: only the first call for a session takes effect."
+  (unless (gethash session leman--revoked-sessions)
+    (puthash session t leman--revoked-sessions)
+    (display-warning
+     'leman
+     (format "Leman: the session of %s was signed out (its access token was revoked, e.g. the session was removed from another device's session list).  Reconnect with `M-x leman-connect'."
+             (leman-user-id (leman-session-user session))))
+    (run-hook-with-args 'leman-session-revoked-hook session)))
+
+(defun leman--response-revoked-p (plz-error)
+  "Return non-nil if PLZ-ERROR reports a revoked access token."
+  (pcase-let (((cl-struct plz-error response) plz-error))
+    (when (plz-response-p response)
+      (and (= (plz-response-status response) 401)
+           (let ((json-object (ignore-errors
+                                (json-read-from-string
+                                 (plz-response-body response)))))
+             (member (alist-get 'errcode json-object)
+                     '("M_UNKNOWN_TOKEN" "M_USER_DEACTIVATED")))))))
 
 (defun leman-api-error (plz-error &optional url)
   "Signal an Leman API error for PLZ-ERROR.

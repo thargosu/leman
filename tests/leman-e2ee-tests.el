@@ -18,6 +18,12 @@
 (declare-function leman--initial-transaction-id "leman")
 (declare-function leman--push-joined-room-events "leman")
 (declare-function leman-e2ee--announce-requests "leman")
+(declare-function leman--response-revoked-p "leman-api")
+(declare-function leman--session-revoked "leman-api")
+(declare-function leman-session-revoked-p "leman-api")
+(declare-function leman--sync-failed "leman")
+(declare-function leman-api-session-revoked-p "leman-api")
+(declare-function leman-room--send-typing "leman-room")
 (declare-function leman-e2ee--decrypt-event "leman")
 (declare-function leman-e2ee--encrypt-content "leman")
 (declare-function leman-e2ee--format-emoji "leman")
@@ -820,6 +826,78 @@ to the agent, newest first."
                  (push (apply #'format format args) messages))))
       (leman-e2ee--announce-requests session (car fake))
       (should (null messages)))))
+
+;;;; Session revocation
+
+(ert-deftest leman--response-revoked-p ()
+  (should (leman--response-revoked-p
+           (make-plz-error :response
+                           (make-plz-response :status 401
+                                              :body "{\"errcode\":\"M_UNKNOWN_TOKEN\"}"))))
+  (should-not (leman--response-revoked-p
+               (make-plz-error :response (make-plz-response :status 200 :body "{}"))))
+  (should-not (leman--response-revoked-p
+               (make-plz-error :response
+                               (make-plz-response :status 401
+                                                  :body "{\"errcode\":\"M_LIMIT_EXCEEDED\"}"))))
+  (should-not (leman--response-revoked-p
+               (make-plz-error :curl-error '(7 . "connection refused")))))
+
+(ert-deftest leman--session-revoked-runs-hook-once ()
+  (let* ((session (make-leman-session :user (make-leman-user :id "@vv:x.org")))
+         (calls 0)
+         (warnings 0)
+         leman-session-revoked-hook)
+    (add-hook 'leman-session-revoked-hook (lambda (_) (cl-incf calls)))
+    (cl-letf (((symbol-function #'display-warning) (lambda (&rest _) (cl-incf warnings))))
+      (leman--session-revoked session)
+      (leman--session-revoked session))
+    (should (= 1 calls))
+    (should (= 1 warnings))
+    (should (leman-session-revoked-p session))))
+
+(ert-deftest leman-api-refuses-revoked-session ()
+  (let* ((session (make-leman-session
+                   :server (make-leman-server :name "x" :uri-prefix "https://x.org")))
+         (leman--revoked-sessions (make-hash-table :weakness 'key :test #'eq)))
+    (puthash session t leman--revoked-sessions)
+    (cl-letf (((symbol-function #'plz)
+               (lambda (&rest _) (error "plz must not be called"))))
+      (should-error (leman-api session "sync")
+                    :type 'leman-api-session-revoked))))
+
+(ert-deftest leman--sync-failed-detects-revoked-token ()
+  (let* ((session (make-leman-session :user (make-leman-user :id "@vv:x.org")))
+         (calls 0)
+         leman-session-revoked-hook)
+    (add-hook 'leman-session-revoked-hook (lambda (_) (cl-incf calls)))
+    (cl-letf (((symbol-function #'leman--sync)
+               (lambda (&rest _) (error "must not resync")))
+              ((symbol-function #'display-warning) #'ignore))
+      (should-error
+       (leman--sync-failed
+        session 30
+        (make-plz-error :response
+                        (make-plz-response :status 401
+                                           :body "{\"errcode\":\"M_UNKNOWN_TOKEN\"}")))
+       :type 'leman-api-error))
+    (should (= 1 calls))
+    (should (leman-session-revoked-p session))))
+
+(ert-deftest leman-room--send-typing-stops-on-revoked-session ()
+  (let* ((session (make-leman-session :user (make-leman-user :id "@vv:x.org")))
+         (room (make-leman-room :id "!room:x.org"))
+         (leman--revoked-sessions (make-hash-table :weakness 'key :test #'eq))
+         (canceled 0)
+         (leman-room-typing-timer (run-at-time 60 nil #'ignore)))
+    (puthash session t leman--revoked-sessions)
+    (cl-letf (((symbol-function #'leman-api)
+               (lambda (&rest _) (error "leman-api must not be called")))
+              ((symbol-function #'cancel-timer)
+               (lambda (_timer) (cl-incf canceled))))
+      (leman-room--send-typing session room))
+    (should (= 1 canceled))
+    (should (null leman-room-typing-timer))))
 
 ;;;; Footer
 

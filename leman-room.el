@@ -2710,6 +2710,14 @@ the previously oldest event."
 
 (cl-defun leman-room--send-typing (session room &key (typing t))
   "Send a typing notification for ROOM on SESSION."
+  (when (leman-session-revoked-p session)
+    ;; The session is signed out: stop the repeating timer and send
+    ;; nothing.
+    (when leman-room-typing-timer
+      (when (timerp leman-room-typing-timer)
+        (cancel-timer leman-room-typing-timer))
+      (setf leman-room-typing-timer nil))
+    (cl-return-from leman-room--send-typing))
   (pcase-let* (((cl-struct leman-session user) session)
                ((cl-struct leman-user (id user-id)) user)
                ((cl-struct leman-room (id room-id)) room)
@@ -3449,7 +3457,9 @@ To be called from timer stored in
   (when leman-room-send-read-receipts
     (dolist (window (window-list))
       (when (and (eq 'leman-room-mode (buffer-local-value 'major-mode (window-buffer window)))
-                 (buffer-local-value 'leman-room (window-buffer window)))
+                 (buffer-local-value 'leman-room (window-buffer window))
+                 (not (leman-session-revoked-p
+                       (buffer-local-value 'leman-session (window-buffer window)))))
         (leman-room-update-read-receipt window)))))
 
 (defun leman-room-update-read-receipt (window)

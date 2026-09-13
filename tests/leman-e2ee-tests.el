@@ -994,6 +994,25 @@ to the agent, newest first."
       (should (file-directory-p device-dir)))
     (should (null (leman-session-e2ee session)))))
 
+(ert-deftest leman--session-revoked-cleanup-removes-session-from-list ()
+  ;; Reconnecting must prompt a fresh login, not resume the revoked
+  ;; session.
+  (let* ((session (make-leman-session :user (make-leman-user :id "@vv:x.org")))
+         (other (make-leman-session :user (make-leman-user :id "@other:x.org")))
+         (leman-sessions (list (cons "@vv:x.org" session)
+                               (cons "@other:x.org" other)))
+         (fake (leman-e2ee-tests--fake-agent nil))
+         (leman--revoked-sessions (make-hash-table :weakness 'key :test #'eq)))
+    (setf (leman-session-e2ee session) (car fake))
+    (cl-letf (((symbol-function #'display-warning) #'ignore)
+              ((symbol-function #'leman--write-sessions) #'ignore)
+              (leman-room-typing-timer nil)
+              (leman-read-receipt-idle-timer nil)
+              (leman-syncs (make-hash-table :test #'eq))
+              (leman-e2ee-data-directory (make-temp-file "leman-store-test-" 'dir)))
+      (leman--session-revoked-cleanup session)
+      (should (equal (mapcar #'cdr leman-sessions) (list other))))))
+
 ;;;; Footer
 
 (provide 'leman-e2ee-tests)

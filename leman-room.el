@@ -345,12 +345,6 @@ Does not include filenames, emotes, etc.")
 Called with two arguments, the room and the session."
   :type 'hook)
 
-(defcustom leman-room-reaction-names-limit 3
-  "Up to this many users, show a reaction's senders' names.
-If more than this many users have sent a reaction, show the
-number of senders instead (and the names in a tooltip)."
-  :type 'natnum)
-
 (defcustom leman-room-reaction-emoji-max-size 20
   "Maximum width/height in pixels of custom-emoji images shown as reaction keys.
 Custom emoji reactions (e.g. as sent by, e.g. Element) have
@@ -4198,10 +4192,7 @@ Formats according to `leman-room-message-format-spec', which see."
                        (key (if key-image
                                 (propertize " " 'display key-image)
                               (propertize raw-key 'face 'leman-room-reactions-key)))
-                       (count (propertize (format " (%s)"
-                                                  (if (length> senders leman-room-reaction-names-limit)
-                                                      (length senders)
-                                                    (senders-names senders room)))
+                       (count (propertize (format " (%s)" (length senders))
                                           'face 'leman-room-reactions))
                        (string
                         (propertize (concat key count)

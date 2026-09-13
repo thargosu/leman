@@ -343,6 +343,10 @@ again; otherwise, use a saved session if one is available."
           (setf leman-sessions (leman--read-sessions))
         (error (display-warning 'leman (format "Unable to read session data from disk (%s).  Prompting to log in again."
                                                (error-message-string err))))))
+    ;; Never resume a revoked session: prompt for a fresh login.
+    (setf leman-sessions (cl-remove-if (lambda (entry)
+                                         (leman-session-revoked-p (cdr entry)))
+                                       leman-sessions))
     (cl-case (length leman-sessions)
       (0 (list :user-id (read-string "User ID: " nil 'leman-connect-user-id-history)))
       (1 (list :session (cdar leman-sessions)))
@@ -1356,6 +1360,9 @@ are not reused after the server has destroyed the session."
       (leman-e2ee--discard-store user-id device-id)))
   ;; Forget the dead token so restarts don't reuse it.
   (setf (leman-session-token session) nil)
+  ;; Drop the dead session from the session list, so reconnecting
+  ;; prompts a fresh login instead of resuming the revoked session.
+  (setf leman-sessions (cl-remove session leman-sessions :key #'cdr :test #'eq))
   (when leman-save-sessions
     (leman--write-sessions leman-sessions)))
 

@@ -437,6 +437,18 @@ appear in the buffer text)."
       (should (equal (get-text-property (string-match "👍" string) 'leman-reaction-key string)
                      "👍")))))
 
+(ert-deftest leman-room--format-reactions-show-count-not-names ()
+  "Reactions show the number of senders, not their names.
+Names are available in the reaction's tooltip instead."
+  (let ((leman-session (make-leman-session
+                        :user (make-leman-user :id "@me:example.com"))))
+    (let ((string (leman-tests--format-reactions)))
+      (should (string-match-p "👍 (1)" string))
+      (should-not (string-match-p "Alice\\|Bob\\|@other" string))
+      ;; The names are delivered through the reaction's tooltip.
+      (should (functionp (get-text-property (string-match "👍" string)
+                                            'help-echo string))))))
+
 (ert-deftest leman-room--format-reactions-custom-emoji ()
   "Test that custom-emoji reaction keys (mxc URIs) are handled.
 When the emoji's image is available (from the URL cache), it is

@@ -2860,7 +2860,7 @@ see."
               'follow-link t
               'action action))
 
-(defun leman-room--initial-header (room)
+(defun leman-room--initial-header (_room)
   "Return initial header string for ROOM's buffer."
   "")
 

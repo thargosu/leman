@@ -211,19 +211,11 @@ URL differ from the previous one."
   "Test initial room buffer header."
   (let ((plain (make-leman-room :id "!room:example.com"))
         (encrypted (make-leman-room :id "!room:example.com"
-                                    :state (list (make-leman-event :type "m.room.encryption"))))
-        (encrypted-invite (make-leman-room :id "!room:example.com"
-                                           :invite-state (list (make-leman-event :type "m.room.encryption")))))
-    ;; A plain room has an empty header.
+                                    :state (list (make-leman-event :type "m.room.encryption")))))
+    ;; Every room's header is empty (encrypted rooms are natively
+    ;; supported).
     (should (string-empty-p (leman-room--initial-header plain)))
-    ;; An encrypted room's header warns, whether encryption is in the
-    ;; state or the invite state.
-    (should (string-search "encrypted room"
-                           (substring-no-properties (leman-room--initial-header encrypted))))
-    (should (string-search "encrypted room"
-                           (substring-no-properties (leman-room--initial-header encrypted-invite))))
-    (should (eq 'font-lock-warning-face
-                (get-text-property 0 'face (leman-room--initial-header encrypted))))))
+    (should (string-empty-p (leman-room--initial-header encrypted)))))
 
 (ert-deftest leman-room--initial-footer ()
   "Test initial room buffer footer."

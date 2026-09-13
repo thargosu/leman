@@ -36,6 +36,12 @@
 (declare-function leman-e2ee--process-outgoing-requests "leman")
 (declare-function leman-e2ee--process-outgoing-requests-sync "leman")
 (declare-function leman-e2ee--sync-changes "leman")
+(declare-function leman-e2ee--backup-pump "leman")
+(declare-function leman-e2ee--account-data-get "leman")
+(declare-function leman-e2ee--account-data-put "leman")
+(declare-function leman-e2ee--unlock-backup-secret "leman")
+(declare-function leman-e2ee--re-store-backup-secret "leman")
+(declare-function leman-e2ee-ssss-check-key "leman-e2ee")
 
 ;;;; Helpers
 
@@ -1110,6 +1116,106 @@ to the agent, newest first."
                  (push (apply #'format format-string args) messages))))
       (leman-e2ee--backup-pump nil agent)
       (should messages))))
+
+(ert-deftest leman-e2ee-ssss-check-key ()
+  (pcase-let* ((fake (leman-e2ee-tests--fake-agent
+                      '((ssss_check_key . ((valid . t))))))
+               (agent (car fake)))
+    (should (leman-e2ee-ssss-check-key agent "k1" "EsGood" nil)))
+  (pcase-let* ((fake (leman-e2ee-tests--fake-agent
+                      '((ssss_check_key . (err "crypto" "The MAC check failed")))))
+               (agent (car fake)))
+    (should-not (leman-e2ee-ssss-check-key agent "k1" "EsBad" nil))))
+
+(ert-deftest leman-e2ee--unlock-backup-secret-tries-default-key-first ()
+  (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
+         (attempts nil)
+         (checks nil)
+         (account-data `(("m.secret_storage.key.k1" . ((algorithm . "x")))
+                         ("m.secret_storage.key.k2" . ((algorithm . "y"))))))
+    (cl-letf (((symbol-function #'leman-e2ee--account-data-get)
+               (lambda (_session type)
+                 (alist-get type account-data nil nil #'equal)))
+              ((symbol-function #'leman-e2ee-ssss-check-key)
+               (lambda (_agent key-id _recovery _content)
+                 (push key-id checks)
+                 ;; Only k2's recovery key matches the entered one.
+                 (equal key-id "k2")))
+              ((symbol-function #'leman-e2ee-ssss-decrypt-secret)
+               (lambda (_agent key-id _recovery _content _name _iv _ct _mac)
+                 (push key-id attempts)
+                 (base64-encode-string "EsBACKUP" t))))
+      ;; The default key (k1) is tried first (its entry fails to
+      ;; unlock), then k2's entry unlocks.
+      (let ((result (leman-e2ee--unlock-backup-secret
+                     nil agent "EsK2"
+                     '((k1 . ((iv . "i") (ciphertext . "c") (mac . "m")))
+                       (k2 . ((iv . "i") (ciphertext . "c") (mac . "m"))))
+                     "k1")))
+        (should (equal result "EsBACKUP"))
+        (should (equal checks '("k2" "k1")))
+        (should (equal attempts '("k2")))))))
+
+(ert-deftest leman-e2ee--unlock-backup-secret-reports-failures ()
+  (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
+         (account-data `(("m.secret_storage.key.k1" . ((algorithm . "x"))))))
+    (cl-letf (((symbol-function #'leman-e2ee--account-data-get)
+               (lambda (_session type)
+                 (alist-get type account-data nil nil #'equal)))
+              ((symbol-function #'leman-e2ee-ssss-check-key)
+               (lambda (_agent _key-id _recovery _content) nil)))
+      (let ((err (should-error
+                  (leman-e2ee--unlock-backup-secret
+                   nil agent "EsWrong" '((k1 . ((iv . "i") (ciphertext . "c") (mac . "m"))))
+                   "k1")
+                  :type 'user-error)))
+        (should (string-search "does not unlock" (cadr err)))
+        (should (string-search "k1" (cadr err)))))))
+
+(ert-deftest leman-e2ee--re-store-backup-secret-adds-default-entry ()
+  (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
+         (puts nil)
+         (account-data `(("m.secret_storage.default_key" . ((key . "kd")))
+                         ("m.secret_storage.secret.m.megolm_backup.v1"
+                          . ((encrypted . (("k1" . ((iv . "i")))))))
+                         ("m.secret_storage.key.kd" . ((algorithm . "x"))))))
+    (cl-letf (((symbol-function #'leman-e2ee--account-data-get)
+               (lambda (_session type)
+                 (alist-get type account-data nil nil #'equal)))
+              ((symbol-function #'leman-e2ee--account-data-put)
+               (lambda (_session type data) (push (cons type data) puts)))
+              ((symbol-function #'leman-e2ee-ssss-check-key)
+               (lambda (_agent _key-id _recovery _content) t))
+              ((symbol-function #'leman-e2ee-ssss-encrypt-secret)
+               (lambda (_agent _key-id _recovery _content _name _secret)
+                 '((iv . "i2") (ciphertext . "c2") (mac . "m2")))))
+      (leman-e2ee--re-store-backup-secret nil agent "EsK" "EsBACKUP")
+      (should (= (length puts) 1))
+      (let* ((put (car puts))
+             (entries (alist-get 'encrypted (cdr put))))
+        (should (equal (car put) "m.secret_storage.secret.m.megolm_backup.v1"))
+        ;; Both entries are kept: the old one and the new default one.
+        (should (alist-get "k1" entries nil nil #'equal))
+        (should (equal (alist-get "kd" entries nil nil #'equal)
+                       '((iv . "i2") (ciphertext . "c2") (mac . "m2"))))))))
+
+(ert-deftest leman-e2ee--re-store-backup-secret-skips-existing-entry ()
+  (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
+         (puts nil)
+         (account-data `(("m.secret_storage.default_key" . ((key . "kd")))
+                         ("m.secret_storage.secret.m.megolm_backup.v1"
+                          . ((encrypted . ((kd . ((iv . "i"))))))))))
+    (cl-letf (((symbol-function #'leman-e2ee--account-data-get)
+               (lambda (_session type)
+                 (alist-get type account-data nil nil #'equal)))
+              ((symbol-function #'leman-e2ee--account-data-put)
+               (lambda (_session type _data) (push type puts)))
+              ((symbol-function #'leman-e2ee-ssss-check-key)
+               (lambda (_agent _key-id _recovery _content) t))
+              ((symbol-function #'leman-e2ee-ssss-encrypt-secret)
+               (lambda (&rest _args) nil)))
+      (leman-e2ee--re-store-backup-secret nil agent "EsK" "EsBACKUP")
+      (should-not puts))))
 
 ;;;; Footer
 

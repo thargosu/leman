@@ -29,8 +29,9 @@ inherited from upstream.)
 
 * E2EE
 
-Pantalaimon was archived on 2026-04-08; its design (MITM proxy +
-libolm) is deprecated.  State of the ecosystem as of 2026-09:
+The old libolm-based MITM-proxy approach is deprecated upstream (its
+best-known implementation was archived on 2026-04-08).  State of the
+ecosystem as of 2026-09:
 
 + *vodozemac* 0.11.0 (pure Rust): the reference implementation of
   Olm/Megolm, audited; also provides SAS and MSC4108 verification.
@@ -39,7 +40,7 @@ libolm) is deprecated.  State of the ecosystem as of 2026-09:
   encryption state machine with no network I/O: callers feed it
   to-device messages and encrypted events, and it returns decrypted
   events plus outbound requests (key distribution) to send.
-+ *libolm*: deprecated upstream; only Pantalaimon and old clients.
++ *libolm*: deprecated upstream; only old clients still use it.
 + *Element*: Web/Desktop uses matrix-js-sdk + Rust crypto compiled to
   WASM (matrix-sdk-crypto-wasm); Element X uses matrix-rust-sdk via
   UniFFI bindings (Kotlin/Swift; Python/Ruby for crypto-ffi).
@@ -61,7 +62,6 @@ Design decision needed first:
    vodozemac, loaded via the Emacs module API.  In-process and fast,
    but requires maintaining C glue + module lifecycle discipline, and
    bindings for the full state machine are not trivial.
-3. *Pantalaimon-style proxy*: deprecated; only as a last resort.
 
 Phasing:
 

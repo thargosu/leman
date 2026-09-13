@@ -2862,10 +2862,7 @@ see."
 
 (defun leman-room--initial-header (room)
   "Return initial header string for ROOM's buffer."
-  (if (leman-room--encrypted-p room)
-      (propertize "This appears to be an encrypted room, which is not natively supported by Leman.el.  (See information about using Pantalaimon in Leman.el documentation.)"
-                  'face 'font-lock-warning-face)
-    ""))
+  "")
 
 (defun leman-room--initial-footer (room)
   "Return initial footer string for ROOM's buffer."

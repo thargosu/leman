@@ -67,8 +67,8 @@ Initialization may have to ratchet an existing store open."
                         "~/.local/share/"))
   "Directory in which the E2EE crypto store is kept.
 The store contains the account's key material and is kept with
-user-only permissions; it is not itself encrypted (the same
-trade-off as Pantalaimon)."
+user-only permissions; it is not itself encrypted, so anyone who
+can read the user's files can extract the key material."
   :type 'directory)
 
 (define-error 'leman-e2ee-error "Leman E2EE agent error")
@@ -589,6 +589,19 @@ the plaintext secret, base64-encoded."
                                        (cons 'iv iv)
                                        (cons 'ciphertext ciphertext)
                                        (cons 'mac mac)))))
+
+(defun leman-e2ee-ssss-check-key (agent key-id recovery-key key-content)
+  "Check whether RECOVERY-KEY unlocks AGENT's SSSS key KEY-ID.
+KEY-CONTENT is the m.secret_storage.key.<key_id> account-data
+content.  Return non-nil when the key matches."
+  (condition-case nil
+      (progn
+        (leman-e2ee-request agent "ssss_check_key"
+                            (list (cons 'key_id key-id)
+                                  (cons 'recovery_key recovery-key)
+                                  (cons 'key_content key-content)))
+        t)
+    (leman-e2ee-error nil)))
 
 ;;;; Footer
 

@@ -177,7 +177,8 @@ before encryption).
 * Security notes
 
 + The crypto store on disk is unencrypted (same trade-off as
-  Pantalaimon); it must live in a user-private directory (0700).
+  a MITM proxy could see); it must live in a user-private directory
+  (0700).
 + The agent holds the account pickle in memory; clients should not
   expose the agent's stdio.
 + Key import/export (passphrase-encrypted) and verification arrive

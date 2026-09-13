@@ -785,49 +785,239 @@ Signal `user-error' when it does not exist."
              :then 'sync
              :else nil))
 
+(defun leman-e2ee--backup-version-info (session)
+  "Return the homeserver's current key backup version info for SESSION.
+An alist with ~version~, ~algorithm~, and ~auth_data~ keys; signal
+`user-error' when no backup exists."
+  (condition-case err
+      (leman-api session "room_keys/version"
+                 :version "v3"
+                 :then 'sync
+                 :else nil)
+    (plz-error
+     (user-error "Leman E2EE: no key backup exists on the homeserver (%S)"
+                 (cdr err)))))
+
+(defun leman-e2ee--unlock-backup-secret (session agent recovery-key encrypted default-key-id)
+  "Unlock the m.megolm_backup.v1 secret's ENCRYPTED entries.
+Try each entry (the default secret-storage key's first) with
+RECOVERY-KEY: when it unlocks the entry's key's content, decrypt
+the entry and return the backup decryption key (base58).  Signal
+`user-error' when no entry can be unlocked; DEFAULT-KEY-ID is the
+account's m.secret_storage.default_key's key (may be nil)."
+  (unless encrypted
+    (user-error "Leman E2EE: the m.megolm_backup.v1 secret has no encrypted entries"))
+  (let* ((entries (mapcar (lambda (entry) (cons (format "%s" (car entry)) (cdr entry)))
+                          encrypted))
+         (default (seq-find (lambda (entry)
+                              (equal (car entry) default-key-id))
+                            entries))
+         (ordered (if default
+                      (cons default (delete default entries))
+                    entries))
+         (reasons nil))
+    (catch 'unlocked
+      (dolist (entry ordered)
+        (let* ((key-id (car entry))
+               (data (cdr entry))
+               (key-content (ignore-errors
+                              (leman-e2ee--account-data-get
+                               session (format "m.secret_storage.key.%s" key-id)))))
+          (condition-case err
+              (progn
+                (unless key-content
+                  (signal 'leman-e2ee-error
+                          (list (format "secret-storage key %s is not stored on the account"
+                                        key-id))))
+                (unless (leman-e2ee-ssss-check-key agent key-id recovery-key key-content)
+                  (signal 'leman-e2ee-error
+                          (list (format "the recovery key does not unlock secret-storage key %s"
+                                        key-id))))
+                (throw 'unlocked
+                       (decode-coding-string
+                        (base64-decode-string
+                         (leman-e2ee-ssss-decrypt-secret
+                          agent key-id recovery-key key-content
+                          "m.megolm_backup.v1"
+                          (alist-get 'iv data)
+                          (alist-get 'ciphertext data)
+                          (alist-get 'mac data)))
+                        'utf-8)))
+            (leman-e2ee-error (push (cadr err) reasons)))))
+      (user-error
+       "the recovery key does not unlock any stored secret-storage key (%s)"
+       (string-join (nreverse reasons) "; ")))))
+
+(defun leman-e2ee--enable-backup-and-import (session agent backup-recovery)
+  "Enable AGENT's backup for BACKUP-RECOVERY and import its keys.
+BACKUP-RECOVERY is the backup's decryption key (base58); the
+backup version's info comes from the homeserver."
+  (let* ((version-info (leman-e2ee--backup-version-info session))
+         (version (alist-get 'version version-info))
+         (backup-info `((algorithm . ,(alist-get 'algorithm version-info))
+                        (auth_data . ,(alist-get 'auth_data version-info)))))
+    (unless (equal (leman-e2ee-backup-verify agent backup-recovery backup-info) t)
+      (user-error "Leman E2EE: the backup's decryption key does not match the current backup version"))
+    (leman-e2ee-backup-enable agent backup-recovery version)
+    (let* ((downloaded (leman-api session "room_keys/keys"
+                                  :version "v3"
+                                  :params (list (list "version" version))
+                                  :then 'sync
+                                  :else nil))
+           (result (leman-e2ee-backup-import
+                    agent backup-recovery (alist-get 'rooms downloaded))))
+      (leman-message
+       "Leman E2EE: restored %s of %s room keys from backup"
+       (alist-get 'imported result) (alist-get 'total result)))))
+
+(defun leman-e2ee--re-store-backup-secret (session agent recovery-key backup-recovery)
+  "Store BACKUP-RECOVERY under SESSION's default secret-storage key.
+When the m.megolm_backup.v1 secret has no entry for the current
+default key and RECOVERY-KEY unlocks that key's content, encrypt
+BACKUP-RECOVERY under it and add the entry (other clients expect
+the secret under the default key)."
+  (let* ((default-key-id (ignore-errors
+                           (alist-get 'key
+                                      (leman-e2ee--account-data-get
+                                       session "m.secret_storage.default_key"))))
+         (stored (ignore-errors
+                   (alist-get 'encrypted
+                              (leman-e2ee--account-data-get
+                               session "m.secret_storage.secret.m.megolm_backup.v1")))))
+    (when (and default-key-id
+               (not (alist-get default-key-id stored nil nil #'equal)))
+      (let ((content (ignore-errors
+                       (leman-e2ee--account-data-get
+                        session (format "m.secret_storage.key.%s" default-key-id)))))
+        (when (and content
+                   (leman-e2ee-ssss-check-key agent default-key-id recovery-key content))
+          (let ((encrypted (leman-e2ee-ssss-encrypt-secret
+                            agent default-key-id recovery-key content
+                            "m.megolm_backup.v1"
+                            (base64-encode-string backup-recovery t))))
+            (leman-e2ee--account-data-put
+             session "m.secret_storage.secret.m.megolm_backup.v1"
+             `((encrypted . ,(append stored `((,default-key-id . ,encrypted))))))
+            (leman-message
+             "Leman E2EE: stored the backup key under the current default secret-storage key")))))))
+
+(defun leman-e2ee--restore-backup (session agent &optional adopt)
+  "Unlock and adopt the server-side key backup for SESSION.
+Ask for a secret-storage recovery key; unlock the backup's
+decryption key from secret storage (trying every stored
+secret-storage key), or accept the backup's own recovery key
+directly when no stored key matches.  Enable the backup, import
+its room keys, and back up new keys afterwards (the pump).  With
+ADOPT non-nil the messages speak of adopting an existing setup
+(the command is `leman-e2ee-setup-backup' on an account that
+already has one, e.g. from Element)."
+  (let* ((secret (ignore-errors
+                   (leman-e2ee--account-data-get
+                    session "m.secret_storage.secret.m.megolm_backup.v1")))
+         (encrypted (alist-get 'encrypted secret))
+         (default-key-id (ignore-errors
+                           (alist-get 'key
+                                      (leman-e2ee--account-data-get
+                                       session "m.secret_storage.default_key"))))
+         (recovery-key (read-string
+                        (if default-key-id
+                            (format "Secret storage recovery key (of key %s): " default-key-id)
+                          "Secret storage recovery key: ")))
+         (unlock-reason nil)
+         (backup-recovery
+          (or (condition-case err
+                  (leman-e2ee--unlock-backup-secret
+                   session agent recovery-key encrypted default-key-id)
+                (user-error (setq unlock-reason (apply #'format (cdr err))) nil))
+              ;; Fall back to the backup's own recovery key (Es...).
+              (condition-case err
+                  (let* ((version-info (leman-e2ee--backup-version-info session))
+                         (backup-info `((algorithm . ,(alist-get 'algorithm version-info))
+                                        (auth_data . ,(alist-get 'auth_data version-info)))))
+                    (unless (equal (leman-e2ee-backup-verify
+                                    agent recovery-key backup-info)
+                                   t)
+                      (user-error "the recovery key does not match the current backup version"))
+                    recovery-key)
+                (user-error (setq unlock-reason (apply #'format (cdr err))) nil)
+                (leman-e2ee-error (setq unlock-reason (cadr err)) nil)
+                (plz-error (setq unlock-reason "no key backup exists on the homeserver") nil)))))
+    (unless backup-recovery
+      (user-error "Leman E2EE: %s" unlock-reason))
+    (leman-e2ee--enable-backup-and-import session agent backup-recovery)
+    (leman-e2ee--re-store-backup-secret session agent recovery-key backup-recovery)
+    (leman-e2ee--backup-pump session agent)
+    (leman-message
+     (if adopt
+         "Leman E2EE: adopted the existing key backup"
+       "Leman E2EE: keys restored from the key backup"))))
+
 (defun leman-e2ee-setup-backup (session)
   "Set up key backup and secret storage for SESSION.
-Create a new backup version from a fresh recovery key, enable
-backups, generate the secret storage default key, store the
-backup's recovery key in it as the m.megolm_backup.v1 secret, and
-back up the existing room keys.  Both recovery keys are displayed
-for the user to save: the secret-storage key unlocks the backup's
-key on a new device."
+When the account already has a secret-storage default key (e.g.
+set up in another client like Element), ask for that recovery key
+and adopt the existing setup: unlock the backup's decryption key
+from secret storage, enable the backup, and import its keys.
+Otherwise create a fresh backup version and secret-storage
+default key and display both recovery keys to save."
   (interactive (list (leman-complete-session)))
   (let ((agent (leman-session-e2ee session)))
     (unless agent
       (user-error "Leman E2EE: no agent running (try reconnecting)"))
     (condition-case err
-        (let* ((created (leman-e2ee-backup-create agent))
-               (recovery-key (alist-get 'recovery_key created))
-               (version (alist-get 'version
-                                   (leman-api session "room_keys/version"
-                                              :method 'post
-                                              :version "v3"
-                                              :data (json-encode
-                                                     `((algorithm . ,(alist-get 'algorithm created))
-                                                       (auth_data . ,(alist-get 'auth_data created))))
-                                              :then 'sync
-                                              :else nil))))
-          (leman-e2ee-backup-enable agent recovery-key version)
-          (let* ((ssss (leman-e2ee-ssss-create agent))
-                 (key-id (alist-get 'key_id ssss))
-                 (ssss-recovery (alist-get 'recovery_key ssss))
-                 (content (alist-get 'content ssss))
-                 (encrypted (leman-e2ee-ssss-encrypt-secret
-                             agent key-id ssss-recovery content
-                             "m.megolm_backup.v1"
-                             (base64-encode-string recovery-key t))))
-            (leman-e2ee--account-data-put
-             session (format "m.secret_storage.key.%s" key-id) content)
-            (leman-e2ee--account-data-put
-             session "m.secret_storage.default_key" `((key . ,key-id)))
-            (leman-e2ee--account-data-put
-             session "m.secret_storage.secret.m.megolm_backup.v1"
-             `((encrypted . ((,key-id . ,encrypted)))))
-            (leman-e2ee--backup-pump session agent)
-            (with-output-to-temp-buffer "*Leman key backup*"
-              (princ (format "Key backup is set up.  Save these recovery keys somewhere safe
+        (let ((default-key-id (ignore-errors
+                                (alist-get 'key
+                                           (leman-e2ee--account-data-get
+                                            session "m.secret_storage.default_key")))))
+          (if default-key-id
+              (leman-e2ee--restore-backup session agent 'adopt)
+            (leman-e2ee--create-backup session agent)))
+      (leman-e2ee-error
+       (user-error "Leman E2EE: setting up key backup failed: %s" (cdr err)))
+      (plz-error
+       (user-error "Leman E2EE: setting up key backup failed: %S" (cdr err))))))
+
+(defun leman-e2ee--create-backup (session agent)
+  "Create a fresh backup and secret-storage default key for SESSION."
+  (let* ((created (leman-e2ee-backup-create agent))
+         (recovery-key (alist-get 'recovery_key created))
+         (existing-version (ignore-errors
+                             (leman-api session "room_keys/version"
+                                        :version "v3"
+                                        :then 'sync
+                                        :else nil)))
+         (version (alist-get 'version
+                             (leman-api session "room_keys/version"
+                                        :method 'post
+                                        :version "v3"
+                                        :data (json-encode
+                                               `((algorithm . ,(alist-get 'algorithm created))
+                                                 (auth_data . ,(alist-get 'auth_data created))))
+                                        :then 'sync
+                                        :else nil)))
+         (ssss (leman-e2ee-ssss-create agent))
+         (key-id (alist-get 'key_id ssss))
+         (ssss-recovery (alist-get 'recovery_key ssss))
+         (content (alist-get 'content ssss))
+         (encrypted (leman-e2ee-ssss-encrypt-secret
+                     agent key-id ssss-recovery content
+                     "m.megolm_backup.v1"
+                     (base64-encode-string recovery-key t))))
+    (when existing-version
+      (leman-message
+       "Leman E2EE: replacing existing backup version %s (its backed-up keys stay in that version)"
+       (alist-get 'version existing-version)))
+    (leman-e2ee-backup-enable agent recovery-key version)
+    (leman-e2ee--account-data-put
+     session (format "m.secret_storage.key.%s" key-id) content)
+    (leman-e2ee--account-data-put
+     session "m.secret_storage.default_key" `((key . ,key-id)))
+    (leman-e2ee--account-data-put
+     session "m.secret_storage.secret.m.megolm_backup.v1"
+     `((encrypted . ((,key-id . ,encrypted)))))
+    (leman-e2ee--backup-pump session agent)
+    (with-output-to-temp-buffer "*Leman key backup*"
+      (princ (format "Key backup is set up.  Save these recovery keys somewhere safe
 \(e.g. a password manager); they cannot be shown again.
 
 Secret storage recovery key (the one to enter on a new device
@@ -841,61 +1031,20 @@ Backup recovery key (also stored in secret storage):
 
 The room keys are being backed up in the background.
 " ssss-recovery recovery-key)))))
-      (leman-e2ee-error
-       (user-error "Leman E2EE: setting up key backup failed: %s" (cdr err)))
-      (plz-error
-       (user-error "Leman E2EE: setting up key backup failed: %S" (cdr err))))))
 
 (defun leman-e2ee-restore-keys (session)
   "Restore SESSION's message history from the server-side key backup.
 Ask for the secret-storage recovery key, unlock the backup's
 decryption key stored in secret storage, enable the backup, and
-import its room keys."
+import its room keys.  Every secret-storage key stored on the
+account is tried, so the recovery key of any of them works (e.g.
+after the default key was changed in another client)."
   (interactive (list (leman-complete-session)))
   (let ((agent (leman-session-e2ee session)))
     (unless agent
       (user-error "Leman E2EE: no agent running (try reconnecting)"))
     (condition-case err
-        (let* ((default-key (leman-e2ee--account-data-get
-                             session "m.secret_storage.default_key"))
-               (key-id (alist-get 'key default-key))
-               (key-content (leman-e2ee--account-data-get
-                             session (format "m.secret_storage.key.%s" key-id)))
-               (secret (leman-e2ee--account-data-get
-                        session "m.secret_storage.secret.m.megolm_backup.v1"))
-               (data (alist-get key-id (alist-get 'encrypted secret) nil nil #'equal))
-               (recovery-key (read-string "Secret storage recovery key: "))
-               (backup-recovery
-                (decode-coding-string
-                 (base64-decode-string
-                  (leman-e2ee-ssss-decrypt-secret
-                   agent key-id recovery-key key-content
-                   "m.megolm_backup.v1"
-                   (alist-get 'iv data)
-                   (alist-get 'ciphertext data)
-                   (alist-get 'mac data)))
-                 'utf-8))
-               (version-info (leman-api session "room_keys/version"
-                                        :version "v3"
-                                        :then 'sync
-                                        :else nil))
-               (backup-info `((algorithm . ,(alist-get 'algorithm version-info))
-                              (auth_data . ,(alist-get 'auth_data version-info)))))
-          (unless (equal (leman-e2ee-backup-verify agent backup-recovery backup-info) t)
-            (user-error "Leman E2EE: the recovery key does not match the backup"))
-          (leman-e2ee-backup-enable agent backup-recovery (alist-get 'version version-info))
-          (let* ((downloaded (leman-api session "room_keys/keys"
-                                        :version "v3"
-                                        :params (list (list "version"
-                                                            (alist-get 'version version-info)))
-                                        :then 'sync
-                                        :else nil))
-                 (result (leman-e2ee-backup-import
-                          agent backup-recovery (alist-get 'rooms downloaded))))
-            (leman-message
-             "Leman E2EE: restored %s of %s room keys from backup"
-             (alist-get 'imported result) (alist-get 'total result))
-            (leman-e2ee--backup-pump session agent)))
+        (leman-e2ee--restore-backup session agent)
       (leman-e2ee-error
        (user-error "Leman E2EE: restoring keys failed: %s" (cdr err)))
       (plz-error
@@ -1007,9 +1156,9 @@ To be called from `leman-disconnect-hook'."
 
 (defun leman--initial-transaction-id ()
   "Return an initial transaction ID for a new session."
-  ;; We generate a somewhat-random initial transaction ID to avoid potential conflicts in
-  ;; case, e.g. using Pantalaimon causes a transaction ID conflict.  See
-  ;; <https://github.com/alphapapa/ement.el/issues/36>.
+  ;; We generate a somewhat-random initial transaction ID to avoid
+  ;; potential transaction ID conflicts between sessions and clients.
+  ;; See <https://github.com/alphapapa/ement.el/issues/36>.
   (cl-parse-integer
    (secure-hash 'sha256 (prin1-to-string (list (current-time) (system-name))))
    :end 8 :radix 16))

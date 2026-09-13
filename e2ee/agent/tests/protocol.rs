@@ -820,6 +820,21 @@ async fn test_backup_restore_round_trip() {
                "name": "m.megolm_backup.v1", "secret": secret_b64}),
     );
 
+    // The recovery key must verify against the key content...
+    let checked = agent_a.request(
+        "ssss_check_key",
+        json!({"key_id": key_id, "recovery_key": ssss_recovery,
+               "key_content": ssss["ok"]["content"]}),
+    );
+    assert_eq!(checked["ok"]["valid"], json!(true));
+    // ...and a wrong key must be rejected.
+    let rejected = agent_a.request(
+        "ssss_check_key",
+        json!({"key_id": key_id, "recovery_key": "EsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+               "key_content": ssss["ok"]["content"]}),
+    );
+    assert!(rejected["err"].is_object(), "{rejected}");
+
     // Restore: a fresh device of the same user with the SSSS
     // recovery key.
     let store_b = TempDir::new().unwrap();
@@ -833,6 +848,13 @@ async fn test_backup_restore_round_trip() {
             )["ok"]
             .is_object()
     );
+    // On the new device the recovery key verifies before use.
+    let checked_b = agent_b.request(
+        "ssss_check_key",
+        json!({"key_id": key_id, "recovery_key": ssss_recovery,
+               "key_content": ssss["ok"]["content"]}),
+    );
+    assert_eq!(checked_b["ok"]["valid"], json!(true));
     let decrypted_secret = agent_b.request(
         "ssss_decrypt_secret",
         json!({"key_id": key_id, "recovery_key": ssss_recovery,

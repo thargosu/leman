@@ -534,6 +534,19 @@ secret's name (e.g. ~m.megolm_backup.v1~).  The encrypted data
 The ~m.megolm_backup.v1~ secret's plaintext is the base58 backup
 decryption key.
 
+** ~ssss_check_key~
+
+Checks whether a recovery key unlocks the SSSS key described by
+KEY_CONTENT (the zero-message MAC check); errs otherwise.  The
+client uses this to verify a recovery key before adopting an
+existing secret-storage setup.
+
+#+begin_src json
+{"id": 30, "cmd": "ssss_check_key", "params": {
+  "key_id": "<id>", "recovery_key": "<base58>", "key_content": {...}}}
+{"id": 30, "ok": {"valid": true}}
+#+end_src
+
 ** Client flows
 
 Setup (a device that has room keys):

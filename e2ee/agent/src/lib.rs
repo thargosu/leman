@@ -181,6 +181,7 @@ impl Agent {
             "ssss_create" => self.ssss_create().await,
             "ssss_encrypt_secret" => self.ssss_encrypt_secret(params).await,
             "ssss_decrypt_secret" => self.ssss_decrypt_secret(params).await,
+            "ssss_check_key" => self.ssss_check_key(params).await,
             other => Err(AgentError::UnknownCommand(other.to_owned())),
         }
     }
@@ -1075,6 +1076,13 @@ impl Agent {
         };
         let plaintext = key.decrypt(&data, &name).map_err(crypto_error)?;
         Ok(json!({"secret": base64_encode(&plaintext)}))
+    }
+
+    /// Check whether the recovery key unlocks the SSSS key described
+    /// by key_content (the zero-message MAC check).
+    async fn ssss_check_key(&self, params: Value) -> CommandResult {
+        self.ssss_key_from_params(&params)?;
+        Ok(json!({"valid": true}))
     }
 
     /// Fetch the live SAS object of a flow.

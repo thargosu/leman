@@ -933,7 +933,7 @@ impl Agent {
         let body = json!({"version": keys_backup.version, "rooms": keys_backup.rooms});
         Ok(json!({"request": {
             "id": txn_id.as_str(),
-            "path": format!("/room_keys/keys/{}", keys_backup.version),
+            "path": format!("/_matrix/client/v3/room_keys/keys/{}", keys_backup.version),
             "body": body.to_string(),
         }}))
     }

@@ -388,4 +388,173 @@ Cancels the request or SAS.
    ordinary outgoing requests); the peer's events arrive via sync and
    ~receive_sync_changes~, so each step may need a sync in between.
 
-+ Key backup commands (SSSS).
+* E4: key backup and secret storage (SSSS)
+
+Backing up room keys to the homeserver (Megolm backup v1) so that a
+new device can restore its message history, and storing the backup's
+decryption key in SSSS (secret storage) under the standard
+~m.megolm_backup.v1~ secret name (Element interoperates with this).
+
+Two distinct keys are involved, as in the rest of the Matrix
+ecosystem:
+
++ the *backup decryption key* (curve25519, shown to the user as the
+  backup's recovery key in base58; its private half decrypts the
+  backup), and
++ the *SSSS default key* (aes-hmac-sha2, shown as the secret-storage
+  recovery key in base58; it encrypts secrets in account data).
+
+For the backup's auth data the device signs with its ed25519 key.
+
+All commands below are agent commands; the client performs the
+corresponding HTTP calls (room_keys, account data) — same split as
+everywhere else.
+
+** ~backup_create~
+
+Generates a fresh backup decryption key and the signed auth data for
+a new backup version.  (Device-side; the client creates the version
+on the server with these.)
+
+#+begin_src json
+{"id": 20, "cmd": "backup_create"}
+{"id": 20, "ok": {
+  "recovery_key": "<base58>",
+  "algorithm": "m.megolm_backup.v1.curve25519-aes-sha2",
+  "auth_data": {"public_key": "<base64>", "signatures": {...}}}}
+#+end_src
+
+** ~backup_enable~
+
+Imports a backup decryption key (base58) and enables backing up
+future room keys for VERSION.  Also used by a NEW device to adopt a
+backup for restoring.
+
+#+begin_src json
+{"id": 21, "cmd": "backup_enable", "params": {
+  "recovery_key": "<base58>", "version": "<version>"}}
+{"id": 21, "ok": {}}
+#+end_src
+
+** ~backup_verify~
+
+Checks whether a recovery key matches a backup's auth data (the
+~m.room_key.backup~ account data).  The client calls this before
+adopting a backup.
+
+#+begin_src json
+{"id": 22, "cmd": "backup_verify", "params": {
+  "recovery_key": "<base58>", "auth_data": {...}}}
+{"id": 22, "ok": {"matches": true}}
+#+end_src
+
+** ~backup_status~
+
+#+begin_src json
+{"id": 23, "cmd": "backup_status"}
+{"id": 23, "ok": {
+  "enabled": true, "version": "<version>",
+  "room_key_counts": {"total": 42, "backed_up": 40}}}
+#+end_src
+
+** ~backup_room_keys~
+
+Encrypts the not-yet-backed-up room keys.  Returns a request for
+~POST /room_keys/keys/{version}~ (body is a pre-encoded JSON string),
+or null when there is nothing to back up.
+
+#+begin_src json
+{"id": 24, "cmd": "backup_room_keys"}
+{"id": 24, "ok": {"request": {
+  "id": "<txn-id>",
+  "path": "/room_keys/keys/<version>",
+  "body": "{...}"}}}
+#+end_src
+
+** ~backup_mark_as_sent~
+
+Reports that a backup request was performed.
+
+#+begin_src json
+{"id": 25, "cmd": "backup_mark_as_sent", "params": {"id": "<txn-id>"}}
+{"id": 25, "ok": {}}
+#+end_src
+
+** ~backup_import~
+
+Imports room keys downloaded with
+~GET /room_keys/keys?version=<version>~ (the ~rooms~ object of the
+response, as JSON).
+
+#+begin_src json
+{"id": 26, "cmd": "backup_import", "params": {"rooms": {...}}}
+{"id": 26, "ok": {"imported": 30, "total": 30}}
+#+end_src
+
+** ~ssss_create~
+
+Generates the secret storage default key.
+
+#+begin_src json
+{"id": 27, "cmd": "ssss_create"}
+{"id": 27, "ok": {
+  "key_id": "<id>",
+  "recovery_key": "<base58>",
+  "content": {"algorithm": "m.secret_storage.v1.aes-hmac-sha2",
+              "iv": "...", "mac": "..."}}}
+#+end_src
+
+The client uploads ~content~ as the ~m.secret_storage.key.<key_id>~
+account data and ~{"key": "<key_id>"}~ as
+~m.secret_storage.default_key~.
+
+** ~ssss_encrypt_secret~ / ~ssss_decrypt_secret~
+
+Encrypts/decrypts a named secret with the SSSS key.  NAME is the
+secret's name (e.g. ~m.megolm_backup.v1~).  The encrypted data
+({~ciphertext~, ~iv~, ~mac~}) is stored as the
+~m.secret_storage.secret.<name>~ account data.
+
+#+begin_src json
+{"id": 28, "cmd": "ssss_encrypt_secret", "params": {
+  "key_id": "<id>", "recovery_key": "<base58>",
+  "name": "m.megolm_backup.v1", "secret": "<base64>"}}
+{"id": 28, "ok": {"iv": "...", "ciphertext": "...", "mac": "..."}}
+
+{"id": 29, "cmd": "ssss_decrypt_secret", "params": {
+  "key_id": "<id>", "recovery_key": "<base58>",
+  "name": "m.megolm_backup.v1",
+  "iv": "...", "ciphertext": "...", "mac": "..."}}
+{"id": 29, "ok": {"secret": "<base64>"}}
+#+end_src
+
+The ~m.megolm_backup.v1~ secret's plaintext is the base58 backup
+decryption key.
+
+** Client flows
+
+Setup (a device that has room keys):
+
+1. ~backup_create~ → ~POST /room_keys/version~ with the returned
+   ~algorithm~ and ~auth_data~ → the response gives the ~version~.
+2. ~backup_enable~ with the recovery key and version.
+3. ~ssss_create~ → upload the default key and key content account
+   data → ~ssss_encrypt_secret~ with the backup's recovery key →
+   upload ~m.secret_storage.secret.m.megolm_backup.v1~.
+4. Loop ~backup_room_keys~ → perform the request → ~backup_mark_as_sent~,
+   until there is nothing left to back up; repeat after syncs.
+
+Restore (a new device, e.g. after a fresh login):
+
+1. Read account data: ~m.secret_storage.default_key~,
+   ~m.secret_storage.key.<key_id>~,
+   ~m.secret_storage.secret.m.megolm_backup.v1~, and
+   ~m.room_key.backup~ (the version's auth data).
+2. Ask the user for the secret-storage recovery key.
+3. ~ssss_decrypt_secret~ → the base58 backup decryption key.
+4. ~backup_verify~ against ~m.room_key.backup~'s auth data; if it
+   matches, ~backup_enable~ with the backup's version.
+5. ~GET /room_keys/keys?version=<version>~ → ~backup_import~.
+
+The client surfaces a ~leman-e2ee-restore-keys~ command for the
+restore flow and backs up keys periodically after syncs.

@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 use anyhow::{anyhow, Context, Result};
 use matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent;
 use matrix_sdk_crypto::{
-    types::events::room::encrypted::EncryptedEvent, types::requests::AnyOutgoingRequest,
+    types::events::room::encrypted::EncryptedEvent,
+    types::requests::{AnyOutgoingRequest, OutgoingVerificationRequest},
     DecryptionSettings, EncryptionSettings, EncryptionSyncChanges, OlmMachine,
     TrustRequirement,
 };
@@ -152,6 +153,15 @@ impl Agent {
             "decrypt_room_event" => self.decrypt_room_event(params).await,
             "update_tracked_users" => self.update_tracked_users(params).await,
             "encrypt_room_event" => self.encrypt_room_event(params).await,
+            "devices" => self.devices(params).await,
+            "request_verification" => self.request_verification(params).await,
+            "verification_requests" => self.verification_requests(params).await,
+            "accept_verification" => self.accept_verification(params).await,
+            "start_sas" => self.start_sas(params).await,
+            "verification_sas" => self.verification_sas(params).await,
+            "accept_sas" => self.accept_sas(params).await,
+            "confirm_sas" => self.confirm_sas(params).await,
+            "cancel_verification" => self.cancel_verification(params).await,
             other => Err(AgentError::UnknownCommand(other.to_owned())),
         }
     }
@@ -268,8 +278,17 @@ impl Agent {
                 "body": body,
             }));
         }
-        // Include requests stashed by commands like `encrypt_room_event`.
-        serialized.append(&mut self.extra_requests);
+        // Include requests stashed by commands like `encrypt_room_event`
+        // or the verification dance.  Skip ones the machine also queued
+        // (same transaction id) so they are not performed twice.
+        let seen: std::collections::HashSet<String> =
+            serialized.iter().map(|entry| entry["id"].as_str().unwrap_or_default().to_owned()).collect();
+        for extra in self.extra_requests.drain(..) {
+            let id = extra["id"].as_str().unwrap_or_default().to_owned();
+            if !seen.contains(&id) {
+                serialized.push(extra);
+            }
+        }
         Ok(json!({"requests": serialized}))
     }
 
@@ -578,6 +597,245 @@ impl Agent {
             "status": "ok",
             "event": {"type": "m.room.encrypted", "content": encrypted_content},
         }))
+    }
+
+    /// List a user's known devices (E3), with their verification state.
+    async fn devices(&mut self, params: Value) -> CommandResult {
+        let machine = self.machine()?;
+        let user_id: ruma::OwnedUserId = match params.get("user_id").and_then(Value::as_str) {
+            Some(user) => user.parse().map_err(crypto_error)?,
+            None => machine.user_id().to_owned(),
+        };
+        let devices = machine
+            .get_user_devices(&user_id, None)
+            .await
+            .map_err(crypto_error)?;
+        let list = devices
+            .devices()
+            .map(|device| {
+                json!({
+                    "device_id": device.device_id(),
+                    "display_name": device.display_name(),
+                    "verified": device.is_verified(),
+                    "deleted": device.is_deleted(),
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({"devices": list}))
+    }
+
+    /// Start verifying a device (E3).  The initial
+    /// m.key.verification.request is returned directly by the state
+    /// machine (not queued in its outgoing requests), so it must be
+    /// stashed here.
+    async fn request_verification(&mut self, params: Value) -> CommandResult {
+        let machine = self.machine()?;
+        let user_id: ruma::OwnedUserId = param_str(&params, "user_id")?.parse().map_err(crypto_error)?;
+        let device_id = ruma::OwnedDeviceId::from(param_str(&params, "device_id")?);
+        let device = machine
+            .get_device(&user_id, &device_id, None)
+            .await
+            .map_err(crypto_error)?
+            .ok_or_else(|| AgentError::Crypto(anyhow!("unknown device {device_id}")))?;
+        let (request, outgoing) = device.request_verification();
+        let flow_id = request.flow_id().as_str().to_owned();
+        self.stash_outgoing_verification(outgoing);
+        Ok(json!({"flow_id": flow_id}))
+    }
+
+    /// List the known verification requests for a user (the machine's
+    /// own user by default), including whether a SAS object exists.
+    async fn verification_requests(&mut self, params: Value) -> CommandResult {
+        let machine = self.machine()?;
+        let user_id: ruma::OwnedUserId = match params.get("user_id").and_then(Value::as_str) {
+            Some(user) => user.parse().map_err(crypto_error)?,
+            None => machine.user_id().to_owned(),
+        };
+        let requests = machine
+            .get_verification_requests(&user_id)
+            .into_iter()
+            .map(|request| {
+                let state = if request.is_done() {
+                    "done"
+                } else if request.is_cancelled() {
+                    "cancelled"
+                } else if request.is_ready() {
+                    "ready"
+                } else {
+                    "created"
+                };
+                let flow_id = request.flow_id().as_str().to_owned();
+                let sas = machine
+                    .get_verification(&user_id, &flow_id)
+                    .map(|verification| matches!(verification, matrix_sdk_crypto::Verification::SasV1(_)))
+                    .unwrap_or(false);
+                json!({
+                    "flow_id": flow_id,
+                    "user_id": request.other_user(),
+                    "device_id": request.other_device_id(),
+                    "state": state,
+                    "we_started": request.we_started(),
+                    "sas": sas,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({"requests": requests}))
+    }
+
+    /// Accept an incoming verification request (sends ready).
+    async fn accept_verification(&mut self, params: Value) -> CommandResult {
+        let (request, user_id, flow_id) = self.verification_request(&params)?;
+        if let Some(outgoing) = request.accept() {
+            self.stash_outgoing_verification(outgoing);
+        }
+        Ok(json!({"flow_id": flow_id, "user_id": user_id}))
+    }
+
+    /// Start SAS for a request (sends start), or report an existing
+    /// SAS when their start already arrived.
+    async fn start_sas(&mut self, params: Value) -> CommandResult {
+        let (request, user_id, flow_id) = self.verification_request(&params)?;
+        match request.start_sas().await.map_err(crypto_error)? {
+            Some((_sas, outgoing)) => {
+                self.stash_outgoing_verification(outgoing);
+                Ok(json!({"flow_id": flow_id, "user_id": user_id}))
+            }
+            None => Ok(json!({"flow_id": flow_id, "user_id": user_id})),
+        }
+    }
+
+    /// Report the SAS state of a flow (emoji, presented, done, ...).
+    async fn verification_sas(&mut self, params: Value) -> CommandResult {
+        let machine = self.machine()?;
+        let (user_id, flow_id) = self.verification_ids(&params)?;
+        let sas = self.verification_sas_for(machine, &user_id, &flow_id)?;
+        let emoji = sas.emoji().map(|emojis| {
+            let indices = sas.emoji_index().unwrap_or([0; 7]);
+            emojis
+                .iter()
+                .enumerate()
+                .map(|(i, emoji)| {
+                    json!({
+                        "number": indices[i],
+                        "symbol": emoji.symbol,
+                        "description": emoji.description,
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        Ok(json!({
+            "accepted": sas.has_been_accepted(),
+            "can_be_presented": sas.can_be_presented(),
+            "done": sas.is_done(),
+            "cancelled": sas.is_cancelled(),
+            "emoji": emoji,
+        }))
+    }
+
+    /// Accept their SAS start (sends accept).
+    async fn accept_sas(&mut self, params: Value) -> CommandResult {
+        let machine = self.machine()?;
+        let (user_id, flow_id) = self.verification_ids(&params)?;
+        let sas = self.verification_sas_for(machine, &user_id, &flow_id)?;
+        if let Some(outgoing) = sas.accept() {
+            self.stash_outgoing_verification(outgoing);
+        }
+        Ok(json!({}))
+    }
+
+    /// Confirm the short auth string (sends mac; a signature upload
+    /// may follow via outgoing_requests).
+    async fn confirm_sas(&mut self, params: Value) -> CommandResult {
+        let machine = self.machine()?;
+        let (user_id, flow_id) = self.verification_ids(&params)?;
+        let sas = self.verification_sas_for(machine, &user_id, &flow_id)?;
+        let (requests, signature_upload) = sas.confirm().await.map_err(crypto_error)?;
+        for outgoing in requests {
+            self.stash_outgoing_verification(outgoing);
+        }
+        if let Some(upload) = signature_upload {
+            let request_id = ruma::TransactionId::new().to_string();
+            let body = serde_json::to_string(&json!({"signed_keys": upload.signed_keys}))
+                .context("serializing signature upload body")
+                .map_err(crypto_error)?;
+            self.pending.insert(request_id.clone(), PendingKind::SignatureUpload);
+            self.extra_requests.push(json!({
+                "id": request_id,
+                "method": "POST",
+                "path": "/_matrix/client/v3/keys/upload_signatures",
+                "body": body,
+            }));
+        }
+        Ok(json!({}))
+    }
+
+    /// Cancel a verification request or SAS.
+    async fn cancel_verification(&mut self, params: Value) -> CommandResult {
+        let (request, _user_id, _flow_id) = self.verification_request(&params)?;
+        if let Some(outgoing) = request.cancel() {
+            self.stash_outgoing_verification(outgoing);
+        }
+        Ok(json!({}))
+    }
+
+    /// Fetch the live SAS object of a flow.
+    fn verification_sas_for(
+        &self,
+        machine: &OlmMachine,
+        user_id: &ruma::UserId,
+        flow_id: &str,
+    ) -> Result<matrix_sdk_crypto::Sas, AgentError> {
+        match machine.get_verification(user_id, flow_id) {
+            Some(matrix_sdk_crypto::Verification::SasV1(sas)) => Ok(*sas),
+            _ => Err(AgentError::Crypto(anyhow!(
+                "no SAS verification for flow {flow_id}"
+            ))),
+        }
+    }
+
+    /// Parse user_id + flow_id from verification command params.
+    fn verification_ids(&self, params: &Value) -> Result<(ruma::OwnedUserId, String), AgentError> {
+        let user_id: ruma::OwnedUserId =
+            param_str(params, "user_id")?.parse().map_err(crypto_error)?;
+        let flow_id = param_str(params, "flow_id")?.to_owned();
+        Ok((user_id, flow_id))
+    }
+
+    /// Fetch the verification request for user_id + flow_id params.
+    fn verification_request(
+        &self,
+        params: &Value,
+    ) -> Result<(matrix_sdk_crypto::VerificationRequest, ruma::OwnedUserId, String), AgentError>
+    {
+        let machine = self.machine()?;
+        let (user_id, flow_id) = self.verification_ids(params)?;
+        let request = machine
+            .get_verification_request(&user_id, &flow_id)
+            .ok_or_else(|| AgentError::Crypto(anyhow!("no verification request for flow {flow_id}")))?;
+        Ok((request, user_id, flow_id))
+    }
+
+    /// Queue a returned outgoing verification request for the client
+    /// to perform.  If the machine's own outgoing requests already
+    /// contain it (same transaction id), the pump's dedup skips the
+    /// stashed copy.
+    fn stash_outgoing_verification(&mut self, outgoing: OutgoingVerificationRequest) {
+        if let OutgoingVerificationRequest::ToDevice(to_device) = outgoing {
+            let Ok(body) = serde_json::to_string(&json!({"messages": to_device.messages})) else {
+                return;
+            };
+            let request_id = to_device.txn_id.as_str().to_owned();
+            self.pending.insert(request_id.clone(), PendingKind::ToDevice);
+            self.extra_requests.push(json!({
+                "id": request_id,
+                "method": "PUT",
+                "path": format!(
+                    "/_matrix/client/v3/sendToDevice/{}/{}",
+                    to_device.event_type, to_device.txn_id
+                ),
+                "body": body,
+            }));
+        }
     }
 }
 

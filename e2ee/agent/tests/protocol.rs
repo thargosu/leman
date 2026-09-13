@@ -10,7 +10,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 
 use matrix_sdk_crypto::{
-    types::events::room::encrypted::EncryptedEvent, types::requests::AnyOutgoingRequest,
+    types::events::room::encrypted::EncryptedEvent,
+    types::requests::{AnyOutgoingRequest, OutgoingVerificationRequest},
     DecryptionSettings, EncryptionSyncChanges, OlmMachine, TrustRequirement,
 };
 use ruma::api::client::keys::upload_keys::v3::Response as UploadKeysResponse;
@@ -632,4 +633,462 @@ async fn test_restart_persistence() {
         json!("It's a secret to everybody."),
         "sessions must survive an agent restart"
     );
+}
+
+/// The current time as a to-device event origin_server_ts (the fake
+/// homeserver stamps events like a real one would).
+fn now_ts() -> Value {
+    json!(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64)
+}
+
+/// Convert an outgoing verification request's to-device messages into
+/// raw to-device events (as the homeserver would deliver them).
+fn verification_to_device_events(
+    request: &OutgoingVerificationRequest,
+    sender: &ruma::UserId,
+) -> Vec<Value> {
+    let mut events = Vec::new();
+    if let OutgoingVerificationRequest::ToDevice(to_device) = request {
+        for devices in to_device.messages.values() {
+            for _device in devices.keys() {
+                events.push(json!({
+                    "sender": sender,
+                    "type": serde_json::to_value(&to_device.event_type).unwrap(),
+                    "origin_server_ts": now_ts(),
+                    "content": serde_json::to_value(
+                        devices.values().next().unwrap(),
+                    )
+                    .unwrap(),
+                }));
+            }
+        }
+    }
+    events
+}
+
+/// Deliver to-device events to the agent.
+async fn feed_agent(agent: &mut TestAgent, events: Vec<Value>) {
+    if events.is_empty() {
+        return;
+    }
+    let events: Vec<Value> = events
+        .into_iter()
+        .map(|mut event| {
+            // Stamp events that only carry bare content.
+            if event.get("origin_server_ts").is_none() {
+                event["origin_server_ts"] = now_ts();
+            }
+            event
+        })
+        .collect();
+    let response = agent.request(
+        "receive_sync_changes",
+        json!({
+            "to_device_events": events,
+            "changed_devices": null,
+            "one_time_keys_count": null,
+            "unused_fallback_keys": null,
+            "next_batch_token": null,
+        }),
+    );
+    assert!(response["ok"].is_object(), "feed_agent: {response}");
+}
+
+/// Perform the agent's outgoing requests against the virtual
+/// homeserver, delivering to-device messages to ALICE's machine
+/// (in-process, same user) and answering keys/query with both
+/// devices' keys.  Returns when no outgoing requests remain.
+async fn exchange_verification_traffic(
+    agent: &mut TestAgent,
+    alice: &OlmMachine,
+    alice_device_keys: &Value,
+    agent_device_keys: &Value,
+) {
+    use ruma::api::client::keys::get_keys::v3::Response as GetKeysResponse;
+    use ruma::{device_id, serde::Raw, user_id};
+
+    for _round in 0..20 {
+        let mut quiet = true;
+
+        // Agent -> Alice.
+        let outgoing = agent.request("outgoing_requests", json!({}));
+        let requests = outgoing["ok"]["requests"].as_array().unwrap().clone();
+        if !requests.is_empty() {
+            quiet = false;
+        }
+        let mut for_alice = Vec::new();
+        for request in requests {
+            let path = request["path"].as_str().unwrap().to_owned();
+            if path.contains("/keys/upload") {
+                let body: Value =
+                    serde_json::from_str(request["body"].as_str().unwrap()).unwrap();
+                let otk_count =
+                    body["one_time_keys"].as_object().map(|k| k.len()).unwrap_or(0);
+                agent.request(
+                    "mark_request_as_sent",
+                    json!({"request_id": request["id"],
+                           "response": {"one_time_key_counts": {"signed_curve25519": otk_count}}}),
+                );
+            } else if path.contains("/keys/query") {
+                agent.request(
+                    "mark_request_as_sent",
+                    json!({"request_id": request["id"], "response": {
+                        "device_keys": {"@bob:example.org": {
+                            "BOBDEVICE": agent_device_keys,
+                            "ALICEDEVICE": alice_device_keys,
+                        }},
+                        "failures": {},
+                    }}),
+                );
+            } else if path.contains("/keys/claim") {
+                // Alice has no one-time keys uploaded in this test's
+                // scenario beyond her initial upload; answer from the
+                // initial upload passed via the closure is not
+                // available here, so answer with an empty map (the
+                // verification flow does not need to claim keys for
+                // self-verification with both keys known).
+                agent.request(
+                    "mark_request_as_sent",
+                    json!({"request_id": request["id"], "response": {
+                        "one_time_keys": {}, "failures": {},
+                    }}),
+                );
+            } else if path.contains("/upload_signatures") {
+                agent.request(
+                    "mark_request_as_sent",
+                    json!({"request_id": request["id"], "response": {"failures": {}}}),
+                );
+            } else if path.contains("/sendToDevice") {
+                let body: Value =
+                    serde_json::from_str(request["body"].as_str().unwrap()).unwrap();
+                let event_type = path
+                    .split('/')
+                    .nth(5)
+                    .expect("event type in sendToDevice path")
+                    .to_owned();
+                if let Some(messages) = body["messages"].as_object() {
+                    for (_user, devices) in messages {
+                        if let Some(devices) = devices.as_object() {
+                            for content in devices.values() {
+                                for_alice.push(json!({
+                                    "sender": "@bob:example.org",
+                                    "type": event_type,
+                                    "origin_server_ts": now_ts(),
+                                    "content": content,
+                                }));
+                            }
+                        }
+                    }
+                }
+                agent.request(
+                    "mark_request_as_sent",
+                    json!({"request_id": request["id"], "response": {}}),
+                );
+            } else {
+                panic!("unexpected outgoing request path: {path}");
+            }
+        }
+        if !for_alice.is_empty() {
+            let events = for_alice
+                .iter()
+                .map(raw_from_value::<AnyToDeviceEvent>)
+                .collect();
+            alice
+                .receive_sync_changes(
+                    EncryptionSyncChanges {
+                        to_device_events: events,
+                        changed_devices: &Default::default(),
+                        one_time_keys_counts: &Default::default(),
+                        unused_fallback_keys: None,
+                        next_batch_token: None,
+                    },
+                    &DecryptionSettings {
+                        sender_device_trust_requirement: TrustRequirement::Untrusted,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        // Alice -> Agent.
+        let mut for_agent = Vec::new();
+        for request in alice.outgoing_requests().await.unwrap() {
+            quiet = false;
+            match request.request() {
+                AnyOutgoingRequest::KeysUpload(_) => {
+                    alice
+                        .mark_request_as_sent(
+                            request.request_id(),
+                            &UploadKeysResponse::new(BTreeMap::new()),
+                        )
+                        .await
+                        .unwrap();
+                }
+                AnyOutgoingRequest::KeysQuery(_) => {
+                    let mut response = GetKeysResponse::new();
+                    response.device_keys.insert(
+                        user_id!("@bob:example.org").to_owned(),
+                        {
+                            let mut devices = BTreeMap::new();
+                            devices.insert(
+                                device_id!("ALICEDEVICE").to_owned(),
+                                serde_json::from_value::<Raw<ruma::encryption::DeviceKeys>>(
+                                    alice_device_keys.clone(),
+                                )
+                                .unwrap(),
+                            );
+                            devices.insert(
+                                device_id!("BOBDEVICE").to_owned(),
+                                serde_json::from_value::<Raw<ruma::encryption::DeviceKeys>>(
+                                    agent_device_keys.clone(),
+                                )
+                                .unwrap(),
+                            );
+                            devices
+                        },
+                    );
+                    alice
+                        .mark_request_as_sent(request.request_id(), &response)
+                        .await
+                        .unwrap();
+                }
+                AnyOutgoingRequest::ToDeviceRequest(to_device) => {
+                    for devices in to_device.messages.values() {
+                        for content in devices.values() {
+                            for_agent.push(json!({
+                                "sender": "@bob:example.org",
+                                "type": serde_json::to_value(&to_device.event_type).unwrap(),
+                                "content": serde_json::to_value(content).unwrap(),
+                            }));
+                        }
+                    }
+                    alice
+                        .mark_request_as_sent(
+                            request.request_id(),
+                            &ruma::api::client::to_device::send_event_to_device::v3::Response::new(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                AnyOutgoingRequest::SignatureUpload(_) => {
+                    alice
+                        .mark_request_as_sent(
+                            request.request_id(),
+                            &ruma::api::client::keys::upload_signatures::v3::Response::new(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                other => panic!("unexpected alice outgoing request: {other:?}"),
+            }
+        }
+        feed_agent(agent, for_agent).await;
+
+        if quiet {
+            break;
+        }
+    }
+}
+
+/// The full SAS verification dance: an in-process machine (Alice
+/// device of the agent's own user) verifies the agent's device
+/// through the protocol, exactly as Element would.
+#[tokio::test]
+async fn test_verification_sas_round_trip() {
+    // The agent (bob @BOBDEVICE).
+    let mut agent = TestAgent::spawn();
+    let store = TempDir::new().unwrap();
+    let initialize = agent.request("initialize", initialize_params(&store));
+    assert!(initialize["ok"].is_object());
+    // Alice: another device of the same user.
+    let alice =
+        OlmMachine::new(ruma::user_id!("@bob:example.org"), ruma::device_id!("ALICEDEVICE")).await;
+    let mut alice_device_keys = None;
+    for request in alice.outgoing_requests().await.unwrap() {
+        if let AnyOutgoingRequest::KeysUpload(upload) = request.request() {
+            alice_device_keys = Some(serde_json::to_value(&upload.device_keys).unwrap());
+            alice
+                .mark_request_as_sent(
+                    request.request_id(),
+                    &UploadKeysResponse::new(BTreeMap::new()),
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let alice_device_keys = alice_device_keys.expect("alice uploads keys");
+
+    // Capture the agent's device keys from its initial key upload and
+    // mark it as sent (the virtual homeserver keeps them).
+    let mut agent_device_keys = None;
+    let outgoing = agent.request("outgoing_requests", json!({}));
+    for request in outgoing["ok"]["requests"].as_array().unwrap() {
+        let path = request["path"].as_str().unwrap().to_owned();
+        if path.contains("/keys/upload") {
+            let body: Value =
+                serde_json::from_str(request["body"].as_str().unwrap()).unwrap();
+            agent_device_keys = Some(body["device_keys"].clone());
+            let otk_count = body["one_time_keys"].as_object().map(|k| k.len()).unwrap_or(0);
+            agent.request(
+                "mark_request_as_sent",
+                json!({"request_id": request["id"],
+                       "response": {"one_time_key_counts": {"signed_curve25519": otk_count}}}),
+            );
+        } else if path.contains("/keys/query") {
+            agent.request(
+                "mark_request_as_sent",
+                json!({"request_id": request["id"], "response": {
+                    "device_keys": {"@bob:example.org": {
+                        "ALICEDEVICE": alice_device_keys,
+                    }},
+                    "failures": {},
+                }}),
+            );
+        }
+    }
+    let agent_device_keys = agent_device_keys.expect("agent uploads keys");
+
+    // Exchange device keys both ways so each machine knows the other.
+    exchange_verification_traffic(
+        &mut agent,
+        &alice,
+        &alice_device_keys,
+        &agent_device_keys,
+    )
+    .await;
+
+    // Alice requests verification of the agent's device.
+    let bob_device = alice
+        .get_device(
+            ruma::user_id!("@bob:example.org"),
+            ruma::device_id!("BOBDEVICE"),
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("alice should know the agent's device after a key query");
+    let (_request, outgoing) = bob_device.request_verification();
+    let events = verification_to_device_events(&outgoing, ruma::user_id!("@bob:example.org"));
+    feed_agent(&mut agent, events).await;
+
+    // The agent sees the incoming request.
+    let requests = agent.request("verification_requests", json!({}));
+    let flow = {
+        let list = requests["ok"]["requests"].as_array().unwrap();
+        assert_eq!(list.len(), 1, "agent should see the request: {requests}");
+        assert_eq!(list[0]["state"], json!("created"));
+        assert_eq!(list[0]["we_started"], json!(false));
+        list[0]["flow_id"].as_str().unwrap().to_owned()
+    };
+
+    // The agent accepts; traffic flows both ways.
+    agent.request(
+        "accept_verification",
+        json!({"user_id": "@bob:example.org", "flow_id": flow}),
+    );
+    exchange_verification_traffic(
+        &mut agent,
+        &alice,
+        &alice_device_keys,
+        &agent_device_keys,
+    )
+    .await;
+
+    // Alice starts the SAS.
+    let request = alice
+        .get_verification_request(ruma::user_id!("@bob:example.org"), &flow)
+        .expect("alice keeps the request");
+
+    let (sas, start) = request.start_sas().await.unwrap().expect("alice starts sas");
+    let events = verification_to_device_events(&start, ruma::user_id!("@bob:example.org"));
+    feed_agent(&mut agent, events).await;
+
+    // The agent has a SAS object; it accepts their start.
+    let requests = agent.request("verification_requests", json!({}));
+    assert_eq!(requests["ok"]["requests"][0]["sas"], json!(true));
+    agent.request(
+        "accept_sas",
+        json!({"user_id": "@bob:example.org", "flow_id": flow}),
+    );
+    exchange_verification_traffic(
+        &mut agent,
+        &alice,
+        &alice_device_keys,
+        &agent_device_keys,
+    )
+    .await;
+
+    // The agent can present the emoji.
+    let sas_state = agent.request(
+        "verification_sas",
+        json!({"user_id": "@bob:example.org", "flow_id": flow}),
+    );
+    assert_eq!(
+        sas_state["ok"]["can_be_presented"],
+        json!(true),
+        "emoji should be presentable: {sas_state}"
+    );
+    let emoji = sas_state["ok"]["emoji"].as_array().unwrap();
+    assert_eq!(emoji.len(), 7);
+    assert!(!emoji[0]["symbol"].as_str().unwrap().is_empty());
+    assert!(emoji[0]["number"].as_u64().is_some());
+
+    // Both sides confirm the short auth string.
+    agent.request(
+        "confirm_sas",
+        json!({"user_id": "@bob:example.org", "flow_id": flow}),
+    );
+    exchange_verification_traffic(
+        &mut agent,
+        &alice,
+        &alice_device_keys,
+        &agent_device_keys,
+    )
+    .await;
+    let (mac_requests, _signature) = sas.confirm().await.unwrap();
+    // The caller must perform the MAC requests returned by confirm.
+    // (They are not queued in the machine's outgoing requests.)
+    for outgoing in mac_requests {
+        let events = verification_to_device_events(&outgoing, ruma::user_id!("@bob:example.org"));
+        feed_agent(&mut agent, events).await;
+    }
+    exchange_verification_traffic(
+        &mut agent,
+        &alice,
+        &alice_device_keys,
+        &agent_device_keys,
+    )
+    .await;
+
+    // Done: the agent's device is verified from Alice's perspective,
+    // and Alice's device is verified from the agent's.
+    let requests = agent.request("verification_requests", json!({}));
+    assert_eq!(requests["ok"]["requests"][0]["state"], json!("done"));
+    let bob_device = alice
+        .get_device(
+            ruma::user_id!("@bob:example.org"),
+            ruma::device_id!("BOBDEVICE"),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        bob_device.is_verified(),
+        "the agent's device should be verified after the dance"
+    );
+    let devices = agent.request(
+        "devices",
+        json!({"user_id": "@bob:example.org"}),
+    );
+    let listed = devices["ok"]["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["device_id"] == json!("ALICEDEVICE"))
+        .expect("the agent should list alice's device");
+    assert_eq!(listed["verified"], json!(true));
 }

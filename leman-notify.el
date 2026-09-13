@@ -41,7 +41,21 @@
        ;; no pong after 2000ms, there's pretty sure no notification service connected or
        ;; the system's setup has issues.
        (dbus-ping :session "org.freedesktop.Notifications" 2000))
-  "Whether D-Bus notifications are usable.")
+  "Whether D-Bus notifications are usable.
+Detected once at load time; when it failed (e.g. Emacs starts as a
+daemon before the desktop's notification service),
+`leman-notify--dbus-recheck' retries periodically.")
+
+(defvar leman-notify-dbus-next-check nil
+  "Next time `leman-notify--dbus-recheck' retries the D-Bus ping.")
+
+(defcustom leman-notify-dbus-retry-interval 300
+  "Seconds between retries of the D-Bus notification service ping.
+When the service wasn't reachable at load time (e.g. Emacs starts
+as a daemon before the desktop's notification service), leman
+retries at this interval until it succeeds."
+  :type 'natnum
+  :group 'leman-notify)
 
 ;;;; Customization
 
@@ -172,6 +186,25 @@ margins in Emacs.  But it's useful, anyway."
 
 ;;;; Functions
 
+(defun leman-notify--dbus-recheck ()
+  "Return non-nil when D-Bus notifications are usable.
+When the load-time detection failed, retry the ping at most every
+`leman-notify-dbus-retry-interval' seconds, so that starting Emacs
+before the desktop's notification service doesn't disable
+notifications for the whole session."
+  (when (and (not leman-notify-dbus-p)
+             (or (null leman-notify-dbus-next-check)
+                 (time-less-p leman-notify-dbus-next-check (current-time))))
+    (setf leman-notify-dbus-next-check
+          (time-add (current-time) leman-notify-dbus-retry-interval))
+    (when (and (featurep 'dbusbind)
+               (require 'dbus nil :no-error)
+               (dbus-ignore-errors (dbus-get-unique-name :session)))
+      (setf leman-notify-dbus-p
+            (dbus-ignore-errors
+              (dbus-ping :session "org.freedesktop.Notifications" 2000)))))
+  leman-notify-dbus-p)
+
 (defun leman-notify (event room session)
   "Send notifications for EVENT in ROOM on SESSION.
 Sends if all of `leman-notify-ignore-predicates' return nil.
@@ -180,7 +213,7 @@ Does not do anything if session hasn't finished initial sync."
     (when (and (leman-session-has-synced-p session)
                (cl-loop for pred in leman-notify-ignore-predicates
                         never (funcall pred event room session)))
-      (when (and leman-notify-dbus-p
+      (when (and (leman-notify--dbus-recheck)
                  (run-hook-with-args-until-success 'leman-notify-notification-predicates event room session))
         (leman-notify--notifications-notify event room session))
       (when (run-hook-with-args-until-success 'leman-notify-log-predicates event room session)

@@ -268,6 +268,18 @@ E.g. \"/_matrix/client/v3/keys/upload\" -> (\"v3\" \"keys/upload\")."
                   (list (expand-file-name "e2ee/agent/target/release/leman-agent" load-dir)
                         (expand-file-name "e2ee/agent/target/debug/leman-agent" load-dir))))))
 
+(defun leman-e2ee--agent-stale-p (program &optional load-dir)
+  "Return non-nil when the agent PROGRAM is older than its source.
+LOAD-DIR is the Leman installation directory (for tests)."
+  (let* ((load-dir (or load-dir (leman-e2ee--load-dir)))
+         (source (expand-file-name "e2ee/agent/src/lib.rs" load-dir)))
+    (and (file-exists-p source)
+         (file-exists-p program)
+         (time-less-p (file-attribute-modification-time
+                       (file-attributes program))
+                      (file-attribute-modification-time
+                       (file-attributes source))))))
+
 (defun leman-e2ee-build-agent ()
   "Build the E2EE agent program with cargo.
 Uses the agent source directory of the Leman installation.  Note
@@ -326,33 +338,40 @@ initialized; the crypto store (STORE-PATH or under
 `leman-e2ee' object."
   (let* ((program (or (leman-e2ee--agent-program)
                       (error "Leman E2EE agent program not found; see `leman-e2ee-agent-program'")))
-         (store-path (or store-path (leman-e2ee--store-path user-id device-id)))
-         (agent (leman-e2ee--create :user-id user-id :device-id device-id))
-         (buffer (get-buffer-create (format " *Leman E2EE agent[%s]*" user-id)))
-         (process (make-process
-                   :name (format "leman-agent[%s]" user-id)
-                   :buffer buffer
-                   :command (list program)
-                   :connection-type 'pipe
-                   :noquery t
-                   :filter #'leman-e2ee--process-filter
-                   :sentinel #'leman-e2ee--sentinel)))
-    (setf (leman-e2ee-process agent) process
-          (leman-e2ee-log-buffer agent) buffer)
-    (process-put process 'leman-e2ee agent)
-    (let ((hello (leman-e2ee-request agent "hello")))
-      (unless (equal (alist-get 'protocol_version hello) 1)
-        (leman-e2ee-stop agent)
-        (error "Leman E2EE agent protocol version mismatch: %S" hello)))
-    (let ((initialized (leman-e2ee-request
-                        agent "initialize"
-                        (list (cons 'user_id user-id)
-                              (cons 'device_id device-id)
-                              (cons 'store_path (directory-file-name store-path)))
-                        leman-e2ee-initialize-timeout)))
-      (setf (leman-e2ee-identity-keys agent)
-            (alist-get 'identity_keys initialized)))
-    agent))
+         (load-dir (leman-e2ee--load-dir)))
+    (when (leman-e2ee--agent-stale-p program load-dir)
+      ;; The binary is older than its source (e.g. after a package
+      ;; upgrade): the agent may lag behind the protocol.
+      (display-warning
+       'leman
+       "Leman E2EE: the agent binary is older than its source; run M-x leman-e2ee-build-agent and reconnect."))
+    (let* ((store-path (or store-path (leman-e2ee--store-path user-id device-id)))
+           (agent (leman-e2ee--create :user-id user-id :device-id device-id))
+           (buffer (get-buffer-create (format " *Leman E2EE agent[%s]*" user-id)))
+           (process (make-process
+                     :name (format "leman-agent[%s]" user-id)
+                     :buffer buffer
+                     :command (list program)
+                     :connection-type 'pipe
+                     :noquery t
+                     :filter #'leman-e2ee--process-filter
+                     :sentinel #'leman-e2ee--sentinel)))
+      (setf (leman-e2ee-process agent) process
+            (leman-e2ee-log-buffer agent) buffer)
+      (process-put process 'leman-e2ee agent)
+      (let ((hello (leman-e2ee-request agent "hello")))
+        (unless (equal (alist-get 'protocol_version hello) 1)
+          (leman-e2ee-stop agent)
+          (error "Leman E2EE agent protocol version mismatch: %S" hello)))
+      (let ((initialized (leman-e2ee-request
+                          agent "initialize"
+                          (list (cons 'user_id user-id)
+                                (cons 'device_id device-id)
+                                (cons 'store_path (directory-file-name store-path)))
+                          leman-e2ee-initialize-timeout)))
+        (setf (leman-e2ee-identity-keys agent)
+              (alist-get 'identity_keys initialized)))
+      agent)))
 
 (defun leman-e2ee-stop (agent)
   "Stop AGENT's subprocess."

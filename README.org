@@ -80,6 +80,17 @@ Current support:
 Not yet (planned, see ~ROADMAP.org~): key backup, and encrypting
 reactions in encrypted rooms.
 
+* Upgrading (package-vc)
+
+#+begin_src elisp
+  M-x package-vc-upgrade RET leman RET
+  M-x leman-e2ee-build-agent   ; the agent binary is not rebuilt by package-vc
+#+end_src
+
+Leman warns at agent start when the binary is older than its source.
+Do not patch the installed clone in place: local changes make
+`package-vc-upgrade' refuse to pull.
+
 * Development
 
 #+begin_src sh

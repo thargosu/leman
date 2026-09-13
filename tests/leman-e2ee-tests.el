@@ -1013,6 +1013,25 @@ to the agent, newest first."
       (leman--session-revoked-cleanup session)
       (should (equal (mapcar #'cdr leman-sessions) (list other))))))
 
+(ert-deftest leman-e2ee--agent-stale-p ()
+  (let* ((root (make-temp-file "leman-agent-stale-" 'dir))
+         (src (expand-file-name "e2ee/agent/src/lib.rs" root))
+         (binary (expand-file-name "e2ee/agent/target/debug/leman-agent" root)))
+    (make-directory (file-name-directory src) t)
+    (make-directory (file-name-directory binary) t)
+    (write-region "agent" nil src)
+    (write-region "binary" nil binary)
+    ;; Binary older than the source: stale.
+    (set-file-times src (current-time))
+    (set-file-times binary (time-subtract (current-time) 60))
+    (should (leman-e2ee--agent-stale-p binary root))
+    ;; Binary newer than the source: fine.
+    (set-file-times binary (current-time))
+    (set-file-times src (time-subtract (current-time) 60))
+    (should-not (leman-e2ee--agent-stale-p binary root))
+    ;; No source available (e.g. a PATH lookup): not stale.
+    (should-not (leman-e2ee--agent-stale-p binary (make-temp-file "leman-none-" 'dir)))))
+
 ;;;; Footer
 
 (provide 'leman-e2ee-tests)

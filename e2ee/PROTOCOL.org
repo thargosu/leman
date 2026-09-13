@@ -230,4 +230,144 @@ bounded (e.g. 3 attempts) to avoid loops.
 5. ~PUT .../send/m.room.encrypted/{txn}~ with the encrypted event.
 6. Pump outgoing requests once more (key distribution continues in
    the background for newly seen devices).
+
+* E3: device verification (specified, in development)
+
+Verification uses the state machine's interactive verification
+(SAS/emoji).  All verification traffic is to-device events: they
+flow through ~receive_sync_changes~ on the way in and through
+~outgoing_requests~ on the way out, like everything else; no new
+transport is needed.  Verification flow IDs are not unique across
+users, so most commands take both ~user_id~ and ~flow_id~.
+
+** ~devices~
+
+Lists a user's known devices (the machine's own user by default).
+
+#+begin_src json
+{"id": 10, "cmd": "devices", "params": {"user_id": "@vv:hobeika.fr"}}
+{"id": 10, "ok": {"devices": [
+  {"device_id": "ABC", "display_name": "Element X",
+   "verified": false, "deleted": false}]}}
+#+end_src
+
+~verified~ is the device's trust state (signature and cross-signing
+checks, plus local trust).
+
+** ~request_verification~
+
+Starts verifying DEVICE of USER (typically another device of the
+machine's own user).  The ~m.key.verification.request~ flows out via
+~outgoing_requests~.  Returns the flow ID.
+
+#+begin_src json
+{"id": 11, "cmd": "request_verification", "params": {
+  "user_id": "@vv:hobeika.fr", "device_id": "ABC"}}
+{"id": 11, "ok": {"flow_id": "<flow-id>"}}
+#+end_src
+
+** ~verification_requests~
+
+Lists the known verification requests (incoming and outgoing),
+including whether a SAS object exists for the request (their start
+has been received).
+
+#+begin_src json
+{"id": 12, "cmd": "verification_requests"}
+{"id": 12, "ok": {"requests": [{
+  "flow_id": "<flow-id>", "user_id": "@vv:hobeika.fr",
+  "device_id": "ABC", "state": "ready", "we_started": false,
+  "sas": false}]}}
+#+end_src
+
+~state~ is one of ~created~, ~ready~, ~accepted~, ~done~,
+~cancelled~ (as seen by us).
+
+** ~accept_verification~
+
+Accepts an incoming request (sends ~m.key.verification.ready~).
+
+#+begin_src json
+{"id": 13, "cmd": "accept_verification", "params": {
+  "user_id": "@vv:hobeika.fr", "flow_id": "<flow-id>"}}
+{"id": 13, "ok": {}}
+#+end_src
+
+** ~start_sas~
+
+Starts SAS for the request (sends ~m.key.verification.start~).
+For an incoming request whose start we already received, the SAS
+object already exists (and our ~accept~ is queued); the command
+then just reports it.
+
+#+begin_src json
+{"id": 14, "cmd": "start_sas", "params": {
+  "user_id": "@vv:hobeika.fr", "flow_id": "<flow-id>"}}
+{"id": 14, "ok": {"flow_id": "<flow-id>"}}
+#+end_src
+
+** ~verification_sas~
+
+Reports the SAS state for the flow.  ~can_be_presented~ is true
+once both sides have exchanged keys and the emoji can be shown;
+~accepted~ is true once we have accepted their start.
+
+#+begin_src json
+{"id": 15, "cmd": "verification_sas", "params": {
+  "user_id": "@vv:hobeika.fr", "flow_id": "<flow-id>"}}
+{"id": 15, "ok": {"can_be_presented": true, "accepted": true,
+                  "done": false, "cancelled": false,
+                  "emoji": [{"number": 49, "symbol": "🦋",
+                             "description": "butterfly"}, ...]}}
+#+end_src
+
+~emoji~ is present (7 items) only when ~can_be_presented~.
+
+** ~accept_sas~
+
+Accepts their start (sends ~m.key.verification.accept~).  Only
+needed for flows where they started the SAS.
+
+#+begin_src json
+{"id": 16, "cmd": "accept_sas", "params": {
+  "user_id": "@vv:hobeika.fr", "flow_id": "<flow-id>"}}
+{"id": 16, "ok": {}}
+#+end_src
+
+** ~confirm_sas~
+
+Confirms the short authentication string matches (sends
+~m.key.verification.mac~; a signature upload may follow via
+~outgoing_requests~).
+
+#+begin_src json
+{"id": 17, "cmd": "confirm_sas", "params": {
+  "user_id": "@vv:hobeika.fr", "flow_id": "<flow-id>"}}
+{"id": 17, "ok": {}}
+#+end_src
+
+** ~cancel_verification~
+
+Cancels the request or SAS.
+
+#+begin_src json
+{"id": 18, "cmd": "cancel_verification", "params": {
+  "user_id": "@vv:hobeika.fr", "flow_id": "<flow-id>"}}
+{"id": 18, "ok": {}}
+#+end_src
+
+** Verification flow (client side)
+
+1. ~devices~ to pick the device to verify (or notice an incoming
+   request via ~verification_requests~ after each sync).
+2. ~request_verification~ (outgoing) or ~accept_verification~
+   (incoming).
+3. ~start_sas~ when the request is ready.
+4. When ~verification_sas~ reports ~can_be_presented~, show the 7
+   emoji and let the user compare with the other device.
+5. ~confirm_sas~ or ~cancel_verification~.
+6. Pump ~outgoing_requests~ throughout (all verification traffic is
+   ordinary outgoing requests); the peer's events arrive via sync and
+   ~receive_sync_changes~, so each step may need a sync in between.
+
 + Key backup commands (SSSS).

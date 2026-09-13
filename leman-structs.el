@@ -63,7 +63,10 @@
   ;; Hash table of all seen events, keyed on event ID.
   events
   ;; E2EE agent (a `leman-e2ee' struct), or nil.
-  e2ee)
+  e2ee
+  ;; Flow IDs of incoming E2EE verification requests already
+  ;; announced to the user.
+  e2ee-announced-requests)
 
 (cl-defstruct leman-room
   id display-name prev-batch

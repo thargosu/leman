@@ -17,6 +17,7 @@
 
 (declare-function leman--initial-transaction-id "leman")
 (declare-function leman--push-joined-room-events "leman")
+(declare-function leman-e2ee--announce-requests "leman")
 (declare-function leman-e2ee--decrypt-event "leman")
 (declare-function leman-e2ee--encrypt-content "leman")
 (declare-function leman-e2ee--format-emoji "leman")
@@ -647,7 +648,7 @@ to the agent, newest first."
                                         (vector (list (cons 'flow_id "flow1")
                                                       (cons 'state "ready")
                                                       (cons 'sas nil)))))))))
-           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1")))
+           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1" "ABC")))
     (should (null result))
     (should (equal (alist-get 'cmd (leman-e2ee--decode (car (cdr (cdr fake)))))
                    "start_sas"))))
@@ -666,7 +667,7 @@ to the agent, newest first."
                                   (cons 'can_be_presented nil)
                                   (cons 'done nil)
                                   (cons 'cancelled nil))))))
-           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1")))
+           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1" "ABC")))
     (should (null result))
     (should (equal (alist-get 'cmd (leman-e2ee--decode (car (cdr (cdr fake)))))
                    "accept_sas"))))
@@ -693,7 +694,7 @@ to the agent, newest first."
            (leman-e2ee-verify-confirm-function
             (lambda (_device-id emoji)
               (setq asked emoji) t))
-           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1")))
+           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1" "ABC")))
     (should (null result))
     (should (equal asked
                    (vector (list (cons 'symbol "🦋")
@@ -717,7 +718,7 @@ to the agent, newest first."
                                         (vector (list (cons 'symbol "🦋")
                                                       (cons 'description "butterfly")))))))))
            (leman-e2ee-verify-confirm-function (lambda (_device _emoji) nil))
-           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1")))
+           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1" "ABC")))
     (should (eq result 'cancelled))
     (should (equal (alist-get 'cmd (leman-e2ee--decode (car (cdr (cdr fake)))))
                    "cancel_verification"))))
@@ -729,7 +730,7 @@ to the agent, newest first."
                                         (vector (list (cons 'flow_id "flow1")
                                                       (cons 'state "done")
                                                       (cons 'sas t)))))))))
-           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1")))
+           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1" "ABC")))
     (should (eq result 'done))))
 
 (ert-deftest leman-e2ee--verify-step-finishes-on-sas-done ()
@@ -746,8 +747,79 @@ to the agent, newest first."
                                   (cons 'can_be_presented nil)
                                   (cons 'done t)
                                   (cons 'cancelled nil))))))
-           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1")))
+           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1" "ABC")))
     (should (eq result 'done))))
+
+(ert-deftest leman-e2ee--verify-step-finishes-when-garbage-collected ()
+  ;; After the dance completes, the state machine garbage-collects the
+  ;; done request and SAS; the device's verified state is the
+  ;; remaining signal.
+  (let* ((fake (leman-e2ee-tests--fake-agent
+                (list (cons 'verification_requests
+                            (list (cons 'requests (vector))))
+                      (cons 'devices
+                            (list (cons 'devices
+                                        (vector (list (cons 'device_id "ABC")
+                                                      (cons 'verified t)))))))))
+           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1" "ABC")))
+    (should (eq result 'done))))
+
+(ert-deftest leman-e2ee--verify-step-keeps-waiting-when-gone-but-unverified ()
+  (let* ((fake (leman-e2ee-tests--fake-agent
+                (list (cons 'verification_requests
+                            (list (cons 'requests (vector))))
+                      (cons 'devices
+                            (list (cons 'devices
+                                        (vector (list (cons 'device_id "ABC")
+                                                      (cons 'verified nil)))))))))
+           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1" "ABC")))
+    (should (null result))))
+
+;;;; Incoming request announcements
+
+(ert-deftest leman-e2ee--announce-requests-announces-new-incoming ()
+  (let* ((fake (leman-e2ee-tests--fake-agent
+                (list (cons 'verification_requests
+                            (list (cons 'requests
+                                        (vector (list (cons 'flow_id "flow1")
+                                                      (cons 'user_id "@vv:x.org")
+                                                      (cons 'device_id "ABC")
+                                                      (cons 'state "created")
+                                                      (cons 'we_started nil)))))))))
+         (session (make-leman-session))
+         (messages nil))
+    (cl-letf (((symbol-function #'leman-message)
+               (lambda (format &rest args)
+                 (push (apply #'format format args) messages))))
+      (leman-e2ee--announce-requests session (car fake))
+      ;; A new incoming request is announced once...
+      (should (= 1 (length messages)))
+      (should (string-match-p "ABC" (car messages)))
+      (should (string-match-p "leman-e2ee-verify" (car messages)))
+      (should (equal (leman-session-e2ee-announced-requests session) '("flow1")))
+      ;; ...and not announced again.
+      (leman-e2ee--announce-requests session (car fake))
+      (should (= 1 (length messages))))))
+
+(ert-deftest leman-e2ee--announce-requests-ignores-outgoing-and-announced ()
+  (let* ((fake (leman-e2ee-tests--fake-agent
+                (list (cons 'verification_requests
+                            (list (cons 'requests
+                                        (vector (list (cons 'flow_id "outgoing")
+                                                      (cons 'device_id "ABC")
+                                                      (cons 'state "ready")
+                                                      (cons 'we_started t))
+                                                (list (cons 'flow_id "old")
+                                                      (cons 'device_id "DEF")
+                                                      (cons 'state "created")
+                                                      (cons 'we_started nil)))))))))
+         (session (make-leman-session :e2ee-announced-requests '("old")))
+         (messages nil))
+    (cl-letf (((symbol-function #'leman-message)
+               (lambda (format &rest args)
+                 (push (apply #'format format args) messages))))
+      (leman-e2ee--announce-requests session (car fake))
+      (should (null messages)))))
 
 ;;;; Footer
 

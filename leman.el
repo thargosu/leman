@@ -503,11 +503,18 @@ Return non-nil to confirm the short auth string, nil to cancel."
   (y-or-n-p (format "Leman E2EE: compare with the other device (%s): %s -- do the emoji match?"
                     device-id (leman-e2ee--format-emoji emoji))))
 
-(defun leman-e2ee--verify-step (agent user-id flow-id)
+(defun leman-e2ee--device-verified-p (agent user-id device-id)
+  "Return non-nil if DEVICE-ID of USER-ID is verified on AGENT."
+  (alist-get 'verified
+             (seq-find (lambda (device)
+                         (equal (alist-get 'device_id device) device-id))
+                       (leman-e2ee-devices agent user-id))))
+
+(defun leman-e2ee--verify-step (agent user-id flow-id device-id)
   "Perform one round of the verification dance for FLOW-ID of
-USER-ID on AGENT.  Return `done' when the device is verified,
-`cancelled' when the dance was cancelled, and nil to keep
-waiting."
+USER-ID on AGENT (verifying DEVICE-ID).  Return `done' when the
+device is verified, `cancelled' when the dance was cancelled, and
+nil to keep waiting."
   (let* ((request (seq-find (lambda (request)
                               (equal (alist-get 'flow_id request) flow-id))
                             (leman-e2ee-verification-requests agent user-id)))
@@ -520,23 +527,27 @@ waiting."
       (leman-e2ee-start-sas agent user-id flow-id)
       nil)
      (t
-      (when-let ((sas (ignore-errors
-                        (leman-e2ee-verification-sas agent user-id flow-id))))
+      (let ((sas (ignore-errors
+                   (leman-e2ee-verification-sas agent user-id flow-id))))
         (cond
-         ((alist-get 'cancelled sas) 'cancelled)
-         ((alist-get 'done sas) 'done)
+         ((and sas (alist-get 'cancelled sas)) 'cancelled)
+         ((and sas (alist-get 'done sas)) 'done)
          ;; Their SAS start arrived before ours (or without ours):
          ;; accept it, or the other device waits forever.
-         ((not (alist-get 'accepted sas))
+         ((and sas (not (alist-get 'accepted sas)))
           (leman-e2ee-accept-sas agent user-id flow-id)
           nil)
-         ((alist-get 'can_be_presented sas)
+         ((and sas (alist-get 'can_be_presented sas))
           (if (funcall leman-e2ee-verify-confirm-function
                        (alist-get 'device_id request)
                        (alist-get 'emoji sas))
               (progn (leman-e2ee-confirm-sas agent user-id flow-id) nil)
             (leman-e2ee-cancel-verification agent user-id flow-id)
             'cancelled))
+         ;; No request and no SAS: the state machine garbage-collects
+         ;; both once the dance finishes; the device's trust state is
+         ;; then the remaining signal.
+         ((leman-e2ee--device-verified-p agent user-id device-id) 'done)
          (t nil)))))))
 
 (defun leman-e2ee-verify (session)
@@ -583,7 +594,8 @@ one is started."
         (catch 'finished
           (cl-loop for round from 1 upto 90
                    do (leman-e2ee--process-outgoing-requests-sync session)
-                      (let ((result (leman-e2ee--verify-step agent user-id flow-id)))
+                      (let ((result (leman-e2ee--verify-step
+                                     agent user-id flow-id device-id)))
                         (pcase result
                           (`done
                            (message "Leman E2EE: device %s is verified." device-id)
@@ -626,7 +638,26 @@ requests are performed."
          (alist-get 'next_batch data))
       (leman-e2ee-error
        (leman-message "Leman E2EE: processing sync changes failed: %S" (cdr err))))
-    (leman-e2ee--process-outgoing-requests session)))
+    (leman-e2ee--process-outgoing-requests session)
+    (leman-e2ee--announce-requests session agent)))
+
+(defun leman-e2ee--announce-requests (session agent)
+  "Tell the user about incoming verification requests for SESSION.
+Each new incoming request (not started by us) is announced once,
+in the echo area; SESSION remembers the announced flow IDs."
+  (let ((announced (leman-session-e2ee-announced-requests session)))
+    (dolist (request (append (ignore-errors
+                               (leman-e2ee-verification-requests agent))
+                             nil))
+      (let ((flow-id (alist-get 'flow_id request)))
+        (when (and (not (alist-get 'we_started request))
+                   (equal (alist-get 'state request) "created")
+                   (not (member flow-id announced)))
+          (leman-message "Leman E2EE: %s wants to verify device %s (run M-x leman-e2ee-verify)"
+                         (alist-get 'user_id request)
+                         (alist-get 'device_id request))
+          (push flow-id announced))))
+    (setf (leman-session-e2ee-announced-requests session) announced)))
 
 (defun leman-e2ee--process-outgoing-requests (session)
   "Perform the E2EE agent's outgoing requests for SESSION.

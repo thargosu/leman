@@ -21,6 +21,7 @@
 (declare-function leman-e2ee--encrypt-content "leman")
 (declare-function leman-e2ee--format-emoji "leman")
 (declare-function leman-e2ee--perform-outgoing-request "leman")
+(declare-function leman-e2ee--verify-step "leman")
 (declare-function leman-e2ee--process-outgoing-requests "leman")
 (declare-function leman-e2ee--process-outgoing-requests-sync "leman")
 (declare-function leman-e2ee--sync-changes "leman")
@@ -637,6 +638,116 @@ to the agent, newest first."
                   (vector (list (cons 'symbol "🦋") (cons 'description "butterfly"))
                           (list (cons 'symbol "🐟") (cons 'description "fish"))))
                  "🦋 butterfly   🐟 fish")))
+
+(ert-deftest leman-e2ee--verify-step-starts-sas-when-ready ()
+  ;; A ready request without a SAS object: send start, keep waiting.
+  (let* ((fake (leman-e2ee-tests--fake-agent
+                (list (cons 'verification_requests
+                            (list (cons 'requests
+                                        (vector (list (cons 'flow_id "flow1")
+                                                      (cons 'state "ready")
+                                                      (cons 'sas nil)))))))))
+           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1")))
+    (should (null result))
+    (should (equal (alist-get 'cmd (leman-e2ee--decode (car (cdr (cdr fake)))))
+                   "start_sas"))))
+
+(ert-deftest leman-e2ee--verify-step-accepts-their-sas-start ()
+  ;; Their SAS start arrived (a SAS object exists but we have not
+  ;; accepted it): accept it, or the other device waits forever.
+  (let* ((fake (leman-e2ee-tests--fake-agent
+                (list (cons 'verification_requests
+                            (list (cons 'requests
+                                        (vector (list (cons 'flow_id "flow1")
+                                                      (cons 'state "ready")
+                                                      (cons 'sas t))))))
+                      (cons 'verification_sas
+                            (list (cons 'accepted nil)
+                                  (cons 'can_be_presented nil)
+                                  (cons 'done nil)
+                                  (cons 'cancelled nil))))))
+           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1")))
+    (should (null result))
+    (should (equal (alist-get 'cmd (leman-e2ee--decode (car (cdr (cdr fake)))))
+                   "accept_sas"))))
+
+(ert-deftest leman-e2ee--verify-step-presents-emoji-and-confirms ()
+  ;; The emoji can be compared: ask the user, then confirm (the dance
+  ;; only finishes once both sides' MACs arrived).
+  (let* ((fake (leman-e2ee-tests--fake-agent
+                (list (cons 'verification_requests
+                            (list (cons 'requests
+                                        (vector (list (cons 'flow_id "flow1")
+                                                      (cons 'device_id "ABC")
+                                                      (cons 'state "ready")
+                                                      (cons 'sas t))))))
+                      (cons 'verification_sas
+                            (list (cons 'accepted t)
+                                  (cons 'can_be_presented t)
+                                  (cons 'done nil)
+                                  (cons 'cancelled nil)
+                                  (cons 'emoji
+                                        (vector (list (cons 'symbol "🦋")
+                                                      (cons 'description "butterfly")))))))))
+           (asked nil)
+           (leman-e2ee-verify-confirm-function
+            (lambda (_device-id emoji)
+              (setq asked emoji) t))
+           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1")))
+    (should (null result))
+    (should (equal asked
+                   (vector (list (cons 'symbol "🦋")
+                                 (cons 'description "butterfly")))))
+    (should (equal (alist-get 'cmd (leman-e2ee--decode (car (cdr (cdr fake)))))
+                   "confirm_sas"))))
+
+(ert-deftest leman-e2ee--verify-step-cancels-on-emoji-mismatch ()
+  (let* ((fake (leman-e2ee-tests--fake-agent
+                (list (cons 'verification_requests
+                            (list (cons 'requests
+                                        (vector (list (cons 'flow_id "flow1")
+                                                      (cons 'state "ready")
+                                                      (cons 'sas t))))))
+                      (cons 'verification_sas
+                            (list (cons 'accepted t)
+                                  (cons 'can_be_presented t)
+                                  (cons 'done nil)
+                                  (cons 'cancelled nil)
+                                  (cons 'emoji
+                                        (vector (list (cons 'symbol "🦋")
+                                                      (cons 'description "butterfly")))))))))
+           (leman-e2ee-verify-confirm-function (lambda (_device _emoji) nil))
+           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1")))
+    (should (eq result 'cancelled))
+    (should (equal (alist-get 'cmd (leman-e2ee--decode (car (cdr (cdr fake)))))
+                   "cancel_verification"))))
+
+(ert-deftest leman-e2ee--verify-step-finishes ()
+  (let* ((fake (leman-e2ee-tests--fake-agent
+                (list (cons 'verification_requests
+                            (list (cons 'requests
+                                        (vector (list (cons 'flow_id "flow1")
+                                                      (cons 'state "done")
+                                                      (cons 'sas t)))))))))
+           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1")))
+    (should (eq result 'done))))
+
+(ert-deftest leman-e2ee--verify-step-finishes-on-sas-done ()
+  ;; A request may lag behind its SAS (both still in flight); a done
+  ;; SAS means verified even if the request state hasn't caught up.
+  (let* ((fake (leman-e2ee-tests--fake-agent
+                (list (cons 'verification_requests
+                            (list (cons 'requests
+                                        (vector (list (cons 'flow_id "flow1")
+                                                      (cons 'state "ready")
+                                                      (cons 'sas t))))))
+                      (cons 'verification_sas
+                            (list (cons 'accepted t)
+                                  (cons 'can_be_presented nil)
+                                  (cons 'done t)
+                                  (cons 'cancelled nil))))))
+           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1")))
+    (should (eq result 'done))))
 
 ;;;; Footer
 

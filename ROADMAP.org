@@ -113,7 +113,14 @@ Phasing:
    + Until the user verifies, other clients still show the
      "device not verified" warning; after verification it goes away.
    + Follow-ups: QR verification, key import/export.
-4. *Key backup* ("E4"): SSSS for cross-device history.
+4. *Key backup* ("E4", done, pending user testing): Megolm backup v1
+   plus secret storage (SSSS).  The agent creates/imports the backup
+   decryption key, backs up and imports room keys, and encrypts/
+   decrypts SSSS secrets; the client performs the HTTP calls, drives
+   the setup (~leman-e2ee-setup-backup~) and restore
+   (~leman-e2ee-restore-keys~) flows, and pumps room-key backups
+   after syncs.  Element interoperates (standard
+   ~m.megolm_backup.v1~ secret, SSSS default key).
 
 TDD workflow (tests before code; monorepo, agent in ~e2ee/~):
 

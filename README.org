@@ -76,9 +76,14 @@ Current support:
 
 + Emoji SAS device verification (~M-x leman-e2ee-verify~): after
   verifying, other clients' "device not verified" warnings go away
++ Key backup (Megolm backup + secret storage): ~M-x
+  leman-e2ee-setup-backup~ creates the backup and displays both
+  recovery keys; ~M-x leman-e2ee-restore-keys~ restores old message
+  history on a new device; room keys are backed up automatically
+  after syncs (~M-x leman-e2ee-backup-info~ shows the status)
 
-Not yet (planned, see ~ROADMAP.org~): key backup, and encrypting
-reactions in encrypted rooms.
+Not yet (planned, see ~ROADMAP.org~): encrypting reactions in
+encrypted rooms.
 
 * Upgrading (package-vc)
 

@@ -53,6 +53,25 @@ URL differ from the previous one."
 
 ;;;; Tests
 
+(ert-deftest leman-api--query-string-from-json-params ()
+  ;; Params decoded from JSON objects are dotted pairs, which
+  ;; `url-build-query-string' (Emacs >=29) rejects; `leman-api' must
+  ;; rewrite them as one-element lists (and keep proper lists as-is).
+  (let* ((urls nil)
+         (session (make-leman-session
+                   :server (make-leman-server :uri-prefix "https://example.org"))))
+    (cl-letf (((symbol-function #'plz)
+               (lambda (_method url &rest _args) (push url urls) nil)))
+      (leman-api session "room_keys/keys"
+        :version "v3"
+        :params '((version . "12132284")))
+      (leman-api session "messages"
+        :version "v3"
+        :params '(("dir" "f") ("limit" "200"))))
+    (should (equal (nreverse urls)
+                   (list "https://example.org/_matrix/client/v3/room_keys/keys?version=12132284"
+                         "https://example.org/_matrix/client/v3/messages?dir=f&limit=200")))))
+
 (ert-deftest leman--format-body-mentions ()
   (let ((room (make-leman-room
                :members (map-into

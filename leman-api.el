@@ -87,6 +87,15 @@ usually the DATA argument should be passed through
                ((cl-struct leman-server uri-prefix) server)
                ((cl-struct url type host portspec) (url-generic-parse-url uri-prefix))
                (path (format "/_matrix/%s/%s/%s" endpoint-category version endpoint))
+               ;; NOTE: `url-build-query-string' wants proper-list items
+               ;; like ("key" "value"), but params decoded from JSON
+               ;; objects are dotted pairs like (key . "value"); accept
+               ;; both by rewriting dotted pairs as one-element lists.
+               (params (mapcar (lambda (param)
+                                 (if (listp (cdr param))
+                                     param
+                                   (list (car param) (cdr param))))
+                               params))
                (query (url-build-query-string params))
                (filename (concat path "?" query))
                (url (url-recreate-url

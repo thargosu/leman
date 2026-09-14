@@ -917,6 +917,13 @@ async fn test_backup_restore_round_trip() {
         json!(1),
         "one room key imported: {imported}"
     );
+    // Null rooms is elisp's encoding of an absent/empty backup
+    // (leman-e2ee--encode): it is tolerated and imports nothing.
+    let empty = agent_b.request(
+        "backup_import",
+        json!({"recovery_key": backup_recovery, "rooms": null}),
+    );
+    assert_eq!(empty["ok"]["imported"], json!(0), "{empty}");
     let decrypted = agent_b.request(
         "decrypt_room_event",
         json!({"room_id": "!room:example.org", "event": encrypted_event}),

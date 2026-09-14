@@ -1085,7 +1085,13 @@ impl Agent {
         let recovery_key = param_str(&params, "recovery_key")?;
         let key = BackupDecryptionKey::from_base58(recovery_key).map_err(crypto_error)?;
 
-        let rooms_value = params.get("rooms").cloned().unwrap_or(json!({}));
+        // Elisp encodes absent/empty objects as null (see the note in
+        // leman-e2ee--encode), so an empty backup's "rooms" arrives
+        // as null: treat it as "no rooms", like everywhere else.
+        let rooms_value = match params.get("rooms") {
+            None | Some(Value::Null) => json!({}),
+            Some(value) => value.clone(),
+        };
         let mut parsed: BTreeMap<ruma::OwnedRoomId, BTreeMap<String, BackedUpRoomKey>> =
             BTreeMap::new();
         let Some(rooms) = rooms_value.as_object() else {

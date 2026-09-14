@@ -33,14 +33,24 @@
 
 ;;;; Variables
 
-(defvar leman-notify-dbus-p
+(defun leman-notify--dbus-service-available-p ()
+  "Return non-nil when a notification service is usable on the session bus.
+Calls the service's GetServerInformation method rather than
+`dbus-ping', whose Peer.Ping probe is not answered by all
+notification services (e.g. awesome's), which would make leman
+permanently conclude that no service is available."
   (and (featurep 'dbusbind)
        (require 'dbus nil :no-error)
        (dbus-ignore-errors (dbus-get-unique-name :session))
-       ;; By default, emacs waits up to 25 seconds for a PONG.  Realistically, if there's
-       ;; no pong after 2000ms, there's pretty sure no notification service connected or
-       ;; the system's setup has issues.
-       (dbus-ping :session "org.freedesktop.Notifications" 2000))
+       (dbus-ignore-errors
+         (dbus-call-method :session "org.freedesktop.Notifications"
+                           "/org/freedesktop/Notifications"
+                           "org.freedesktop.Notifications"
+                           "GetServerInformation"
+                           :timeout 2000))))
+
+(defvar leman-notify-dbus-p
+  (leman-notify--dbus-service-available-p)
   "Whether D-Bus notifications are usable.
 Detected once at load time; when it failed (e.g. Emacs starts as a
 daemon before the desktop's notification service),
@@ -188,7 +198,7 @@ margins in Emacs.  But it's useful, anyway."
 
 (defun leman-notify--dbus-recheck ()
   "Return non-nil when D-Bus notifications are usable.
-When the load-time detection failed, retry the ping at most every
+When the load-time detection failed, retry at most every
 `leman-notify-dbus-retry-interval' seconds, so that starting Emacs
 before the desktop's notification service doesn't disable
 notifications for the whole session."
@@ -197,12 +207,7 @@ notifications for the whole session."
                  (time-less-p leman-notify-dbus-next-check (current-time))))
     (setf leman-notify-dbus-next-check
           (time-add (current-time) leman-notify-dbus-retry-interval))
-    (when (and (featurep 'dbusbind)
-               (require 'dbus nil :no-error)
-               (dbus-ignore-errors (dbus-get-unique-name :session)))
-      (setf leman-notify-dbus-p
-            (dbus-ignore-errors
-              (dbus-ping :session "org.freedesktop.Notifications" 2000)))))
+    (setf leman-notify-dbus-p (leman-notify--dbus-service-available-p)))
   leman-notify-dbus-p)
 
 (defun leman-notify (event room session)

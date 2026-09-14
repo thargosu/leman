@@ -16,38 +16,37 @@
   (let ((leman-notify-dbus-p nil)
         (leman-notify-dbus-next-check nil)
         (leman-notify-dbus-retry-interval 300)
-        (pings 0))
-    (cl-letf (((symbol-function #'dbus-get-unique-name) #'identity)
-              ((symbol-function #'dbus-ping)
-               (lambda (&rest _) (cl-incf pings) t)))
-      ;; The load-time detection failed: a retry pings and flips on.
+        (probes 0))
+    (cl-letf (((symbol-function #'leman-notify--dbus-service-available-p)
+               (lambda () (cl-incf probes) t)))
+      ;; The load-time detection failed: a retry probes and flips on.
       (should (leman-notify--dbus-recheck))
       (should (eq leman-notify-dbus-p t))
-      (should (= 1 pings))
-      ;; Retries are rate-limited: no more pings within the interval.
+      (should (= 1 probes))
+      ;; Retries are rate-limited: no more probes within the interval.
       (should (leman-notify--dbus-recheck))
-      (should (= 1 pings)))))
+      (should (= 1 probes)))))
 
 (ert-deftest leman-notify--dbus-recheck-stays-off-on-failure ()
   (let ((leman-notify-dbus-p nil)
         (leman-notify-dbus-next-check nil)
         (leman-notify-dbus-retry-interval 300))
-    (cl-letf (((symbol-function #'dbus-get-unique-name) #'identity)
-              ((symbol-function #'dbus-ping) (lambda (&rest _) nil)))
+    (cl-letf (((symbol-function #'leman-notify--dbus-service-available-p)
+               (lambda () nil)))
       (should-not (leman-notify--dbus-recheck))
       (should (null leman-notify-dbus-p))
       (should leman-notify-dbus-next-check)
-      ;; A retry within the interval does not ping again.
+      ;; A retry within the interval does not probe again.
       (should-not (leman-notify--dbus-recheck)))))
 
 (ert-deftest leman-notify--dbus-recheck-noop-when-already-on ()
   (let ((leman-notify-dbus-p t)
         (leman-notify-dbus-next-check nil)
-        (pings 0))
-    (cl-letf (((symbol-function #'dbus-ping)
-               (lambda (&rest _) (cl-incf pings) t)))
+        (probes 0))
+    (cl-letf (((symbol-function #'leman-notify--dbus-service-available-p)
+               (lambda () (cl-incf probes) t)))
       (should (leman-notify--dbus-recheck))
-      (should (= 0 pings)))))
+      (should (= 0 probes)))))
 
 ;;;; Footer
 

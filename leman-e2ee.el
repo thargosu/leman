@@ -291,7 +291,9 @@ that cargo must be found on the `exec-path'."
     (unless (file-directory-p agent-dir)
       (user-error "Leman E2EE: agent source not found at %S" agent-dir))
     (let ((default-directory agent-dir))
-      (compilation-start "cargo build"))))
+      ;; Release: `leman-e2ee--agent-program' prefers the release
+      ;; binary over the debug one, so that's what has to be fresh.
+      (compilation-start "cargo build --release"))))
 
 (defun leman-e2ee--sanitize-name (name)
   "Return NAME with characters unsafe for file names replaced."

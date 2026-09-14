@@ -1356,12 +1356,14 @@ to the agent, newest first."
               ((symbol-function #'leman-e2ee-ssss-decrypt-secret)
                (lambda (_agent key-id _recovery _content _name _iv _ct _mac)
                  (push key-id attempts)
+                 ;; Leman's old (pre-interop) encoding wraps the
+                 ;; base58 key in base64; the unlock accepts it.
                  (base64-encode-string "EsBACKUP" t)))
               ((symbol-function #'leman-e2ee-backup-verify)
-               (lambda (_agent _recovery backup-info)
-                 (push backup-info verifies)
-                 ;; The unlocked key matches the current version.
-                 t)))
+               (lambda (_agent recovery _backup-info)
+                 (push recovery verifies)
+                 ;; Only the real key matches the current version.
+                 (equal recovery "EsBACKUP"))))
       ;; The default key (k1) is tried first (its entry fails to
       ;; unlock), then k2's entry unlocks.
       (let ((result (leman-e2ee--unlock-backup-secret
@@ -1372,9 +1374,11 @@ to the agent, newest first."
         (should (equal result "EsBACKUP"))
         (should (equal checks '("k2" "k1")))
         (should (equal attempts '("k2")))
+        ;; Both encodings were tried: the base64-wrapped value failed
+        ;; to verify, then the decoded key matched.
         (should (equal verifies
-                       '(((algorithm . "m.megolm_backup.v1.curve25519-aes-sha2")
-                          (auth_data . ((public_key . "pk9")))))))))))
+                        (list "EsBACKUP"
+                              (base64-encode-string "EsBACKUP" t))))))))
 
 (ert-deftest leman-e2ee--unlock-backup-secret-skips-stale-entries ()
   ;; An entry that unlocks but holds an older version's key is
@@ -1393,9 +1397,9 @@ to the agent, newest first."
               ((symbol-function #'leman-e2ee-ssss-check-key)
                (lambda (_agent _key-id _recovery _content) t))
               ((symbol-function #'leman-e2ee-ssss-decrypt-secret)
-               (lambda (&rest _) (base64-encode-string "EsSTALE" t)))
-              ((symbol-function #'leman-e2ee-backup-verify)
-               (lambda (_agent _recovery _backup-info) nil)))
+                (lambda (&rest _) "EsSTALE"))
+               ((symbol-function #'leman-e2ee-backup-verify)
+                (lambda (_agent _recovery _backup-info) nil)))
       (let ((err (should-error
                   (leman-e2ee--unlock-backup-secret
                    nil agent "EsOld"
@@ -1562,7 +1566,7 @@ to the agent, newest first."
               ((symbol-function #'leman-e2ee--backup-version-info)
                (lambda (_session) '((version . "12148797") (algorithm . "alg") (auth_data . "auth"))))
               ((symbol-function #'leman-e2ee-ssss-decrypt-secret)
-               (lambda (&rest _args) (base64-encode-string "OLD-KEY" t)))
+               (lambda (&rest _args) "EsOLD"))
               ((symbol-function #'leman-e2ee-backup-verify)
                (lambda (_agent _key _info) nil))
               ((symbol-function #'leman-e2ee-ssss-encrypt-secret)
@@ -1595,11 +1599,92 @@ to the agent, newest first."
               ((symbol-function #'leman-e2ee--backup-version-info)
                (lambda (_session) '((version . "12148797") (algorithm . "alg") (auth_data . "auth"))))
               ((symbol-function #'leman-e2ee-ssss-decrypt-secret)
-               (lambda (&rest _args) (base64-encode-string "CURRENT-KEY" t)))
+               (lambda (&rest _args) "EsCURRENT"))
               ((symbol-function #'leman-e2ee-backup-verify)
                (lambda (_agent _key _info) t)))
       (leman-e2ee--re-store-backup-secret nil agent "EsK" "EsOTHERBACKUP")
       (should-not puts))))
+
+(ert-deftest leman-e2ee-cross-signing-wrappers ()
+  (pcase-let* ((fake (leman-e2ee-tests--fake-agent
+                      '((cross_signing_status . ((has_master . t)
+                                                 (has_self_signing . t)
+                                                 (has_user_signing)))))
+                (agent (car fake)))
+    (should (equal (leman-e2ee-cross-signing-status agent)
+                   '((has_master . t) (has_self_signing . t) (has_user_signing))))
+    (leman-e2ee-import-cross-signing agent "MK" "SSK" nil)
+    (let ((sent (mapcar #'leman-e2ee--decode (cdr fake))))
+      (should (equal (alist-get 'params
+                                (seq-find (lambda (r)
+                                            (equal (alist-get 'cmd r)
+                                                   "import_cross_signing_keys"))
+                                          sent))
+     '((master_key . "MK")
+       (self_signing_key . "SSK")
+       (user_signing_key))))))))
+
+(ert-deftest leman-e2ee--decrypt-ssss-secret ()
+  (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
+         (account-data `(("m.secret_storage.key.kd" . ((algorithm . "x")))
+                         ("m.secret_storage.secret.m.cross_signing.self_signing"
+                          . ((encrypted . ((kd . ((iv . "i") (ciphertext . "c") (mac . "m")))
+                                           (other . ((iv . "x"))))))))))
+    (cl-letf (((symbol-function #'leman-e2ee--account-data-get)
+               (lambda (_session type)
+                 (alist-get type account-data nil nil #'equal)))
+              ((symbol-function #'leman-e2ee-ssss-check-key)
+               (lambda (_agent _key-id recovery _content) (equal recovery "EsK")))
+              ((symbol-function #'leman-e2ee-ssss-decrypt-secret)
+               (lambda (&rest _args) "T0hBc2VlZA")))
+      ;; Symbol keys (the json-read shape) are matched.
+      (should (equal (leman-e2ee--decrypt-ssss-secret
+                      nil agent "kd" "EsK" "m.cross_signing.self_signing")
+                     "T0hBc2VlZA"))
+      ;; The value is returned verbatim (no base64-decoding): the
+      ;; m.cross_signing secrets hold the unpadded base64 seeds.
+      (should-not (equal (leman-e2ee--decrypt-ssss-secret
+                          nil agent "kd" "EsK" "m.cross_signing.self_signing")
+                         "OhAseed"))
+      ;; A wrong recovery key or an unknown secret: nil.
+      (should-not (leman-e2ee--decrypt-ssss-secret
+                   nil agent "kd" "EsOther" "m.cross_signing.self_signing"))
+      (should-not (leman-e2ee--decrypt-ssss-secret
+                   nil agent "kd" "EsK" "m.cross_signing.master")))))
+
+(ert-deftest leman-e2ee--import-cross-signing ()
+  (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
+         (imports nil)
+         (account-data `(("m.secret_storage.default_key" . ((key . "kd")))
+                         ("m.secret_storage.key.kd" . ((algorithm . "x")))
+                         ("m.secret_storage.secret.m.cross_signing.master"
+                          . ((encrypted . ((kd . ((iv . "i") (ciphertext . "c") (mac . "m")))))))
+                         ("m.secret_storage.secret.m.cross_signing.self_signing"
+                          . ((encrypted . ((kd . ((iv . "i") (ciphertext . "c") (mac . "m"))))))))))
+    (cl-letf (((symbol-function #'leman-e2ee--account-data-get)
+               (lambda (_session type)
+                 (alist-get type account-data nil nil #'equal)))
+              ((symbol-function #'leman-e2ee-ssss-check-key)
+               (lambda (_agent _key-id _recovery _content) t))
+              ((symbol-function #'leman-e2ee-ssss-decrypt-secret)
+               (lambda (_agent _key-id _recovery _content name &rest _)
+                 (pcase name
+                   ("m.cross_signing.master" "TWFpblNlZWQ")
+                   ("m.cross_signing.self_signing" "U2VsZlNlZWQ"))))
+              ((symbol-function #'leman-e2ee-import-cross-signing)
+               (lambda (_agent master self-signing user-signing)
+                 (push (list master self-signing user-signing) imports)
+                 '((has_master . t) (has_self_signing . t) (has_user_signing))))
+              ((symbol-function #'leman-message) #'ignore))
+      ;; The user-signing secret is not stored on the account; the
+      ;; others are imported.
+      (should (leman-e2ee--import-cross-signing nil agent "EsK"))
+      (should (equal imports '(("TWFpblNlZWQ" "U2VsZlNlZWQ" nil))))
+      ;; When no secret unlocks, nothing is imported.
+      (cl-letf (((symbol-function #'leman-e2ee-ssss-check-key)
+                 (lambda (_agent _key-id _recovery _content) nil)))
+        (should-not (leman-e2ee--import-cross-signing nil agent "EsK"))
+        (should (= (length imports) 1))))))
 
 (ert-deftest leman-e2ee--account-data-put-signals-on-failure ()
   ;; With `:else' nil, `plz' returns the error from a sync request
@@ -1728,6 +1813,8 @@ to the agent, newest first."
 (declare-function leman-e2ee--enable-backup-and-import "leman")
 (declare-function leman-e2ee--create-backup-version "leman")
 (declare-function leman-e2ee--api-sync "leman")
+(declare-function leman-e2ee--decrypt-ssss-secret "leman")
+(declare-function leman-e2ee--import-cross-signing "leman")
 (declare-function leman-e2ee-backup-verify "leman-e2ee")
 (declare-function leman-e2ee-ssss-decrypt-secret "leman-e2ee")
 (declare-function leman-e2ee--backup-version-info "leman")

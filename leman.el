@@ -614,7 +614,15 @@ one is started."
                            (message "Leman E2EE: device %s is verified." device-id)
                            (throw 'finished t))
                           (`cancelled
-                           (message "Leman E2EE: verification of %s was cancelled." device-id)
+                           (let* ((sas (ignore-errors
+                                         (leman-e2ee-verification-sas
+                                          agent user-id flow-id)))
+                                  (code (alist-get 'cancel_code sas))
+                                  (reason (alist-get 'cancel_reason sas)))
+                             (message "Leman E2EE: verification of %s was cancelled (%s%s)."
+                                      device-id
+                                      (or code "unknown code")
+                                      (if reason (format ": %s" reason) "")))
                            (throw 'finished t))))
                       (sleep-for 2)
                    finally (message "Leman E2EE: verification of %s timed out; run `M-x leman-e2ee-verify' again."
@@ -932,6 +940,26 @@ An alist with ~version~, ~algorithm~, and ~auth_data~ keys; signal
             (user-error "Leman E2EE: no key backup exists on the homeserver")
           (signal 'plz-error (list result)))))))
 
+(defun leman-e2ee--backup-key-matches-p (agent decrypted backup-info)
+  "Return the backup recovery key in DECRYPTED when it matches BACKUP-INFO.
+DECRYPTED is the m.megolm_backup.v1 secret's decrypted value:
+either the plain base58 recovery key (as matrix-rust-sdk and the
+dart sdk store it) or, for entries written by older leman
+versions, its base64 wrapper.  Return nil when neither form
+matches."
+  (cl-labels ((matches (recovery)
+                (and recovery
+                     (equal (condition-case _
+                               (leman-e2ee-backup-verify agent recovery backup-info)
+                             (leman-e2ee-error nil))
+                            t))))
+    (or (and (matches decrypted) decrypted)
+        (let ((decoded (ignore-errors
+                         (decode-coding-string
+                          (base64-decode-string decrypted)
+                          'utf-8))))
+          (and (matches decoded) decoded)))))
+
 (defun leman-e2ee--unlock-backup-secret (session agent recovery-key encrypted default-key-id)
   "Unlock the m.megolm_backup.v1 secret's ENCRYPTED entries.
 Try each entry (the default secret-storage key's first) with
@@ -974,19 +1002,16 @@ key (may be nil)."
                       (signal 'leman-e2ee-error
                               (list (format "the recovery key does not unlock secret-storage key %s"
                                             key-id))))
-                    (let ((backup-recovery
-                           (decode-coding-string
-                            (base64-decode-string
-                             (leman-e2ee-ssss-decrypt-secret
-                              agent key-id recovery-key key-content
-                              "m.megolm_backup.v1"
-                              (alist-get 'iv data)
-                              (alist-get 'ciphertext data)
-                              (alist-get 'mac data)))
-                            'utf-8)))
-                      (if (equal (leman-e2ee-backup-verify
-                                  agent backup-recovery backup-info)
-                                 t)
+                    (let* ((decrypted (leman-e2ee-ssss-decrypt-secret
+                                       agent key-id recovery-key key-content
+                                       "m.megolm_backup.v1"
+                                       (alist-get 'iv data)
+                                       (alist-get 'ciphertext data)
+                                       (alist-get 'mac data)))
+                           (backup-recovery
+                            (leman-e2ee--backup-key-matches-p
+                             agent decrypted backup-info)))
+                      (if backup-recovery
                           (throw 'unlocked backup-recovery)
                         (push (format "the backup key stored under %s is for another backup version"
                                       key-id)
@@ -1057,21 +1082,15 @@ key (empty answer skips)."
                                                 (leman-e2ee--backup-version-info session)))
                                  (backup-info `((algorithm . ,(alist-get 'algorithm version-info))
                                                 (auth_data . ,(alist-get 'auth_data version-info)))))
-                       (let ((decrypted (condition-case _
-                                            (decode-coding-string
-                                             (base64-decode-string
-                                              (leman-e2ee-ssss-decrypt-secret
-                                               agent default-key-id recovery-key content
-                                               "m.megolm_backup.v1"
-                                               (alist-get 'iv entry)
-                                               (alist-get 'ciphertext entry)
-                                               (alist-get 'mac entry)))
-                                             'utf-8)
-                                          (leman-e2ee-error nil))))
-                         (not (and decrypted
-                                   (equal (leman-e2ee-backup-verify
-                                           agent decrypted backup-info)
-                                          t)))))))))
+                       (not (leman-e2ee--backup-key-matches-p
+                             agent
+                             (leman-e2ee-ssss-decrypt-secret
+                              agent default-key-id recovery-key content
+                              "m.megolm_backup.v1"
+                              (alist-get 'iv entry)
+                              (alist-get 'ciphertext entry)
+                              (alist-get 'mac entry))
+                             backup-info)))))))
          (default-recovery
            (when needs-store
              (if (leman-e2ee-ssss-check-key agent default-key-id recovery-key content)
@@ -1085,7 +1104,10 @@ key (empty answer skips)."
       (let ((encrypted (leman-e2ee-ssss-encrypt-secret
                         agent default-key-id default-recovery content
                         "m.megolm_backup.v1"
-                        (base64-encode-string backup-recovery t))))
+                        ;; Other clients (matrix-rust-sdk, the dart
+                        ;; sdk) expect the secret's value to be the
+                        ;; plain base58 recovery key.
+                        backup-recovery)))
         (leman-e2ee--account-data-put
          session "m.secret_storage.secret.m.megolm_backup.v1"
          `((encrypted . ,(append (assoc-delete-all default-key-id stored #'equal)
@@ -1141,6 +1163,11 @@ already has one, e.g. from Element)."
       (leman-e2ee--enable-backup-and-import session agent backup-recovery)
       (leman-e2ee--re-store-backup-secret session agent recovery-key backup-recovery)
       (leman-e2ee--backup-pump session agent)
+      ;; With the recovery key at hand, also import the private
+      ;; cross-signing keys: without them the agent cannot sign
+      ;; verified devices or the backup versions it creates, and
+      ;; other clients never trust either.
+      (leman-e2ee--import-cross-signing session agent recovery-key)
       (leman-message
        (if adopt
            "Leman E2EE: adopted the existing key backup"
@@ -1170,7 +1197,8 @@ already has one, e.g. from Element)."
       (let ((saved (leman-e2ee-backup-recovery-key agent)))
         (leman-e2ee--enable-backup-and-import session agent saved)
         (leman-e2ee--re-store-backup-secret session agent recovery-key saved)
-        (leman-e2ee--backup-pump session agent))
+        (leman-e2ee--backup-pump session agent)
+        (leman-e2ee--import-cross-signing session agent recovery-key))
       (leman-message
        "Leman E2EE: the backup key is stored under the default secret-storage key again; keys restored"))
      ;; Both unlock attempts failed.  When adopting (the account has
@@ -1246,7 +1274,10 @@ working.  Backs up the room keys afterwards."
          (encrypted (leman-e2ee-ssss-encrypt-secret
                      agent default-key-id default-recovery content
                      "m.megolm_backup.v1"
-                     (base64-encode-string recovery-key t)))
+                     ;; Other clients (matrix-rust-sdk, the dart
+                     ;; sdk) expect the secret's value to be the
+                     ;; plain base58 recovery key.
+                     recovery-key))
          (stored (ignore-errors
                    (alist-get 'encrypted
                               (leman-e2ee--account-data-get
@@ -1321,7 +1352,10 @@ default key and display both recovery keys to save."
          (encrypted (leman-e2ee-ssss-encrypt-secret
                      agent key-id ssss-recovery content
                      "m.megolm_backup.v1"
-                     (base64-encode-string recovery-key t))))
+                     ;; Other clients (matrix-rust-sdk, the dart
+                     ;; sdk) expect the secret's value to be the
+                     ;; plain base58 recovery key.
+                     recovery-key)))
     (when existing-version
       (leman-message
        "Leman E2EE: replacing existing backup version %s (its backed-up keys stay in that version)"
@@ -1397,6 +1431,88 @@ client)."
            (user-error "Leman E2EE: restoring keys failed: %s" (cdr err)))
           (plz-error
            (user-error "Leman E2EE: restoring keys failed: %S" (cdr err)))))))
+
+(defun leman-e2ee--decrypt-ssss-secret (session agent default-key-id recovery-key name)
+  "Decrypt the secret NAME from SESSION's secret storage.
+Uses the entry encrypted for the account's default secret-storage
+key DEFAULT-KEY-ID, unlocked with RECOVERY-KEY.  Return the
+secret's value verbatim (e.g. for the m.cross_signing secrets,
+the unpadded base64 key seeds), or nil when the secret or the
+entry is not stored, or the key does not fit."
+  (when-let* ((encrypted (ignore-errors
+                           (alist-get 'encrypted
+                                      (leman-e2ee--account-data-get
+                                       session (format "m.secret_storage.secret.%s" name)))))
+              ;; json-read returns symbol keys; normalize to strings
+              ;; so the entry for DEFAULT-KEY-ID is found.
+              (encrypted (mapcar (lambda (entry)
+                                   (cons (format "%s" (car entry)) (cdr entry)))
+                                 encrypted))
+              (entry (and default-key-id
+                          (alist-get default-key-id encrypted nil nil #'equal)))
+              (content (ignore-errors
+                         (leman-e2ee--account-data-get
+                          session (format "m.secret_storage.key.%s" default-key-id))))
+              ((leman-e2ee-ssss-check-key agent default-key-id recovery-key content)))
+    (ignore-errors
+      (leman-e2ee-ssss-decrypt-secret
+       agent default-key-id recovery-key content
+       name
+       (alist-get 'iv entry)
+       (alist-get 'ciphertext entry)
+       (alist-get 'mac entry)))))
+
+(defun leman-e2ee--import-cross-signing (session agent recovery-key)
+  "Decrypt and import SESSION's private cross-signing keys.
+The keys are unlocked from secret storage with RECOVERY-KEY (the
+account's default secret-storage key's recovery key).  Importing
+them lets the agent sign verified devices and the backup versions
+it creates; other clients require those signatures to complete
+verifications and to trust the backup.  Return non-nil when a key
+was imported."
+  (let ((default-key-id (ignore-errors
+                          (alist-get 'key
+                                     (leman-e2ee--account-data-get
+                                      session "m.secret_storage.default_key")))))
+    (when default-key-id
+      (let ((master (leman-e2ee--decrypt-ssss-secret
+                     session agent default-key-id recovery-key "m.cross_signing.master"))
+            (self-signing (leman-e2ee--decrypt-ssss-secret
+                           session agent default-key-id recovery-key
+                           "m.cross_signing.self_signing"))
+            (user-signing (leman-e2ee--decrypt-ssss-secret
+                           session agent default-key-id recovery-key
+                           "m.cross_signing.user_signing")))
+        (when (or master self-signing user-signing)
+          (condition-case err
+              (let ((status (leman-e2ee-import-cross-signing
+                             agent master self-signing user-signing)))
+                (leman-message
+                 "Leman E2EE: imported the private cross-signing keys (master: %s, self-signing: %s, user-signing: %s)"
+                 (alist-get 'has_master status)
+                 (alist-get 'has_self_signing status)
+                 (alist-get 'has_user_signing status))
+                t)
+            (leman-e2ee-error
+             (leman-message "Leman E2EE: importing the private cross-signing keys failed: %s" (cdr err))
+             nil)
+            (plz-error
+             (leman-message "Leman E2EE: importing the private cross-signing keys failed: %S" (cdr err))
+             nil)))))))
+
+(defun leman-e2ee-import-cross-signing-keys (session)
+  "Import SESSION's private cross-signing keys from secret storage.
+Ask for the secret-storage recovery key; the decrypted keys are
+imported into the E2EE agent, which then signs verified devices
+and the backup versions it creates.  Other clients require those
+signatures to complete verifications and to trust the backup."
+  (interactive (list (leman-complete-session)))
+  (let ((agent (leman-session-e2ee session)))
+    (unless agent
+      (user-error "Leman E2EE: no agent running (try reconnecting)"))
+    (let ((recovery-key (read-string "Secret storage recovery key: ")))
+      (or (leman-e2ee--import-cross-signing session agent recovery-key)
+          (user-error "Leman E2EE: no cross-signing secrets are stored for the account's default key")))))
 
 (defun leman-e2ee-backup-info (session)
   "Display SESSION's key backup status."

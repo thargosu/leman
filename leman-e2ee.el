@@ -476,6 +476,23 @@ keys."
                       (list (cons 'user_id user-id)
                             (cons 'flow_id flow-id))))
 
+(defun leman-e2ee-cross-signing-status (agent)
+  "Return which private cross-signing keys AGENT holds.
+An alist with ~has_master~, ~has_self_signing~, and
+~has_user_signing~ keys."
+  (leman-e2ee-request agent "cross_signing_status"))
+
+(defun leman-e2ee-import-cross-signing (agent master-key self-signing-key user-signing-key)
+  "Import the private cross-signing keys into AGENT.
+The keys are the unpadded base64 seeds stored in secret storage;
+without them the agent cannot sign verified devices or the backup
+versions it creates, so other clients never trust them."
+  (leman-e2ee-request
+   agent "import_cross_signing_keys"
+   (list (cons 'master_key master-key)
+         (cons 'self_signing_key self-signing-key)
+         (cons 'user_signing_key user-signing-key))))
+
 (defun leman-e2ee-start-sas (agent user-id flow-id)
   "Start SAS for the verification FLOW-ID of USER-ID on AGENT."
   (leman-e2ee-request agent "start_sas"

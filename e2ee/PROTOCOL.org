@@ -302,6 +302,36 @@ has been received).
 ~state~ is one of ~created~, ~ready~, ~accepted~, ~done~,
 ~cancelled~ (as seen by us).
 
+** ~import_cross_signing_keys~
+
+Imports the account's private cross-signing keys (the unpadded
+base64 seeds stored in secret storage under the
+~m.cross_signing.*~ secrets).  Without them the machine cannot
+sign anything: devices verified via SAS are never signed (other
+clients then show them as unverified and their verification flows
+wait for our signature), and backup versions the machine creates
+carry no master-key signature, so other clients do not trust
+them.
+
+#+begin_src json
+{"id": 13, "cmd": "import_cross_signing_keys", "params": {
+  "master_key": "<unpadded-base64>",
+  "self_signing_key": "<unpadded-base64>",
+  "user_signing_key": "<unpadded-base64>"}}
+{"id": 13, "ok": {"has_master": true, "has_self_signing": true,
+                  "has_user_signing": true}}
+#+end_src
+
+** ~cross_signing_status~
+
+Reports which private cross-signing keys the machine holds.
+
+#+begin_src json
+{"id": 14, "cmd": "cross_signing_status"}
+{"id": 14, "ok": {"has_master": false, "has_self_signing": false,
+                  "has_user_signing": false}}
+#+end_src
+
 ** ~accept_verification~
 
 Accepts an incoming request (sends ~m.key.verification.ready~).
@@ -336,11 +366,16 @@ once both sides have exchanged keys and the emoji can be shown;
   "user_id": "@user:example.com", "flow_id": "<flow-id>"}}
 {"id": 15, "ok": {"can_be_presented": true, "accepted": true,
                   "done": false, "cancelled": false,
+                  "cancel_code": null, "cancel_reason": null,
+                  "cancelled_by_us": null,
                   "emoji": [{"number": 49, "symbol": "🦋",
                              "description": "butterfly"}, ...]}}
 #+end_src
 
-~emoji~ is present (7 items) only when ~can_be_presented~.
+~emoji~ is present (7 items) only when ~can_be_presented~.  When
+~cancelled~ is true, ~cancel_code~ (e.g. ~m.mismatched_sas~),
+~cancel_reason~ (human-readable), and ~cancelled_by_us~ describe
+the cancellation.
 
 ** ~accept_sas~
 

@@ -2127,11 +2127,8 @@ sync delivers room keys."
     (user-error "Leman E2EE: no agent running (try reconnecting)"))
   (pcase-let* ((`(,decrypted . ,pending)
                 (leman-e2ee--retry-decryption leman-session)))
-    (leman-message "Leman E2EE: decrypted %s of %s undecryptable event%s (%s remain%s)"
-                   decrypted pending
-                   (if (= pending 1) "" "s")
-                   (- pending decrypted)
-                   (if (= (- pending decrypted) 1) "s" ""))))
+    (leman-message "Leman E2EE: decrypted %s of %s undecryptable events (%s remaining)"
+                   decrypted pending (- pending decrypted))))
 
 (defun leman-room-view-event (event)
   "Pop up buffer showing details of EVENT (interactively, the one at point).

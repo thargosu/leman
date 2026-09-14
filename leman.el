@@ -881,7 +881,7 @@ performing one at a time until there is nothing left to back up."
                                    (unless leman-e2ee--backup-stale-warned-p
                                      (setq leman-e2ee--backup-stale-warned-p t)
                                      (leman-message
-                                      "Leman E2EE: the server's key backup changed elsewhere; run M-x leman-e2ee-setup-backup to adopt the current version (uploads to the old one are rejected)"))
+                                      "Leman E2EE: the server's key backup changed elsewhere; run M-x leman-e2ee-setup-backup to adopt the current version"))
                                  (leman-message "Leman E2EE: backing up room keys failed: %S"
                                                 plz-error)))))))
     (leman-e2ee-error
@@ -1859,10 +1859,10 @@ Also used for left rooms, in which case STATUS should be set to
                         (cl-loop for event across-ref (alist-get 'events ,type)
                                  do (setf event (leman-e2ee--decrypt-event-struct
                                                  session id event))
-                                ;; Skip events already known to the session
-                                ;; (e.g. re-delivered after a limited timeline,
-                                ;; or by a second concurrent sync), otherwise
-                                ;; they would be shown twice.
+                                 ;; Skip events already known to the session
+                                 ;; (e.g. re-delivered after a limited timeline,
+                                 ;; or by a second concurrent sync), otherwise
+                                 ;; they would be shown twice.
                                 (unless (and (leman-event-id event)
                                              (gethash (leman-event-id event)
                                                       (leman-session-events session)))

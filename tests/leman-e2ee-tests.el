@@ -2012,7 +2012,8 @@ to the agent, newest first."
           (should (string-search "NOT STORED" text))
           (should (string-search "Current backup version: none" text))
           (should (string-search "Agent: backup disabled" text))
-          (should (string-search "Agent: private cross-signing keys (master/self-signing/user-signing): NO/NO/NO" text))))
+          (should (string-search "Agent: private cross-signing keys (master/self-signing/user-signing): NO/NO/NO" text))
+          (should (string-search "m.cross_signing.master secret: NOT STORED" text))))
       (kill-buffer "*Leman backup state*"))))
 
 ;;;; Footer

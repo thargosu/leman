@@ -608,12 +608,18 @@ one is started."
                                     (alist-get 'display_name device)))
                             devices))
            (device-id (completing-read "Device: " choices nil t)))
-      (when (equal (alist-get 'verified
-                              (seq-find (lambda (device)
-                                          (equal (alist-get 'device_id device) device-id))
-                                        devices))
-                    t)
-        (user-error "Leman E2EE: device %s is already verified" device-id))
+      ;; A locally-verified device may still be unsigned (verified
+      ;; before the private cross-signing keys were imported): the
+      ;; signature is only uploaded during a dance, so re-running is
+      ;; the only way to sign it.
+      (when-let ((device (seq-find (lambda (device)
+                                     (equal (alist-get 'device_id device) device-id))
+                                   devices)))
+        (when (and (equal (alist-get 'verified device) t)
+                   (not (y-or-n-p
+                         (format "Device %s is already verified; run the dance again to sign it? "
+                                 device-id))))
+          (user-error "Leman E2EE: device %s is already verified" device-id)))
       (let* ((existing (seq-find (lambda (request)
                                    (equal (alist-get 'device_id request) device-id))
                                  (leman-e2ee-verification-requests agent user-id)))
@@ -1512,22 +1518,42 @@ was imported."
             (user-signing (leman-e2ee--decrypt-ssss-secret
                            session agent default-key-id recovery-key
                            "m.cross_signing.user_signing")))
-        (when (or master self-signing user-signing)
-          (condition-case err
-              (let ((status (leman-e2ee-import-cross-signing
-                              agent master self-signing user-signing)))
-                (leman-message
-                 "Leman E2EE: imported the private cross-signing keys (master: %s, self-signing: %s, user-signing: %s)"
-                 (alist-get 'has_master status)
-                 (alist-get 'has_self_signing status)
-                 (alist-get 'has_user_signing status))
-                t)
-            (leman-e2ee-error
-             (leman-message "Leman E2EE: importing the private cross-signing keys failed: %s" (cdr err))
-             nil)
-            (plz-error
-             (leman-message "Leman E2EE: importing the private cross-signing keys failed: %S" (cdr err))
-             nil)))))))
+        (if (or master self-signing user-signing)
+            (condition-case err
+                (let ((status (leman-e2ee-import-cross-signing
+                               agent master self-signing user-signing))
+                      (yes (lambda (flag) (if flag "yes" "NO"))))
+                  (leman-message
+                   "Leman E2EE: imported the private cross-signing keys (master: %s, self-signing: %s, user-signing: %s)%s"
+                   (funcall yes (alist-get 'has_master status))
+                   (funcall yes (alist-get 'has_self_signing status))
+                   (funcall yes (alist-get 'has_user_signing status))
+                   (if (and (alist-get 'has_master status)
+                            (alist-get 'has_self_signing status)
+                            (alist-get 'has_user_signing status))
+                       ""
+                     "; the agent does not hold all keys, so it cannot sign -- other clients will not complete verifications"))
+                  t)
+              (leman-e2ee-error
+               (leman-message "Leman E2EE: importing the private cross-signing keys failed: %s" (cdr err))
+               nil)
+              (plz-error
+               (leman-message "Leman E2EE: importing the private cross-signing keys failed: %S" (cdr err))
+               nil))
+          ;; Nothing decrypted: say why (M-x leman-e2ee-backup-dump
+          ;; shows which m.cross_signing.* secrets are stored).
+          (let ((content (ignore-errors
+                           (leman-e2ee--account-data-get
+                            session (format "m.secret_storage.key.%s" default-key-id)))))
+            (leman-message
+             "Leman E2EE: no cross-signing secrets imported (%s)"
+             (cond ((not content)
+                    (format "the default secret-storage key %s is not stored on the account"
+                            default-key-id))
+                   ((not (leman-e2ee-ssss-check-key agent default-key-id recovery-key content))
+                    "the recovery key does not unlock the account's default key")
+                   (t "no m.cross_signing.* secrets are stored under the default key")))
+            nil))))))
 
 (defun leman-e2ee-import-cross-signing-keys (session)
   "Import SESSION's private cross-signing keys from secret storage.
@@ -1691,6 +1717,25 @@ untangling key-backup state after other clients changed it."
                 (let ((key-id (format "%s" (car entry))))
                   (princ (format "  - entry encrypted for key %s\n" key-id))
                   (leman-e2ee-backup-dump--key session key-id))))))
+        (princ "\n")
+        ;; The private cross-signing keys' secrets (what
+        ;; `leman-e2ee-import-cross-signing-keys' needs): Element only
+        ;; stores them when recovery is set up, and re-stores them
+        ;; under the default key when the recovery key changes.
+        (dolist (name '("m.cross_signing.master"
+                        "m.cross_signing.self_signing"
+                        "m.cross_signing.user_signing"))
+          (let ((keys (when-let ((secret (ignore-errors
+                                           (leman-e2ee--account-data-get
+                                            session (format "m.secret_storage.secret.%s" name)))))
+                        (mapcar (lambda (entry) (format "%s" (car entry)))
+                                (alist-get 'encrypted secret)))))
+            (princ (format "%s secret: %s\n" name
+                           (cond ((not keys) "NOT STORED")
+                                 ((member default-key-id keys)
+                                  "stored under the default key")
+                                 (t (format "stored under %s (NOT the default key)"
+                                            (string-join keys ", "))))))))
         (princ "\n")
         (let ((version (ignore-errors (leman-e2ee--backup-version-info session))))
           (if (not version)

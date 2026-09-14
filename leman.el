@@ -696,20 +696,23 @@ buffer is refreshed."
 Events that failed to decrypt (their keys had not arrived yet) are
 kept with their raw form; when a retry succeeds, the stored event
 struct is updated in place and refreshed in its room's buffer.
-Returns the number of newly decrypted events."
+Return (DECRYPTED . PENDING): the number of newly decrypted
+events, and the number that are still undecryptable (nil when no
+agent is running)."
   (when-let ((agent (leman-session-e2ee session)))
-    (let ((count 0))
+    (let ((count 0) (pending 0))
       (dolist (room (leman-session-rooms session))
         (dolist (event-struct (append (leman-room-timeline room)
                                       (leman-room-state room)))
           (when-let ((raw (and (equal (leman-event-type event-struct) "m.room.encrypted")
                                (alist-get 'encrypted-raw
                                           (leman-event-local event-struct)))))
+            (cl-incf pending)
             (let ((decrypted (leman-e2ee--decrypt-event session raw (leman-room-id room))))
               (unless (equal (alist-get 'type decrypted) "m.room.encrypted")
                 (leman-e2ee--update-decrypted-event event-struct decrypted session room)
                 (cl-incf count))))))
-      count)))
+      (cons count pending))))
 
 (defun leman-e2ee--sync-changes (session data)
   "Send the E2EE parts of the sync DATA to SESSION's agent.

@@ -1178,21 +1178,19 @@ to the agent, newest first."
     (setf (leman-session-rooms session) (list room))
     ;; Still no keys: nothing changes.
     (cl-letf (((symbol-function #'leman-e2ee--decrypt-event) (lambda (&rest _) raw)))
-      (should (= (leman-e2ee--retry-decryption session) 0))
+      (should (equal (leman-e2ee--retry-decryption session) '(0 . 1)))
       (should (equal (leman-event-type undecrypted) "m.room.encrypted")))
     ;; Keys arrived: the event is decrypted and updated in place.
     (cl-letf (((symbol-function #'leman-e2ee--decrypt-event)
                (lambda (&rest _)
                  '((type . "m.room.message") (event_id . "$e1") (sender . "@a:x.org")
-                   (origin_server_ts . 1) (content . ((body . "hello"))))))
-              ;; The event is old: no notification runs for it.
-              ((symbol-function #'leman-notify) #'ignore))
-      (should (= (leman-e2ee--retry-decryption session) 1))
+                   (origin_server_ts . 1) (content . ((body . "hello")))))))
+      (should (= (car (leman-e2ee--retry-decryption session)) 1))
       (should (equal (leman-event-type undecrypted) "m.room.message"))
       (should (equal (alist-get 'body (leman-event-content undecrypted)) "hello"))
       (should-not (alist-get 'encrypted-raw (leman-event-local undecrypted)))
       ;; Already-decrypted events are not retried.
-      (should (= (leman-e2ee--retry-decryption session) 0)))))
+      (should (equal (leman-e2ee--retry-decryption session) '(0 . 0))))))
 
 (ert-deftest leman-e2ee--retry-decryption-notifies-recent-events ()
   ;; An event that only decrypted because its key arrived after it is

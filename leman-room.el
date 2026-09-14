@@ -2123,9 +2123,15 @@ arrived yet (e.g. old messages fetched before importing keys with
 in place when this succeeds.  It also runs automatically after a
 sync delivers room keys."
   (interactive)
-  (let ((count (leman-e2ee--retry-decryption leman-session)))
-    (leman-message "Leman E2EE: decrypted %s previously undecryptable event%s"
-                   count (if (= count 1) "" "s"))))
+  (unless (leman-session-e2ee leman-session)
+    (user-error "Leman E2EE: no agent running (try reconnecting)"))
+  (pcase-let* ((`(,decrypted . ,pending)
+                (leman-e2ee--retry-decryption leman-session)))
+    (leman-message "Leman E2EE: decrypted %s of %s undecryptable event%s (%s remain%s)"
+                   decrypted pending
+                   (if (= pending 1) "" "s")
+                   (- pending decrypted)
+                   (if (= (- pending decrypted) 1) "s" ""))))
 
 (defun leman-room-view-event (event)
   "Pop up buffer showing details of EVENT (interactively, the one at point).

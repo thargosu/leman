@@ -600,9 +600,13 @@ one is started."
                  device-id user-id)
         ;; The dance's to-device events travel with the session's
         ;; syncs; pump the agent's outgoing requests each round.
+        ;; This must remain asynchronous: confirming the emoji queues
+        ;; the MAC request, and waiting synchronously for a slow
+        ;; homeserver here makes Emacs appear to hang immediately after
+        ;; the user answers `y'.
         (catch 'finished
           (cl-loop for round from 1 upto 90
-                   do (leman-e2ee--process-outgoing-requests-sync session)
+                   do (leman-e2ee--process-outgoing-requests session)
                       (let ((result (leman-e2ee--verify-step
                                      agent user-id flow-id device-id)))
                         (pcase result
@@ -615,7 +619,7 @@ one is started."
                       (sleep-for 2)
                    finally (message "Leman E2EE: verification of %s timed out; run `M-x leman-e2ee-verify' again."
                                     device-id)))
-        (leman-e2ee--process-outgoing-requests-sync session)))))
+        (leman-e2ee--process-outgoing-requests session)))))
 
 (defun leman-e2ee--decrypt-event (session event &optional room-id)
   "Decrypt EVENT (from ROOM-ID) with SESSION's E2EE agent.

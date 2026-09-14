@@ -796,6 +796,38 @@ to the agent, newest first."
            (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1" "ABC")))
     (should (null result))))
 
+(ert-deftest leman-e2ee-verify-pumps-requests-asynchronously ()
+  "Verification must not synchronously wait for the post-SAS MAC request."
+  (let* ((agent (leman-e2ee--create))
+         (session (make-leman-session
+                   :e2ee agent
+                   :user (make-leman-user :id "@me:x.org")))
+         (async-pumps 0))
+    (cl-letf (((symbol-function #'read-string)
+               (lambda (&rest _) "@me:x.org"))
+              ((symbol-function #'completing-read)
+               (lambda (&rest _) "ABC"))
+              ((symbol-function #'leman-e2ee-devices)
+               (lambda (&rest _)
+                 (vector (list (cons 'device_id "ABC")
+                               (cons 'display_name "Other device")
+                               (cons 'verified nil)))))
+              ((symbol-function #'leman-e2ee-verification-requests)
+               (lambda (&rest _) (vector)))
+              ((symbol-function #'leman-e2ee-request-verification)
+               (lambda (&rest _) "flow1"))
+              ((symbol-function #'leman-e2ee--process-outgoing-requests)
+               (lambda (&rest _) (cl-incf async-pumps)))
+              ((symbol-function #'leman-e2ee--process-outgoing-requests-sync)
+               (lambda (&rest _)
+                 (error "verification must not synchronously pump requests")))
+              ((symbol-function #'leman-e2ee--verify-step)
+               (lambda (&rest _) 'done)))
+      (leman-e2ee-verify session))
+    ;; Once before inspecting the completed state, and once to flush
+    ;; anything the final state transition may have queued.
+    (should (= async-pumps 2))))
+
 ;;;; Incoming request announcements
 
 (ert-deftest leman-e2ee--announce-requests-announces-new-incoming ()

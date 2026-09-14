@@ -783,12 +783,10 @@ Return non-nil when the response was reported to the agent."
     ;; NOTE: The body is a pre-encoded JSON string from the agent;
     ;; pass it through verbatim.
     (condition-case err
-        (let ((data (leman-api session endpoint
-                               :method method
-                               :version version
-                               :data body
-                               :then 'sync
-                               :else nil)))
+        (let ((data (leman-e2ee--api-sync session endpoint
+                                          :method method
+                                          :version version
+                                          :data body)))
           (leman-e2ee-mark-request-as-sent agent id data)
           t)
       (plz-error
@@ -891,43 +889,48 @@ performing one at a time until there is nothing left to back up."
     (leman-e2ee-error
      (leman-message "Leman E2EE: backing up room keys failed: %S" (cdr err)))))
 
+(defun leman-e2ee--api-sync (session endpoint &rest args)
+  "Perform a synchronous API request to ENDPOINT on SESSION.
+ARGS are passed to `leman-api'.  Signal `plz-error' when the
+request fails: with `:then' sync, plz replaces `:else' with a
+handler that only stores the error, so a failed request is
+returned as a `plz-error' struct instead of being signaled; the
+error must be detected here (silently dropped requests have left
+e.g. the m.megolm_backup.v1 secret pointing to a stale key)."
+  (let ((result (apply #'leman-api session endpoint :then 'sync args)))
+    (when (plz-error-p result)
+      (signal 'plz-error (list result)))
+    result))
+
 (defun leman-e2ee--account-data-get (session type)
   "Return the global account data of TYPE on SESSION, synchronously.
 Signal `user-error' when it does not exist."
   (condition-case err
-      (leman-api session (leman-e2ee--account-data-endpoint session type)
-                 :version "v3"
-                 :then 'sync
-                 :else nil)
+      (leman-e2ee--api-sync session (leman-e2ee--account-data-endpoint session type)
+                            :version "v3")
     (plz-error (user-error "Leman E2EE: no %s configured (%S)" type (cdr err)))))
 
 (defun leman-e2ee--account-data-put (session type data)
   "Store the global account data DATA under TYPE on SESSION.
-Signal `plz-error' when the request fails: with `:else' nil,
-`plz' returns the error instead of signaling it, so it must be
-detected here (silently dropped writes have left e.g. the
-m.megolm_backup.v1 secret pointing to a stale backup key)."
-  (let ((result (leman-api session (leman-e2ee--account-data-endpoint session type)
-                           :method 'put
-                           :version "v3"
-                           :data (json-encode data)
-                           :then 'sync
-                           :else nil)))
-    (when (plz-error-p result)
-      (signal 'plz-error (list result)))))
+Signal `plz-error' when the request fails."
+  (leman-e2ee--api-sync session (leman-e2ee--account-data-endpoint session type)
+                        :method 'put
+                        :version "v3"
+                        :data (json-encode data))
+  nil)
 
 (defun leman-e2ee--backup-version-info (session)
   "Return the homeserver's current key backup version info for SESSION.
 An alist with ~version~, ~algorithm~, and ~auth_data~ keys; signal
 `user-error' when no backup exists."
-  (condition-case err
-      (leman-api session "room_keys/version"
-                 :version "v3"
-                 :then 'sync
-                 :else nil)
-    (plz-error
-     (user-error "Leman E2EE: no key backup exists on the homeserver (%S)"
-                 (cdr err)))))
+  (let ((result (leman-api session "room_keys/version" :version "v3" :then 'sync)))
+    (if (not (plz-error-p result))
+        result
+      (let ((status (when-let ((response (plz-error-response result)))
+                      (plz-response-status response))))
+        (if (equal status 404)
+            (user-error "Leman E2EE: no key backup exists on the homeserver")
+          (signal 'plz-error (list result)))))))
 
 (defun leman-e2ee--unlock-backup-secret (session agent recovery-key encrypted default-key-id)
   "Unlock the m.megolm_backup.v1 secret's ENCRYPTED entries.
@@ -1004,11 +1007,9 @@ backup version's info comes from the homeserver."
     (unless (equal (leman-e2ee-backup-verify agent backup-recovery backup-info) t)
       (user-error "Leman E2EE: the backup's decryption key does not match the current backup version"))
     (leman-e2ee-backup-enable agent backup-recovery version)
-    (let* ((downloaded (leman-api session "room_keys/keys"
-                                  :version "v3"
-                                  :params (list (list "version" version))
-                                  :then 'sync
-                                  :else nil))
+    (let* ((downloaded (leman-e2ee--api-sync session "room_keys/keys"
+                                             :version "v3"
+                                             :params (list (list "version" version))))
            (result (leman-e2ee-backup-import
                     agent backup-recovery (alist-get 'rooms downloaded))))
       (leman-message
@@ -1200,14 +1201,12 @@ working.  Backs up the room keys afterwards."
          (existing-version (ignore-errors
                              (leman-e2ee--backup-version-info session)))
          (version (alist-get 'version
-                             (leman-api session "room_keys/version"
-                                        :method 'post
-                                        :version "v3"
-                                        :data (json-encode
-                                               `((algorithm . ,(alist-get 'algorithm created))
-                                                 (auth_data . ,(alist-get 'auth_data created))))
-                                        :then 'sync
-                                        :else nil)))
+                             (leman-e2ee--api-sync session "room_keys/version"
+                                                   :method 'post
+                                                   :version "v3"
+                                                   :data (json-encode
+                                                          `((algorithm . ,(alist-get 'algorithm created))
+                                                            (auth_data . ,(alist-get 'auth_data created)))))))
          (content (leman-e2ee--account-data-get
                    session (format "m.secret_storage.key.%s" default-key-id)))
          (encrypted (leman-e2ee-ssss-encrypt-secret
@@ -1225,6 +1224,15 @@ working.  Backs up the room keys afterwards."
          (stored (mapcar (lambda (entry)
                            (cons (format "%s" (car entry)) (cdr entry)))
                          stored)))
+    ;; Trust nothing: verify that the homeserver actually made the
+    ;; new version current before pointing anything at it (some
+    ;; servers returned the new version id while keeping the old
+    ;; version current, which made the fresh key useless).
+    (let ((current (ignore-errors (leman-e2ee--backup-version-info session))))
+      (unless (equal (alist-get 'version current) version)
+        (user-error
+         "Leman E2EE: the homeserver did not make the new backup version current (POST created %S; GET latest returns %S)"
+         version (or (alist-get 'version current) "nothing"))))
     (leman-e2ee-backup-enable agent recovery-key version)
     (leman-e2ee--account-data-put
      session "m.secret_storage.secret.m.megolm_backup.v1"
@@ -1268,19 +1276,14 @@ default key and display both recovery keys to save."
   (let* ((created (leman-e2ee-backup-create agent))
          (recovery-key (alist-get 'recovery_key created))
          (existing-version (ignore-errors
-                             (leman-api session "room_keys/version"
-                                        :version "v3"
-                                        :then 'sync
-                                        :else nil)))
+                             (leman-e2ee--backup-version-info session)))
          (version (alist-get 'version
-                             (leman-api session "room_keys/version"
-                                        :method 'post
-                                        :version "v3"
-                                        :data (json-encode
-                                               `((algorithm . ,(alist-get 'algorithm created))
-                                                 (auth_data . ,(alist-get 'auth_data created))))
-                                        :then 'sync
-                                        :else nil)))
+                             (leman-e2ee--api-sync session "room_keys/version"
+                                                   :method 'post
+                                                   :version "v3"
+                                                   :data (json-encode
+                                                          `((algorithm . ,(alist-get 'algorithm created))
+                                                            (auth_data . ,(alist-get 'auth_data created)))))))
          (ssss (leman-e2ee-ssss-create agent))
          (key-id (alist-get 'key_id ssss))
          (ssss-recovery (alist-get 'recovery_key ssss))
@@ -1293,6 +1296,11 @@ default key and display both recovery keys to save."
       (leman-message
        "Leman E2EE: replacing existing backup version %s (its backed-up keys stay in that version)"
        (alist-get 'version existing-version)))
+    (let ((current (ignore-errors (leman-e2ee--backup-version-info session))))
+      (unless (equal (alist-get 'version current) version)
+        (user-error
+         "Leman E2EE: the homeserver did not make the new backup version current (POST created %S; GET latest returns %S)"
+         version (or (alist-get 'version current) "nothing"))))
     (leman-e2ee-backup-enable agent recovery-key version)
     (leman-e2ee--account-data-put
      session (format "m.secret_storage.key.%s" key-id) content)

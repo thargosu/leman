@@ -1631,7 +1631,7 @@ to the agent, newest first."
                           . ((encrypted . ((kd . ((iv . "stale")))
                                            (k1 . ((iv . "i"))))))))))
     (cl-letf (((symbol-function #'leman-e2ee--backup-version-info)
-               (lambda (_session) '((version . "69562"))))
+               (lambda (_session) '((version . "12148797"))))
               ((symbol-function #'leman-api)
                (lambda (_session endpoint &rest args)
                  (if (eq (plist-get args :method) 'post)
@@ -1660,10 +1660,36 @@ to the agent, newest first."
         (should (equal (alist-get "k1" entries nil nil #'equal) '((iv . "i")))))
       (should (= pumps 1)))))
 
+(ert-deftest leman-e2ee--create-backup-version-verifies-current ()
+  ;; Some homeservers return the new version id while keeping an old
+  ;; version current: creating must abort before pointing the agent
+  ;; and the secret at a version the server would not serve.
+  (let* ((fake (leman-e2ee-tests--fake-agent
+                '((backup_create . ((recovery_key . "EsNew")
+                                    (algorithm . "m.megolm_backup.v1.curve25519-aes-sha2")
+                                    (auth_data . "auth"))))))
+         (agent (car fake))
+         (session (make-leman-session :user (make-leman-user :id "@me:x.org")
+                                      :e2ee agent))
+         (enables 0))
+    (cl-letf (((symbol-function #'leman-e2ee--backup-version-info)
+               ;; The server keeps the old version current.
+               (lambda (_session) '((version . "69562"))))
+              ((symbol-function #'leman-e2ee--api-sync)
+               (lambda (&rest _) '((version . "12150227"))))
+              ((symbol-function #'leman-e2ee-backup-enable)
+               (lambda (&rest _) (cl-incf enables)))
+              ((symbol-function #'leman-message) #'ignore))
+      (should-error (leman-e2ee--create-backup-version session agent "kd" "EsDefault")
+                    :type 'user-error)
+      (should (= enables 0)))))
+
 (declare-function leman-e2ee-restore-keys "leman")
 (declare-function leman-e2ee--restore-with-agent-key "leman")
 (declare-function leman-e2ee--restore-backup "leman")
 (declare-function leman-e2ee--enable-backup-and-import "leman")
+(declare-function leman-e2ee--create-backup-version "leman")
+(declare-function leman-e2ee--api-sync "leman")
 (declare-function leman-e2ee-backup-verify "leman-e2ee")
 (declare-function leman-e2ee-ssss-decrypt-secret "leman-e2ee")
 (declare-function leman-e2ee--backup-version-info "leman")

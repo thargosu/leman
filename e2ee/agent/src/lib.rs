@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent;
 use matrix_sdk_crypto::{
     secret_storage::{AesHmacSha2EncryptedData, SecretStorageKey},
-    store::types::BackupDecryptionKey,
+    store::types::{BackupDecryptionKey, CrossSigningKeyExport},
     types::events::room::encrypted::EncryptedEvent,
     types::requests::{AnyOutgoingRequest, OutgoingVerificationRequest},
     DecryptionSettings, EncryptionSettings, EncryptionSyncChanges, OlmMachine,
@@ -165,6 +165,8 @@ impl Agent {
             "devices" => self.devices(params).await,
             "request_verification" => self.request_verification(params).await,
             "verification_requests" => self.verification_requests(params).await,
+            "import_cross_signing_keys" => self.import_cross_signing_keys(params).await,
+            "cross_signing_status" => self.cross_signing_status().await,
             "accept_verification" => self.accept_verification(params).await,
             "start_sas" => self.start_sas(params).await,
             "verification_sas" => self.verification_sas(params).await,
@@ -806,11 +808,15 @@ impl Agent {
                 })
                 .collect::<Vec<_>>()
         });
+        let cancel_info = sas.cancel_info();
         Ok(json!({
             "accepted": sas.has_been_accepted(),
             "can_be_presented": sas.can_be_presented(),
             "done": sas.is_done(),
             "cancelled": sas.is_cancelled(),
+            "cancel_code": cancel_info.as_ref().map(|info| info.cancel_code().as_str()),
+            "cancel_reason": cancel_info.as_ref().map(|info| info.reason()),
+            "cancelled_by_us": cancel_info.as_ref().map(|info| info.cancelled_by_us()),
             "emoji": emoji,
         }))
     }
@@ -859,6 +865,54 @@ impl Agent {
             self.stash_outgoing_verification(outgoing);
         }
         Ok(json!({}))
+    }
+
+    /// Import the account's private cross-signing keys (unpadded
+    /// base64 seeds, as stored in secret storage).  Without them the
+    /// machine cannot sign anything: verified devices are never
+    /// signed (other clients then show them as unverified, and their
+    /// verification flows wait for our signature), and backup
+    /// versions we create are not signed by the account's master
+    /// key.
+    async fn import_cross_signing_keys(&self, params: Value) -> CommandResult {
+        let machine = self.machine()?;
+        let export = CrossSigningKeyExport {
+            master_key: params.get("master_key").and_then(Value::as_str).map(str::to_owned),
+            self_signing_key: params
+                .get("self_signing_key")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            user_signing_key: params
+                .get("user_signing_key")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        };
+        if export.master_key.is_none()
+            && export.self_signing_key.is_none()
+            && export.user_signing_key.is_none()
+        {
+            return Err(crypto_error("no cross-signing keys provided"));
+        }
+        let status = machine
+            .import_cross_signing_keys(export)
+            .await
+            .map_err(crypto_error)?;
+        Ok(json!({
+            "has_master": status.has_master,
+            "has_self_signing": status.has_self_signing,
+            "has_user_signing": status.has_user_signing,
+        }))
+    }
+
+    /// Report which private cross-signing keys the machine holds.
+    async fn cross_signing_status(&self) -> CommandResult {
+        let machine = self.machine()?;
+        let status = machine.cross_signing_status().await;
+        Ok(json!({
+            "has_master": status.has_master,
+            "has_self_signing": status.has_self_signing,
+            "has_user_signing": status.has_user_signing,
+        }))
     }
 
     /// Generate a fresh backup decryption key and the signed auth data

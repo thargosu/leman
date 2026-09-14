@@ -744,6 +744,28 @@ When it succeeds, report the response to the agent."
           (url-hexify-string (leman-user-id (leman-session-user session)))
           (url-hexify-string type)))
 
+(defvar leman-e2ee--backup-stale-warned-p nil
+  "Non-nil when the user was already warned about a stale backup
+version (the server rejected an upload because another client
+created a newer backup version), so the warning is shown once
+per streak, not on every pump retry.")
+
+(defun leman-e2ee--backup-stale-version-p (plz-error)
+  "Return non-nil when PLZ-ERROR is a stale backup version rejection.
+That is M_INVALID_PARAM (a newer backup version was created
+elsewhere, e.g. by Element) or M_NOT_FOUND (the version was
+deleted); either way the agent's version no longer matches the
+homeserver's current one."
+  (pcase-let (((cl-struct plz-error response) plz-error))
+    (when (plz-response-p response)
+      (let* ((body (ignore-errors
+                     (json-read-from-string (plz-response-body response))))
+             (errcode (alist-get 'errcode body)))
+        (or (and (= (plz-response-status response) 400)
+                 (equal errcode "M_INVALID_PARAM"))
+            (and (= (plz-response-status response) 404)
+                 (equal errcode "M_NOT_FOUND")))))))
+
 (defun leman-e2ee--backup-pump (session agent)
   "Back up SESSION's room keys that are not backed up yet.
 Asynchronously drain the agent's pending backup requests,
@@ -759,11 +781,17 @@ performing one at a time until there is nothing left to back up."
                        :params params
                        :data body
                        :then (lambda (_data)
+                               (setq leman-e2ee--backup-stale-warned-p nil)
                                (leman-e2ee-backup-mark-as-sent agent id)
                                (leman-e2ee--backup-pump session agent))
                        :else (lambda (plz-error)
-                               (leman-message "Leman E2EE: backing up room keys failed: %S"
-                                              plz-error))))))
+                               (if (leman-e2ee--backup-stale-version-p plz-error)
+                                   (unless leman-e2ee--backup-stale-warned-p
+                                     (setq leman-e2ee--backup-stale-warned-p t)
+                                     (leman-message
+                                      "Leman E2EE: the server's key backup changed elsewhere; run M-x leman-e2ee-setup-backup to adopt the current version (uploads to the old one are rejected)"))
+                                 (leman-message "Leman E2EE: backing up room keys failed: %S"
+                                                plz-error)))))))
     (leman-e2ee-error
      (leman-message "Leman E2EE: backing up room keys failed: %S" (cdr err)))))
 

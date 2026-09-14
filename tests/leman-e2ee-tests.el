@@ -1124,6 +1124,68 @@ to the agent, newest first."
       (leman-e2ee--backup-pump nil agent)
       (should messages))))
 
+(ert-deftest leman-e2ee--backup-stale-version-p ()
+  (should (leman-e2ee--backup-stale-version-p
+           (make-plz-error :response
+                           (make-plz-response :status 400
+                                              :body "{\"errcode\":\"M_INVALID_PARAM\",\"error\":\"You may only manipulate the most recently created version of the backup.\"}"))))
+  (should (leman-e2ee--backup-stale-version-p
+           (make-plz-error :response
+                           (make-plz-response :status 404
+                                              :body "{\"errcode\":\"M_NOT_FOUND\"}"))))
+  ;; A rejected upload for another reason (e.g. the old POST bug) is
+  ;; not a stale-version rejection.
+  (should-not (leman-e2ee--backup-stale-version-p
+               (make-plz-error :response
+                               (make-plz-response :status 405
+                                                  :body "{\"errcode\":\"M_UNRECOGNIZED\"}"))))
+  (should-not (leman-e2ee--backup-stale-version-p
+               (make-plz-error :curl-error '(7 . "connection refused")))))
+
+(ert-deftest leman-e2ee--backup-pump-warns-once-when-stale ()
+  (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
+         (messages nil)
+         (stale (make-plz-error :response
+                                (make-plz-response :status 400
+                                                   :body "{\"errcode\":\"M_INVALID_PARAM\"}")))
+         (request '((id . "t1")
+                    (path . "/_matrix/client/v3/room_keys/keys")
+                    (params . ((version . "1")))
+                    (body . "{\"rooms\":{}}")))
+         ;; Fresh global state (other tests may have warned already).
+         (leman-e2ee--backup-stale-warned-p nil))
+    (cl-letf (((symbol-function #'leman-message)
+               (lambda (format-string &rest args)
+                 (push (apply #'format format-string args) messages))))
+      ;; Two stale rejections: only one warning.
+      (let ((requests (list request nil)))
+        (cl-letf (((symbol-function #'leman-e2ee-backup-room-keys)
+                   (lambda (_agent) (pop requests)))
+                  ((symbol-function #'leman-api)
+                   (lambda (_session _endpoint &rest args)
+                     (funcall (plist-get args :else) stale))))
+          (leman-e2ee--backup-pump nil agent)
+          (leman-e2ee--backup-pump nil agent)))
+      (should (= (length messages) 1))
+      (should (string-prefix-p "Leman E2EE: the server's key backup changed" (car messages)))
+      ;; A successful upload clears the flag: the next rejection warns again.
+      (let ((requests (list request)))
+        (cl-letf (((symbol-function #'leman-e2ee-backup-room-keys)
+                   (lambda (_agent) (pop requests)))
+                  ((symbol-function #'leman-e2ee-backup-mark-as-sent) #'ignore)
+                  ((symbol-function #'leman-api)
+                   (lambda (_session _endpoint &rest args)
+                     (funcall (plist-get args :then) nil))))
+          (leman-e2ee--backup-pump nil agent)))
+      (let ((requests (list request)))
+        (cl-letf (((symbol-function #'leman-e2ee-backup-room-keys)
+                   (lambda (_agent) (pop requests)))
+                  ((symbol-function #'leman-api)
+                   (lambda (_session _endpoint &rest args)
+                     (funcall (plist-get args :else) stale))))
+          (leman-e2ee--backup-pump nil agent)))
+      (should (= (length messages) 2)))))
+
 (ert-deftest leman-e2ee-ssss-check-key ()
   (pcase-let* ((fake (leman-e2ee-tests--fake-agent
                       '((ssss_check_key . ((valid . t))))))

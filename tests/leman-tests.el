@@ -530,6 +530,108 @@ property for toggling."
                                                                  (event_id . "$not-in-thread")))))
                    room)))))
 
+(ert-deftest leman-room--invalidate-event-node-by-id ()
+  "Event nodes are found by event ID, not struct identity.
+The event struct whose image was downloaded (captured when the
+event was formatted) may be a different object from the one the
+node holds, e.g. when a thread event was edited (the thread data
+stores a copy) or when the room buffer was re-created."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (calls nil)
+         (printer (lambda (data)
+                    (push data calls)
+                    (format "%s " (leman-event-id data))))
+         (event (make-leman-event :id "$img"))
+         (other (make-leman-event :id "$img"))
+         (missing (make-leman-event :id "$missing")))
+    (with-temp-buffer
+      (setf (map-elt (leman-room-local room) 'buffer) (current-buffer)
+            leman-ewoc (ewoc-create printer))
+      (ewoc-enter-last leman-ewoc event)
+      (should (= (length calls) 1))
+      ;; Invalidating another struct with the same event ID
+      ;; invalidates the node.
+      (leman-room--invalidate-event-node other room)
+      (should (= (length calls) 2))
+      ;; An event with no node in the buffer is ignored without error.
+      (leman-room--invalidate-event-node missing room)
+      (should (= (length calls) 2)))))
+
+(ert-deftest leman-room--m.image-callback-shows-thread-reply-image ()
+  "A downloaded image for a thread reply is shown in the thread view.
+Thread replies are not inserted into the room buffer's main
+timeline, so the callback re-renders the open thread view
+instead; it formerly warned that the event was \"not found in
+room\" (an \"as-yet unexplained bug\") and the image was never
+displayed."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (session (make-leman-session :user (make-leman-user :id "@me:example.com")
+                                      :events (make-hash-table :test #'equal)))
+         (root (make-leman-event :id "$root" :origin-server-ts 1000
+                                 :type "m.room.message"
+                                 :sender (make-leman-user :id "@me:example.com")
+                                 :content '((msgtype . "m.text") (body . "root"))))
+         (reply (make-leman-event :id "$reply" :origin-server-ts 2000
+                                  :sender (make-leman-user :id "@other:example.com")
+                                  :content '((msgtype . "m.image")
+                                             (body . "photo.jpg")
+                                             (m.relates_to . ((rel_type . "m.thread")
+                                                              (event_id . "$root"))))))
+         (thread-buffer (get-buffer-create "*Leman Thread: room*")))
+    (puthash "$root" root (leman-session-events session))
+    (leman-room--add-thread-event reply room)
+    (with-current-buffer thread-buffer
+      (leman-thread-mode)
+      (setf leman-thread-root-id "$root"
+            leman-room room
+            leman-session session)
+      (let ((leman-room-images nil))
+        (leman-room--render-thread thread-buffer root))
+      (should (string-search "root" (buffer-string))))
+    ;; The image arrives (via a struct captured when the reply was
+    ;; first formatted); the callback must re-render the thread view,
+    ;; which then uses the image data.  (The fake image data makes the
+    ;; formatter insert its error string, proving the re-render used
+    ;; the image data.)
+    (let ((leman-room-images t))
+      (leman-room--m.image-callback reply room "not-really-an-image"))
+    (with-current-buffer thread-buffer
+      (should (string-search "[error inserting image" (buffer-string))))
+    (kill-buffer thread-buffer)))
+
+(ert-deftest leman-room--format-m.image-no-duplicate-downloads ()
+  "Re-rendering an event does not start a second image download.
+The event may be re-rendered while its image is being downloaded
+(e.g. when other events arrive or the room buffer is
+re-created); each re-render must not start another download."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (event (make-leman-event :id "$img"
+                                  :content '((msgtype . "m.image")
+                                             (body . "photo.jpg")
+                                             (url . "mxc://example.com/photo"))))
+         (downloads 0))
+    (cl-letf (((symbol-function 'leman-room--image-download)
+               (lambda (&rest _args) (cl-incf downloads))))
+      (let ((leman-room-images t)
+            ;; The formatter reads the room from the dynamic
+            ;; `leman-room' variable.
+            (leman-room room))
+        (leman-room--format-m.image event nil)
+        (leman-room--format-m.image event nil)
+        (should (= downloads 1))
+        ;; Once the image is available, re-rendering shows it
+        ;; without downloading.
+        (setf (map-elt (leman-event-local event) 'image) "image-data")
+        (should (string-match-p "error inserting image"
+                                (leman-room--format-m.image event nil)))
+        (should (= downloads 1))
+        ;; After the download completes or fails, re-rendering may
+        ;; download again.
+        (setf (map-elt (leman-event-local event) 'image) nil
+              (map-elt (leman-event-local event) 'image-downloading) nil)
+        (leman-room--format-m.image event nil)
+        (should (= downloads 2))))))
+
 (ert-deftest leman-room--format-thread-chip ()
   "Test that thread roots show a summary chip linking to the view."
   (let* ((room (make-leman-room :id "!room:example.com"))

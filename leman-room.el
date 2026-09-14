@@ -4314,6 +4314,27 @@ original ID and relationships."
                        (equal leman-room room))))
               (buffer-list)))
 
+(defun leman-room--thread-root-id (event)
+  "Return the thread root ID for thread-reply EVENT, if any."
+  (when (equal (map-nested-elt (leman-event-content event) '(m.relates_to rel_type))
+               "m.thread")
+    (map-nested-elt (leman-event-content event) '(m.relates_to event_id))))
+
+(defun leman-room--rerender-thread-for-event (event room)
+  "Re-render any open thread buffer for ROOM that shows EVENT.
+EVENT may be the thread's root or a reply in it.  This is
+necessary for events that are not in the room buffer's main
+timeline (i.e. thread replies), whose fetched images can
+otherwise never be shown."
+  (let ((root-id (or (leman-room--thread-root-id event)
+                     (leman-event-id event))))
+    (when-let ((thread-buffer (leman-room--thread-buffer root-id room)))
+      (with-current-buffer thread-buffer
+        (leman-room--render-thread
+         thread-buffer
+         (or (gethash root-id (leman-session-events leman-session))
+             (make-leman-event :id root-id)))))))
+
 (defun leman-room--thread-summary (event)
   "Return EVENT's server-side thread summary, if any.
 This is the \"m.thread\" aggregation in EVENT's unsigned data."
@@ -4712,14 +4733,21 @@ The file mimics a raw HTTP response, the format that
 (defun leman-room--invalidate-event-node (event room)
   "Invalidate EVENT's node in ROOM's buffer, if any.
 This re-renders the event, displaying any images fetched since
-its last rendering."
-  (when-let* ((buffer (map-elt (leman-room-local room) 'buffer))
-              ((buffer-live-p buffer)))
-    (with-current-buffer buffer
-      (when-let ((node (leman-room--ewoc-last-matching leman-ewoc
-                         (lambda (node-data)
-                           (eq node-data event)))))
-        (ewoc-invalidate leman-ewoc node)))))
+its last rendering.  The node is found by event ID, so the event
+is also re-rendered when its node now holds another struct for
+the same event.  If EVENT has no node in the main timeline (e.g.
+a thread reply), or is also shown in an open thread view (e.g. a
+thread root), the thread view is re-rendered too."
+  (let ((id (leman-event-id event)))
+    (when-let* ((buffer (map-elt (leman-room-local room) 'buffer))
+                ((buffer-live-p buffer)))
+      (with-current-buffer buffer
+        (when-let ((node (leman-room--ewoc-last-matching leman-ewoc
+                           (lambda (node-data)
+                             (and (leman-event-p node-data)
+                                  (equal (leman-event-id node-data) id))))))
+          (ewoc-invalidate leman-ewoc node))))
+    (leman-room--rerender-thread-for-event event room)))
 
 (cl-defun leman-room--fetch-html-image (url event room &optional token)
   "Fetch image URL for EVENT in ROOM, asynchronously.
@@ -6116,6 +6144,9 @@ large; use `leman-room-image-show' to view it)."
   "Handle PLZ-ERROR from a failed request to download EVENT's image on SESSION.
 THEN is the success continuation, to which the request may be
 retried unauthenticated if the server returns M_UNRECOGNIZED."
+  ;; Allow a later re-rendering (e.g. after a network failure is
+  ;; resolved) to retry the download.
+  (setf (map-elt (leman-event-local event) 'image-downloading) nil)
   (pcase-let* (((cl-struct plz-error response
                            (message plz-message)
                            (curl-error `(,curl-exit-code . ,curl-message)))
@@ -6226,28 +6257,24 @@ show it in the buffer."
             'help-echo "Show image"
             'keymap button-map
             'mouse-face 'highlight)
-        (when leman-room-images
-          ;; Images enabled: download it.
+        (when (and leman-room-images
+                   (not (map-elt (leman-event-local event) 'image-downloading)))
+          ;; Images enabled: download it, unless a download is
+          ;; already in flight.  Re-rendering the event while the
+          ;; image is being downloaded (e.g. when the buffer is
+          ;; re-created or the event is invalidated) must not start
+          ;; another download.
+          (setf (map-elt (leman-event-local event) 'image-downloading) t)
           (leman-room--image-download event session
             :then then :else else))))))
 (defun leman-room--m.image-callback (event room data)
   "Add downloaded image from DATA to EVENT in ROOM.
 Then invalidate EVENT's node to show the image."
-  (pcase-let* (((cl-struct leman-room (local (map buffer))) room))
-    (setf (map-elt (leman-event-local event) 'image) data)
-    (when (buffer-live-p buffer)
-      (with-current-buffer buffer
-        (if-let (node (leman-room--ewoc-last-matching leman-ewoc
-                        (lambda (node-data)
-                          (eq node-data event))))
-            (ewoc-invalidate leman-ewoc node)
-          ;; This shouldn't happen, but very rarely, it can.  I haven't figured out why
-          ;; yet, so checking whether a node is found rather than blindly calling
-          ;; `ewoc-invalidate' prevents an error from aborting event processing.
-          (display-warning 'leman-room--m.image-callback
-                           (format "Event %S not found in room %S (a very rare, as-yet unexplained bug, which can be safely ignored; you may disconnect and reconnect if you wish, but it isn't strictly necessary)"
-                                   (leman-event-id event)
-                                   (leman-room-display-name room))))))))
+  (setf (map-elt (leman-event-local event) 'image) data
+        ;; The download has finished, so allow re-rendering to show
+        ;; the image without starting another download.
+        (map-elt (leman-event-local event) 'image-downloading) nil)
+  (leman-room--invalidate-event-node event room))
 
 (defun leman-room--format-m.file (event)
   "Return \"m.file\" EVENT formatted as a string."

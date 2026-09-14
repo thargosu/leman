@@ -751,11 +751,12 @@ performing one at a time until there is nothing left to back up."
   (condition-case err
       (let ((request (leman-e2ee-backup-room-keys agent)))
         (when request
-          (pcase-let* (((map ('id id) ('path path) ('body body)) request)
+          (pcase-let* (((map ('id id) ('path path) ('params params) ('body body)) request)
                        (`(,version ,endpoint) (leman-e2ee--split-path path)))
             (leman-api session endpoint
-                       :method 'post
+                       :method 'put
                        :version version
+                       :params params
                        :data body
                        :then (lambda (_data)
                                (leman-e2ee-backup-mark-as-sent agent id)

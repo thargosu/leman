@@ -794,12 +794,18 @@ async fn test_backup_restore_round_trip() {
     let backup = agent_a.request("backup_room_keys", json!({}));
     let request = &backup["ok"]["request"];
     assert!(request["id"].as_str().is_some(), "{backup}");
-    assert!(
-        request["path"].as_str().unwrap().contains("room_keys/keys/1"),
+    assert_eq!(
+        request["path"],
+        json!("/_matrix/client/v3/room_keys/keys"),
         "{backup}"
     );
+    assert_eq!(request["params"]["version"], json!("1"), "{backup}");
     let uploaded: Value =
         serde_json::from_str(request["body"].as_str().unwrap()).unwrap();
+    assert!(
+        uploaded["rooms"]["!room:example.org"]["sessions"].is_object(),
+        "{uploaded}"
+    );
     agent_a
         .request("backup_mark_as_sent", json!({"id": request["id"]}));
     let after = agent_a.request("backup_status", json!({}));

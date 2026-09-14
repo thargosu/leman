@@ -979,19 +979,21 @@ impl Agent {
     }
 
     /// Encrypt the not-yet-backed-up room keys.  The returned request
-    /// is for POST /room_keys/keys/{version}; the client reports it
-    /// with `backup_mark_as_sent`, which lets the machine clear its
-    /// pending backup (the same request is returned until then).
+    /// is for PUT /room_keys/keys?version={version}; the client
+    /// reports it with `backup_mark_as_sent`, which lets the machine
+    /// clear its pending backup (the same request is returned until
+    /// then).
     async fn backup_room_keys(&mut self) -> CommandResult {
         let machine = self.machine()?;
         let request = machine.backup_machine().backup().await.map_err(crypto_error)?;
         let Some((txn_id, keys_backup)) = request else {
             return Ok(json!({"request": Value::Null}));
         };
-        let body = json!({"version": keys_backup.version, "rooms": keys_backup.rooms});
+        let body = json!({"rooms": keys_backup.rooms});
         Ok(json!({"request": {
             "id": txn_id.as_str(),
-            "path": format!("/_matrix/client/v3/room_keys/keys/{}", keys_backup.version),
+            "path": "/_matrix/client/v3/room_keys/keys",
+            "params": {"version": keys_backup.version},
             "body": body.to_string(),
         }}))
     }

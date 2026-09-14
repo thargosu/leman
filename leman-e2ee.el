@@ -537,10 +537,10 @@ An alist with ~enabled~, ~version~, and ~room_key_counts~ keys."
 
 (defun leman-e2ee-backup-room-keys (agent)
   "Return the next backup request AGENT wants performed, or nil.
-The request is an alist with ~id~, ~path~, and ~body~ keys (the
-body is a pre-encoded JSON string); the client POSTs it to the
-path and reports the id with
-`leman-e2ee-backup-mark-as-sent'."
+The request is an alist with ~id~, ~path~, ~params~, and ~body~
+keys (the body is a pre-encoded JSON string); the client PUTs it
+to the path with the query parameters PARAMS and reports the id
+with `leman-e2ee-backup-mark-as-sent'."
   (alist-get 'request (leman-e2ee-request agent "backup_room_keys")))
 
 (defun leman-e2ee-backup-mark-as-sent (agent request-id)

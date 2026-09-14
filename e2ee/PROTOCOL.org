@@ -462,14 +462,15 @@ The client calls this before adopting a backup.
 ** ~backup_room_keys~
 
 Encrypts the not-yet-backed-up room keys.  Returns a request for
-~POST /room_keys/keys/{version}~ (body is a pre-encoded JSON string),
-or null when there is nothing to back up.
+~PUT /room_keys/keys?version=<version>~ (body is a pre-encoded JSON
+string), or null when there is nothing to back up.
 
 #+begin_src json
 {"id": 24, "cmd": "backup_room_keys"}
 {"id": 24, "ok": {"request": {
   "id": "<txn-id>",
-  "path": "/_matrix/client/v3/room_keys/keys/<version>",
+  "path": "/_matrix/client/v3/room_keys/keys",
+  "params": {"version": "<version>"},
   "body": "{...}"}}}
 #+end_src
 

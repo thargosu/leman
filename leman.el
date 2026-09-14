@@ -51,6 +51,7 @@
 (require 'cl-lib)
 (require 'dns)
 (require 'files)
+(require 'lisp-mnt)
 (require 'map)
 
 ;; This package.
@@ -196,6 +197,17 @@ It shouldn't usually be necessary to change this."
 
 ;;;; Commands
 
+(defun leman--device-display-name ()
+  "Return leman's default device display name."
+  ;; The version comes from the file header, so it can't go stale
+  ;; (and `package-get-version' only works when byte-compiled).
+  (format "Léman v%s GNU Emacs (%s@%s)"
+          (with-temp-buffer
+            (insert-file-contents (locate-library "leman"))
+            (lm-version))
+          (or user-login-name "[unknown user-login-name]")
+          (or (system-name) "[unknown system-name]")))
+
 (defun leman--new-session (user-id &optional uri-prefix)
   "Return a new session for USER-ID, using URI-PREFIX if given."
   (unless (string-match (rx bos "@" (group (1+ (not (any ":")))) ; Username
@@ -208,10 +220,7 @@ It shouldn't usually be necessary to change this."
          (user (make-leman-user :id user-id :username username))
          (server (make-leman-server :name server-name :uri-prefix uri-prefix))
          (transaction-id (leman--initial-transaction-id))
-         (initial-device-display-name (format "Leman.el: %s@%s"
-                                              ;; Just to be extra careful:
-                                              (or user-login-name "[unknown user-login-name]")
-                                              (or (system-name) "[unknown system-name]")))
+         (initial-device-display-name (leman--device-display-name))
          ;; NOTE: A fresh login must NOT claim a device ID (e.g. a
          ;; deterministic one): a fresh login is a new device
          ;; identity, and reusing a removed device's ID would
@@ -381,6 +390,26 @@ the port, e.g.
     (when (leman-api session "login"
             :then (apply-partially #'leman--connect-flows-callback session password))
       (message "Leman: Checking server's login flows..."))))
+
+(defun leman-rename-device (session)
+  "Set the display name of SESSION's device on the homeserver.
+The name is shown in the session lists of other clients.  When
+called non-interactively, NAME defaults to leman's computed
+device name."
+  (interactive (list (leman-complete-session)))
+  (pcase-let* (((cl-struct leman-session user device-id) session)
+               ((cl-struct leman-user id) user)
+               (name (read-string "Device display name: "
+                                  nil nil (leman--device-display-name))))
+    (unless device-id
+      (user-error "Leman: the session has no device ID (not logged in yet?)"))
+    (leman-api session (format "user/%s/devices/%s"
+                               (url-hexify-string id)
+                               (url-hexify-string device-id))
+      :method 'put
+      :data (json-encode `((display_name . ,name)))
+      :then (lambda (_data)
+              (leman-message "Leman: device renamed to %s" name)))))
 (defun leman-disconnect (sessions)
   "Disconnect from SESSIONS.
 Interactively, with prefix, disconnect from all sessions.  If
@@ -1486,7 +1515,7 @@ was imported."
         (when (or master self-signing user-signing)
           (condition-case err
               (let ((status (leman-e2ee-import-cross-signing
-                             agent master self-signing user-signing)))
+                              agent master self-signing user-signing)))
                 (leman-message
                  "Leman E2EE: imported the private cross-signing keys (master: %s, self-signing: %s, user-signing: %s)"
                  (alist-get 'has_master status)

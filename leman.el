@@ -831,9 +831,12 @@ An alist with ~version~, ~algorithm~, and ~auth_data~ keys; signal
   "Unlock the m.megolm_backup.v1 secret's ENCRYPTED entries.
 Try each entry (the default secret-storage key's first) with
 RECOVERY-KEY: when it unlocks the entry's key's content, decrypt
-the entry and return the backup decryption key (base58).  Signal
-`user-error' when no entry can be unlocked; DEFAULT-KEY-ID is the
-account's m.secret_storage.default_key's key (may be nil)."
+the entry and check the backup decryption key against the
+homeserver's current backup version; return it only when it
+matches (entries holding an older version's key are skipped and
+noted in the error).  Signal `user-error' when no entry qualifies;
+DEFAULT-KEY-ID is the account's m.secret_storage.default_key's
+key (may be nil)."
   (unless encrypted
     (user-error "Leman E2EE: the m.megolm_backup.v1 secret has no encrypted entries"))
   (let* ((entries (mapcar (lambda (entry) (cons (format "%s" (car entry)) (cdr entry)))
@@ -844,38 +847,49 @@ account's m.secret_storage.default_key's key (may be nil)."
          (ordered (if default
                       (cons default (delete default entries))
                     entries))
-         (reasons nil))
-    (catch 'unlocked
-      (dolist (entry ordered)
-        (let* ((key-id (car entry))
-               (data (cdr entry))
-               (key-content (ignore-errors
-                              (leman-e2ee--account-data-get
-                               session (format "m.secret_storage.key.%s" key-id)))))
-          (condition-case err
-              (progn
-                (unless key-content
-                  (signal 'leman-e2ee-error
-                          (list (format "secret-storage key %s is not stored on the account"
-                                        key-id))))
-                (unless (leman-e2ee-ssss-check-key agent key-id recovery-key key-content)
-                  (signal 'leman-e2ee-error
-                          (list (format "the recovery key does not unlock secret-storage key %s"
-                                        key-id))))
-                (throw 'unlocked
-                       (decode-coding-string
-                        (base64-decode-string
-                         (leman-e2ee-ssss-decrypt-secret
-                          agent key-id recovery-key key-content
-                          "m.megolm_backup.v1"
-                          (alist-get 'iv data)
-                          (alist-get 'ciphertext data)
-                          (alist-get 'mac data)))
-                        'utf-8)))
-            (leman-e2ee-error (push (cadr err) reasons)))))
-      (user-error
-       "the recovery key does not unlock any stored secret-storage key (%s)"
-       (string-join (nreverse reasons) "; ")))))
+         (reasons nil)
+         (version-info (ignore-errors (leman-e2ee--backup-version-info session))))
+    (when version-info
+      (let ((backup-info `((algorithm . ,(alist-get 'algorithm version-info))
+                           (auth_data . ,(alist-get 'auth_data version-info)))))
+        (catch 'unlocked
+          (dolist (entry ordered)
+            (let* ((key-id (car entry))
+                   (data (cdr entry))
+                   (key-content (ignore-errors
+                                  (leman-e2ee--account-data-get
+                                   session (format "m.secret_storage.key.%s" key-id)))))
+              (condition-case err
+                  (progn
+                    (unless key-content
+                      (signal 'leman-e2ee-error
+                              (list (format "secret-storage key %s is not stored on the account"
+                                            key-id))))
+                    (unless (leman-e2ee-ssss-check-key agent key-id recovery-key key-content)
+                      (signal 'leman-e2ee-error
+                              (list (format "the recovery key does not unlock secret-storage key %s"
+                                            key-id))))
+                    (let ((backup-recovery
+                           (decode-coding-string
+                            (base64-decode-string
+                             (leman-e2ee-ssss-decrypt-secret
+                              agent key-id recovery-key key-content
+                              "m.megolm_backup.v1"
+                              (alist-get 'iv data)
+                              (alist-get 'ciphertext data)
+                              (alist-get 'mac data)))
+                            'utf-8)))
+                      (if (equal (leman-e2ee-backup-verify
+                                  agent backup-recovery backup-info)
+                                 t)
+                          (throw 'unlocked backup-recovery)
+                        (push (format "the backup key stored under %s is for another backup version"
+                                      key-id)
+                              reasons))))
+                (leman-e2ee-error (push (cadr err) reasons)))))
+          (user-error
+           "no entry of the m.megolm_backup.v1 secret holds the current backup version's key (%s)"
+           (string-join (nreverse reasons) "; ")))))))
 
 (defun leman-e2ee--enable-backup-and-import (session agent backup-recovery)
   "Enable AGENT's backup for BACKUP-RECOVERY and import its keys.

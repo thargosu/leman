@@ -1200,9 +1200,15 @@ to the agent, newest first."
   (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
          (attempts nil)
          (checks nil)
+         (verifies nil)
          (account-data `(("m.secret_storage.key.k1" . ((algorithm . "x")))
                          ("m.secret_storage.key.k2" . ((algorithm . "y"))))))
-    (cl-letf (((symbol-function #'leman-e2ee--account-data-get)
+    (cl-letf (((symbol-function #'leman-e2ee--backup-version-info)
+               (lambda (_session)
+                 '((version . "9")
+                   (algorithm . "m.megolm_backup.v1.curve25519-aes-sha2")
+                   (auth_data . ((public_key . "pk9"))))))
+              ((symbol-function #'leman-e2ee--account-data-get)
                (lambda (_session type)
                  (alist-get type account-data nil nil #'equal)))
               ((symbol-function #'leman-e2ee-ssss-check-key)
@@ -1213,7 +1219,12 @@ to the agent, newest first."
               ((symbol-function #'leman-e2ee-ssss-decrypt-secret)
                (lambda (_agent key-id _recovery _content _name _iv _ct _mac)
                  (push key-id attempts)
-                 (base64-encode-string "EsBACKUP" t))))
+                 (base64-encode-string "EsBACKUP" t)))
+              ((symbol-function #'leman-e2ee-backup-verify)
+               (lambda (_agent _recovery backup-info)
+                 (push backup-info verifies)
+                 ;; The unlocked key matches the current version.
+                 t)))
       ;; The default key (k1) is tried first (its entry fails to
       ;; unlock), then k2's entry unlocks.
       (let ((result (leman-e2ee--unlock-backup-secret
@@ -1223,12 +1234,49 @@ to the agent, newest first."
                      "k1")))
         (should (equal result "EsBACKUP"))
         (should (equal checks '("k2" "k1")))
-        (should (equal attempts '("k2")))))))
+        (should (equal attempts '("k2")))
+        (should (equal verifies
+                       '(((algorithm . "m.megolm_backup.v1.curve25519-aes-sha2")
+                          (auth_data . ((public_key . "pk9")))))))))))
+
+(ert-deftest leman-e2ee--unlock-backup-secret-skips-stale-entries ()
+  ;; An entry that unlocks but holds an older version's key is
+  ;; skipped (Element may have created a newer backup version since
+  ;; the entry was written); the error names it.
+  (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
+         (account-data `(("m.secret_storage.key.k1" . ((algorithm . "x"))))))
+    (cl-letf (((symbol-function #'leman-e2ee--backup-version-info)
+               (lambda (_session)
+                 '((version . "9")
+                   (algorithm . "m.megolm_backup.v1.curve25519-aes-sha2")
+                   (auth_data . ((public_key . "pk9"))))))
+              ((symbol-function #'leman-e2ee--account-data-get)
+               (lambda (_session type)
+                 (alist-get type account-data nil nil #'equal)))
+              ((symbol-function #'leman-e2ee-ssss-check-key)
+               (lambda (_agent _key-id _recovery _content) t))
+              ((symbol-function #'leman-e2ee-ssss-decrypt-secret)
+               (lambda (&rest _) (base64-encode-string "EsSTALE" t)))
+              ((symbol-function #'leman-e2ee-backup-verify)
+               (lambda (_agent _recovery _backup-info) nil)))
+      (let ((err (should-error
+                  (leman-e2ee--unlock-backup-secret
+                   nil agent "EsOld"
+                   '((k1 . ((iv . "i") (ciphertext . "c") (mac . "m"))))
+                   "k1")
+                  :type 'user-error)))
+        (should (string-search "another backup version" (cadr err)))
+        (should (string-search "k1" (cadr err)))))))
 
 (ert-deftest leman-e2ee--unlock-backup-secret-reports-failures ()
   (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
          (account-data `(("m.secret_storage.key.k1" . ((algorithm . "x"))))))
-    (cl-letf (((symbol-function #'leman-e2ee--account-data-get)
+    (cl-letf (((symbol-function #'leman-e2ee--backup-version-info)
+               (lambda (_session)
+                 '((version . "9")
+                   (algorithm . "m.megolm_backup.v1.curve25519-aes-sha2")
+                   (auth_data . ((public_key . "pk9"))))))
+              ((symbol-function #'leman-e2ee--account-data-get)
                (lambda (_session type)
                  (alist-get type account-data nil nil #'equal)))
               ((symbol-function #'leman-e2ee-ssss-check-key)

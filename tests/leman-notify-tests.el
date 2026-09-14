@@ -48,7 +48,27 @@
       (should (leman-notify--dbus-recheck))
       (should (= 0 probes)))))
 
-;;;; Footer
+(ert-deftest leman-notify--notifications-notify-app-icon-fallback ()
+  "The room avatar is shown when available, the Leman icon otherwise."
+  (let* ((avatar (propertize " " 'display '(image :data "avatar-bytes")))
+         (event (make-leman-event
+                 :sender (make-leman-user :id "@alice:example.org")
+                 :content '((body . "hello"))))
+         notified)
+    (cl-letf (((symbol-function #'notifications-notify)
+               (lambda (&rest args) (setq notified args)))
+              ((symbol-function #'leman-notify--temp-file)
+               (lambda (content &rest _) content)))
+      (pcase-dolist (`(,room . ,expected)
+                     (cons (cons (make-leman-room :display-name "Room" :avatar avatar)
+                                 "avatar-bytes")
+                           (cons (cons (make-leman-room :display-name "Room")
+                                       leman-notify-app-icon)
+                                 nil)))
+        (leman-notify--notifications-notify event room nil)
+        (should (equal (plist-get notified :app-icon) expected))))))
+
+ ;;;; Footer
 
 (provide 'leman-notify-tests)
 

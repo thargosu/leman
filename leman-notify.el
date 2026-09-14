@@ -155,6 +155,16 @@ limitations and complexities of displaying strings and images in
 margins in Emacs.  But it's useful, anyway."
   :type 'boolean)
 
+(defcustom leman-notify-app-icon
+  (ignore-errors
+    (expand-file-name "assets/leman.svg"
+                      (file-name-directory (locate-library "leman-notify"))))
+  "File used as the desktop notification's app icon.
+Shown when the event's room has no avatar; otherwise the room's
+avatar is shown.  Set to nil to send no icon."
+  :type '(choice (file :tag "Icon file")
+                 (const :tag "No icon" nil)))
+
 ;;;; Commands
 
 (declare-function leman-room-goto-event "leman-room")
@@ -276,9 +286,10 @@ If ROOM has no existing buffer, do nothing."
       (truncate-string-to-width body 60)
       (notifications-notify :title title :body body
                             :app-name "Leman.el"
-                            :app-icon (when avatar
-                                        (leman-notify--temp-file
-                                         (plist-get (cdr (get-text-property 0 'display avatar)) :data)))
+                            :app-icon (or (when avatar
+                                            (leman-notify--temp-file
+                                             (plist-get (cdr (get-text-property 0 'display avatar)) :data)))
+                                          leman-notify-app-icon)
                             :category "im.received"
                             :timeout 5000
                             ;; FIXME: Using :sound-file seems to do nothing, ever.  Maybe a bug in notifications-notify?

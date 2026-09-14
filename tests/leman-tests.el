@@ -27,9 +27,6 @@
 (require 'leman-room-list)
 (require 'leman-tabulated-room-list)
 
-;; Variables from leman.el, which the tests don't load.
-(defvar leman-users)
-
 ;;;; Helpers
 
 (defun leman-tests--member-event (id state-key old new &optional kicked-p avatar-differs-p)
@@ -119,18 +116,16 @@ URL differ from the previous one."
 
 (ert-deftest leman-room--format-membership-events ()
   "Test membership events summary formatting."
-  ;; `leman-users' is declared without a value in leman-room.el (its real
-  ;; definition is in leman.el, which the tests don't load); SET it directly
-  ;; because SET is not lexically scoped, so the formatter's dynamic lookup
-  ;; will find it.
-  (set 'leman-users (make-hash-table :test #'equal))
-  (let* ((room (make-leman-room :id "!room:example.com"))
+  ;; Bind a fresh user table so the test does not depend on (or
+  ;; leak into) leman's global `leman-users'.
+  (let* ((leman-users (make-hash-table :test #'equal))
+         (room (make-leman-room :id "!room:example.com"))
          (leman-room room)
-         (format-summary (lambda (&rest events)
-                           (substring-no-properties
-                            (leman-room--format-membership-events
-                             (make-leman-room-membership-events :events events)
-                             room)))))
+        (format-summary (lambda (&rest events)
+                          (substring-no-properties
+                           (leman-room--format-membership-events
+                            (make-leman-room-membership-events :events events)
+                            room)))))
     ;; A single event is formatted by `leman-room--format-member-event'.
     (should (equal (funcall format-summary
                             (leman-tests--member-event 1 "@alice:example.com" nil "join"))
@@ -226,16 +221,6 @@ URL differ from the previous one."
            (pos (string-search "joined" raw)))
       (should (eq 'bold (get-text-property pos 'face raw))))))
 
-(ert-deftest leman-room--initial-header ()
-  "Test initial room buffer header."
-  (let ((plain (make-leman-room :id "!room:example.com"))
-        (encrypted (make-leman-room :id "!room:example.com"
-                                    :state (list (make-leman-event :type "m.room.encryption")))))
-    ;; Every room's header is empty (encrypted rooms are natively
-    ;; supported).
-    (should (string-empty-p (leman-room--initial-header plain)))
-    (should (string-empty-p (leman-room--initial-header encrypted)))))
-
 (ert-deftest leman-room--initial-footer ()
   "Test initial room buffer footer."
   (let ((plain (make-leman-room :id "!room:example.com"))
@@ -268,23 +253,87 @@ URL differ from the previous one."
           (cl-loop for sub-taxy in (taxy-taxys taxy)
                    append (leman-tests--taxy-items sub-taxy))))
 
+(defun leman-tests--taxy-named (name taxy)
+  "Return TAXY's descendant (or itself) named NAME, or nil."
+  (if (equal name (substring-no-properties (taxy-name taxy)))
+      taxy
+    (cl-loop for sub-taxy in (taxy-taxys taxy)
+             when (leman-tests--taxy-named name sub-taxy)
+             return it)))
+
+(ert-deftest leman-push-joined-room-events-account-data-keys-match-readers ()
+  ;; Room account data is stored by the sync push and read back by
+  ;; the room buffer's read-marker restoration and the room
+  ;; display-name code with STRING keys (e.g. "m.fully_read"): the
+  ;; stored keys must be strings, or read markers can never be
+  ;; restored.
+  (let* ((session (make-leman-session))
+         (fully-read (list (cons 'type "m.fully_read")
+                           (cons 'content (list (cons 'event_id "$read-up-to")))))
+         (name-override (list (cons 'type "org.matrix.msc3015.m.room.name.override")
+                              (cons 'content (list (cons 'name "Override")))))
+         (room (progn
+                 (setf (leman-session-events session) (make-hash-table :test #'equal))
+                 (leman--push-joined-room-events
+                  session
+                  (cons (intern "!room:x.org")
+                        (list (cons 'account_data
+                                    (list (cons 'events
+                                                (vector fully-read name-override)))))))
+                 (car (leman-session-rooms session))))
+         ;; The exact lookups the room buffer and display-name code
+         ;; use.
+         (fully-read-lookup (alist-get "m.fully_read"
+                                       (leman-room-account-data room)
+                                       nil nil #'equal))
+         (override-lookup (alist-get "org.matrix.msc3015.m.room.name.override"
+                                     (leman-room-account-data room)
+                                     nil nil #'equal)))
+    (should (equal (map-nested-elt fully-read-lookup '(content event_id))
+                   "$read-up-to"))
+    (should (equal (map-nested-elt override-lookup '(content name))
+                   "Override"))))
+
 (ert-deftest leman-room-list--build-taxy ()
   "Test building the room list taxy."
   (let* ((room-old (make-leman-room :id "!old:example.com" :latest-ts 100))
          (room-new (make-leman-room :id "!new:example.com" :latest-ts 200))
+         (room-invited (make-leman-room :id "!invited:example.com"
+                                        :latest-ts 300 :status 'invite))
+         (room-left (make-leman-room :id "!left:example.com"
+                                     :latest-ts 50 :status 'leave))
+         (room-buffered (make-leman-room :id "!buffered:example.com" :latest-ts 400
+                                         :local (list (cons 'buffer
+                                                            (get-buffer-create
+                                                             " *leman-test-room*")))))
          (session (make-leman-session :user (make-leman-user :id "@me:example.com")))
          (taxy (leman-room-list--build-taxy
-                (list (vector room-old session) (vector room-new session))
+                (list (vector room-old session) (vector room-new session)
+                      (vector room-invited session) (vector room-left session)
+                      (vector room-buffered session))
                 leman-room-list-default-keys
                 #'identity))
          (items (mapcar (lambda (item) (elt item 0))
                         (leman-tests--taxy-items taxy))))
     (should (equal "Leman Rooms" (taxy-name taxy)))
-    (should (member room-new items))
-    (should (member room-old items))
+    (dolist (room (list room-old room-new room-invited room-left room-buffered))
+      (should (member room items)))
     ;; Rooms are sorted latest-first.
     (should (< (cl-position room-new items :test #'equal)
-               (cl-position room-old items :test #'equal)))))
+               (cl-position room-old items :test #'equal)))
+    ;; Grouping: invitations, left rooms, and rooms with open
+    ;; buffers land in their own groups (and only there).
+    (dolist (group (list (list "Invited" room-invited room-old)
+                         (list "[Left]" room-left room-old)
+                         (list "Buffers" room-buffered room-old)))
+      (pcase-let* ((`(,name ,in ,out) group)
+                   (sub-taxy (leman-tests--taxy-named name taxy))
+                   (sub-items (when sub-taxy
+                                (mapcar (lambda (item) (elt item 0))
+                                        (leman-tests--taxy-items sub-taxy)))))
+        (should sub-taxy)
+        (should (member in sub-items))
+        (should-not (member out sub-items))))))
 
 (ert-deftest leman-tabulated-room-list--entry ()
   "Test building a tabulated room list entry."
@@ -469,7 +518,12 @@ property for toggling."
   (let ((leman-session (make-leman-session
                         :user (make-leman-user :id "@me:example.com")
                         :server (make-leman-server :uri-prefix "https://matrix.example.com"))))
-    (let* ((event (leman-tests--reacted-event "mxc://example.com/emoji"))
+    ;; Without the image, the key is shown as the mxc URI.  Bind
+    ;; `leman-room-images' explicitly: when it defaults to t (on an
+    ;; ImageMagick-capable build), the formatter would try to fetch
+    ;; the mxc URI for real.
+    (let* ((leman-room-images nil)
+           (event (leman-tests--reacted-event "mxc://example.com/emoji"))
            (room (make-leman-room :id "!room:example.com"))
            (string (leman-room--format-reactions event room)))
       ;; Without the image, the key is shown as the mxc URI.

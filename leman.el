@@ -1679,6 +1679,16 @@ untangling key-backup state after other clients changed it."
                            (or (alist-get 'version status) "-")
                            (alist-get 'backed_up (alist-get 'room_key_counts status))
                            (alist-get 'total (alist-get 'room_key_counts status))))))
+        (let ((status (ignore-errors (leman-e2ee-cross-signing-status agent))))
+          (if (not status)
+              (princ "Agent cross-signing keys: unavailable\n")
+            (princ (format "Agent: private cross-signing keys (master/self-signing/user-signing): %s/%s/%s\n%s"
+                           (if (alist-get 'has_master status) "yes" "NO")
+                           (if (alist-get 'has_self_signing status) "yes" "NO")
+                           (if (alist-get 'has_user_signing status) "yes" "NO")
+                           (if (and (alist-get 'has_master status) (alist-get 'has_self_signing status))
+                               ""
+                             "  (missing keys: verifications complete only on one side, and created\n  backup versions are not trusted by other clients; run M-x leman-e2ee-import-cross-signing-keys)\n")))))
         (princ "
 The recovery key asked for by setup/restore is the account's
 secret-storage recovery key (a ~48 character Es... string, shown

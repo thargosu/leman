@@ -1433,9 +1433,10 @@ to the agent, newest first."
 (ert-deftest leman-e2ee--re-store-backup-secret-adds-default-entry ()
   (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
          (puts nil)
+         ;; Symbol keys: the shape `json-read' returns.
          (account-data `(("m.secret_storage.default_key" . ((key . "kd")))
                          ("m.secret_storage.secret.m.megolm_backup.v1"
-                          . ((encrypted . (("k1" . ((iv . "i")))))))
+                          . ((encrypted . ((k1 . ((iv . "i")))))))
                          ("m.secret_storage.key.kd" . ((algorithm . "x"))))))
     (cl-letf (((symbol-function #'leman-e2ee--account-data-get)
                (lambda (_session type)
@@ -1458,11 +1459,15 @@ to the agent, newest first."
                        '((iv . "i2") (ciphertext . "c2") (mac . "m2"))))))))
 
 (ert-deftest leman-e2ee--re-store-backup-secret-skips-existing-entry ()
+  ;; The entry under the default key already holds the current
+  ;; backup version's key: nothing is written.
   (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
          (puts nil)
          (account-data `(("m.secret_storage.default_key" . ((key . "kd")))
                          ("m.secret_storage.secret.m.megolm_backup.v1"
-                          . ((encrypted . (("kd" . ((iv . "i"))))))))))
+                          . ((encrypted . ((kd . ((iv . "i") (ciphertext . "c")
+                                                  (mac . "m")))))))
+                         ("m.secret_storage.key.kd" . ((algorithm . "x"))))))
     (cl-letf (((symbol-function #'leman-e2ee--account-data-get)
                (lambda (_session type)
                  (alist-get type account-data nil nil #'equal)))
@@ -1470,9 +1475,14 @@ to the agent, newest first."
                (lambda (_session type _data) (push type puts)))
               ((symbol-function #'leman-e2ee-ssss-check-key)
                (lambda (_agent _key-id _recovery _content) t))
-              ((symbol-function #'leman-e2ee-ssss-encrypt-secret)
-               (lambda (&rest _args) nil)))
-      (leman-e2ee--re-store-backup-secret nil agent "EsK" "EsBACKUP")
+              ((symbol-function #'leman-e2ee--backup-version-info)
+               (lambda (_session) '((version . "12148797") (algorithm . "alg")
+                                    (auth_data . "auth"))))
+              ((symbol-function #'leman-e2ee-ssss-decrypt-secret)
+               (lambda (&rest _args) "EsCURRENT"))
+              ((symbol-function #'leman-e2ee-backup-verify)
+               (lambda (_agent _key _info) t)))
+      (leman-e2ee--re-store-backup-secret nil agent "EsK" "EsOTHERBACKUP")
       (should-not puts))))
 
 (ert-deftest leman-e2ee--re-store-backup-secret-asks-for-default-recovery ()
@@ -1483,7 +1493,7 @@ to the agent, newest first."
          (prompts nil)
          (account-data `(("m.secret_storage.default_key" . ((key . "kd")))
                          ("m.secret_storage.secret.m.megolm_backup.v1"
-                          . ((encrypted . (("k1" . ((iv . "i")))))))
+                          . ((encrypted . ((k1 . ((iv . "i")))))))
                          ("m.secret_storage.key.kd" . ((algorithm . "x"))))))
     (cl-letf (((symbol-function #'leman-e2ee--account-data-get)
                (lambda (_session type)
@@ -1511,7 +1521,7 @@ to the agent, newest first."
          (puts nil)
          (account-data `(("m.secret_storage.default_key" . ((key . "kd")))
                          ("m.secret_storage.secret.m.megolm_backup.v1"
-                          . ((encrypted . (("k1" . ((iv . "i")))))))
+                          . ((encrypted . ((k1 . ((iv . "i")))))))
                          ("m.secret_storage.key.kd" . ((algorithm . "x"))))))
     (cl-letf (((symbol-function #'leman-e2ee--account-data-get)
                (lambda (_session type)
@@ -1523,26 +1533,6 @@ to the agent, newest first."
               ((symbol-function #'read-string)
                (lambda (&rest _args) "")))
       (leman-e2ee--re-store-backup-secret nil agent "EsOther" "EsBACKUP")
-      (should-not puts))))
-
-(ert-deftest leman-e2ee--re-store-backup-secret-skips-existing-symbol-key-entry ()
-  ;; Real account data comes from `json-read', whose object keys are
-  ;; symbols: the lookup of the default key's entry must work anyway.
-  (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
-         (puts nil)
-         (account-data `(("m.secret_storage.default_key" . ((key . "kd")))
-                         ("m.secret_storage.secret.m.megolm_backup.v1"
-                          . ((encrypted . ((kd . ((iv . "i"))))))))))
-    (cl-letf (((symbol-function #'leman-e2ee--account-data-get)
-               (lambda (_session type)
-                 (alist-get type account-data nil nil #'equal)))
-              ((symbol-function #'leman-e2ee--account-data-put)
-               (lambda (_session type _data) (push type puts)))
-              ((symbol-function #'leman-e2ee-ssss-check-key)
-               (lambda (_agent _key-id _recovery _content) t))
-              ((symbol-function #'leman-e2ee-ssss-encrypt-secret)
-               (lambda (&rest _args) nil)))
-      (leman-e2ee--re-store-backup-secret nil agent "EsK" "EsBACKUP")
       (should-not puts))))
 
 (ert-deftest leman-e2ee--re-store-backup-secret-replaces-stale-entry ()
@@ -1770,6 +1760,17 @@ to the agent, newest first."
                     :type 'user-error)
       (should (= enables 0)))))
 
+(ert-deftest leman-e2ee--delete-backup-version ()
+  (let ((calls nil))
+    (cl-letf (((symbol-function #'leman-e2ee--api-sync)
+               (lambda (_session endpoint &rest args)
+                 (push (cons endpoint args) calls)
+                 '())))
+      (leman-e2ee--delete-backup-version nil "69562")
+      (should (equal (car calls)
+                     (cons "room_keys/version/69562"
+                           (list :method 'delete :version "v3")))))))
+
 (ert-deftest leman-e2ee--ensure-version-current-noop ()
   (let ((deletes 0))
     (cl-letf (((symbol-function #'leman-e2ee--backup-version-info)
@@ -1957,8 +1958,7 @@ to the agent, newest first."
                  "Es")))
 
 (ert-deftest leman-e2ee-backup-dump ()
-  (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
-         (fake (leman-e2ee-tests--fake-agent
+  (let* ((fake (leman-e2ee-tests--fake-agent
                 '((backup_status . ((enabled . t) (version . "3")
                                     (room_key_counts . ((total . 5) (backed_up . 4))))))))
          (session (make-leman-session :user (make-leman-user :id "@vv:x.org")))
@@ -1991,23 +1991,28 @@ to the agent, newest first."
 
 (ert-deftest leman-e2ee-backup-dump-missing-pieces ()
   ;; Absent account data and no backup version must not error; the
-  ;; dump reports them.
-  (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
-         (fake (leman-e2ee-tests--fake-agent '((backup_status . nil))))
+  ;; dump reports them.  The homeserver stub returns a real 404
+  ;; plz-error struct, so the account-data and backup-version error
+  ;; conversions run for real (a 404 on room_keys/version means "no
+  ;; backup", not "request failed").
+  (let* ((fake (leman-e2ee-tests--fake-agent
+                '((backup_status . ((enabled)))
+                  (cross_signing_status . ((has_master)
+                                           (has_self_signing)
+                                           (has_user_signing))))))
          (session (make-leman-session :user (make-leman-user :id "@vv:x.org"))))
     (setf (leman-session-e2ee session) (car fake))
-    (cl-letf (((symbol-function #'leman-e2ee--account-data-get)
-               (lambda (_session _type)
-                 (signal 'user-error (list "not found"))))
-              ((symbol-function #'leman-api)
+    (cl-letf (((symbol-function #'leman-api)
                (lambda (_session _endpoint &rest _args)
-                 (signal 'plz-error (list "404")))))
+                 (make-plz-error :response (make-plz-response :status 404)))))
       (leman-e2ee-backup-dump session)
       (with-current-buffer "*Leman backup state*"
         (let ((text (buffer-string)))
           (should (string-search "Default secret-storage key: none" text))
           (should (string-search "NOT STORED" text))
-          (should (string-search "Current backup version: none" text))))
+          (should (string-search "Current backup version: none" text))
+          (should (string-search "Agent: backup disabled" text))
+          (should (string-search "Agent: private cross-signing keys (master/self-signing/user-signing): NO/NO/NO" text))))
       (kill-buffer "*Leman backup state*"))))
 
 ;;;; Footer

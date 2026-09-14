@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
-matrix-sdk-crypto = "0.18"
+matrix-sdk-crypto = { version = "0.18", features = ["automatic-room-key-forwarding"] }
 matrix-sdk-sqlite = { version = "0.18", default-features = false, features = ["crypto-store"] }
 rand = "0.10"
 ruma = { version = "0.16", features = ["client-api"] }

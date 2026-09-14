@@ -199,14 +199,19 @@ It shouldn't usually be necessary to change this."
 
 (defun leman--device-display-name ()
   "Return leman's default device display name."
-  ;; The version comes from the file header, so it can't go stale
-  ;; (and `package-get-version' only works when byte-compiled).
-  (format "Léman v%s GNU Emacs (%s@%s)"
-          (with-temp-buffer
-            (insert-file-contents (locate-library "leman"))
-            (lm-version))
-          (or user-login-name "[unknown user-login-name]")
-          (or (system-name) "[unknown system-name]")))
+  ;; The version is read from the header of the file that defines
+  ;; this function (`symbol-file', resolved to the .el: a .elc has
+  ;; no header, and `locate-library' can find an unrelated copy).
+  (let ((file (or (symbol-file 'leman--device-display-name)
+                  (locate-library "leman.el"))))
+    (when (equal (file-name-extension file) "elc")
+      (setf file (concat (file-name-sans-extension file) ".el")))
+    (format "Léman v%s GNU Emacs (%s@%s)"
+            (with-temp-buffer
+              (insert-file-contents file)
+              (lm-version))
+            (or user-login-name "[unknown user-login-name]")
+            (or (system-name) "[unknown system-name]"))))
 
 (defun leman--new-session (user-id &optional uri-prefix)
   "Return a new session for USER-ID, using URI-PREFIX if given."

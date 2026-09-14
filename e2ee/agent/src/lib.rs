@@ -256,13 +256,22 @@ impl Agent {
         if !migratable {
             return Ok(());
         }
-        std::fs::create_dir_all(path).context("creating per-device store directory")?;
-        for entry in std::fs::read_dir(parent).context("reading legacy store directory")? {
-            let entry = entry.context("reading legacy store directory entry")?;
+        tokio::fs::create_dir_all(path)
+            .await
+            .context("creating per-device store directory")?;
+        let mut entries = tokio::fs::read_dir(parent)
+            .await
+            .context("reading legacy store directory")?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .context("reading legacy store directory entry")?
+        {
             let file_name = entry.file_name();
             let name = file_name.to_string_lossy();
             if name.starts_with("matrix-sdk-crypto.sqlite3") {
-                std::fs::rename(entry.path(), path.join(&*file_name))
+                tokio::fs::rename(entry.path(), path.join(&*file_name))
+                    .await
                     .context("moving legacy crypto store file")?;
             }
         }

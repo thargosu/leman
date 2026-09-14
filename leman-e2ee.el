@@ -553,6 +553,30 @@ path and reports the id with
   (alist-get 'recovery_key
              (leman-e2ee-request agent "backup_recovery_key")))
 
+(defun leman-e2ee--export-keys (agent passphrase)
+  "Export every room key AGENT holds as an encrypted key-export file.
+PASSPHRASE protects the export.  Return the file's content (the
+same format as Element's \"Export E2E room keys\")."
+  (alist-get 'keys
+             (leman-e2ee-request
+              agent "export_room_keys"
+              (list (cons 'passphrase passphrase)))
+             nil nil #'equal))
+
+(defun leman-e2ee--import-keys (agent keys passphrase)
+  "Import room keys from an encrypted key-export KEYS string into AGENT.
+PASSPHRASE unlocks the export (the same format as Element's
+\"Export E2E room keys\").  Return an alist with ~imported~ and
+~total~ counts."
+  (leman-e2ee-request
+   agent "import_room_keys"
+   (list (cons 'keys keys)
+         (cons 'passphrase passphrase))))
+
+(defun leman-e2ee--format-recovery-key (key)
+  "Return KEY grouped in 4-character chunks, like Element does."
+  (mapconcat #'identity (seq-partition key 4) " "))
+
 (defun leman-e2ee-backup-import (agent recovery-key rooms)
   "Import downloaded backup ROOMS into AGENT with RECOVERY-KEY.
 ROOMS is the ~rooms~ value of the GET /room_keys/keys response.

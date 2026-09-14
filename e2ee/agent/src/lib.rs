@@ -176,6 +176,8 @@ impl Agent {
             "backup_verify" => self.backup_verify(params).await,
             "backup_status" => self.backup_status().await,
             "backup_recovery_key" => self.backup_recovery_key().await,
+            "export_room_keys" => self.export_room_keys(params).await,
+            "import_room_keys" => self.import_room_keys(params).await,
             "backup_room_keys" => self.backup_room_keys().await,
             "backup_mark_as_sent" => self.backup_mark_as_sent(params).await,
             "backup_import" => self.backup_import(params).await,
@@ -937,6 +939,43 @@ impl Agent {
                 None => Value::Null,
             }
         }))
+    }
+
+    /// Export every room key the machine holds as an encrypted
+    /// key-export file (the same format as Element's "Export E2E
+    /// room keys").
+    async fn export_room_keys(&self, params: Value) -> CommandResult {
+        use matrix_sdk_crypto::encrypt_room_key_export;
+        let machine = self.machine()?;
+        let passphrase = param_str(&params, "passphrase")?;
+        let exported = machine
+            .store()
+            .export_room_keys(|_| true)
+            .await
+            .map_err(crypto_error)?;
+        // NOTE: Element's exporter uses 500000 PBKDF2 rounds.
+        let file = encrypt_room_key_export(&exported, passphrase, 500_000)
+            .map_err(crypto_error)?;
+        Ok(json!({"keys": file}))
+    }
+
+    /// Import room keys from an encrypted key-export file (the same
+    /// format as Element's "Export E2E room keys").  Imported keys
+    /// are not marked as backed up, so an enabled backup will pick
+    /// them up.
+    async fn import_room_keys(&self, params: Value) -> CommandResult {
+        use matrix_sdk_crypto::decrypt_room_key_export;
+        let machine = self.machine()?;
+        let passphrase = param_str(&params, "passphrase")?;
+        let keys = param_str(&params, "keys")?;
+        let exported = decrypt_room_key_export(keys.as_bytes(), passphrase)
+            .map_err(crypto_error)?;
+        let result = machine
+            .store()
+            .import_room_keys(exported, None, |_, _| {})
+            .await
+            .map_err(crypto_error)?;
+        Ok(json!({"imported": result.imported_count, "total": result.total_count}))
     }
 
     /// Encrypt the not-yet-backed-up room keys.  The returned request

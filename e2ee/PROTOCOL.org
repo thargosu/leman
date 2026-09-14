@@ -560,6 +560,23 @@ asking the user to type it again.
 {"id": 31, "ok": {"recovery_key": "<base58>"}}
 #+end_src
 
+** ~export_room_keys~ / ~import_room_keys~
+
+Exports every room key the machine holds to, and imports room
+keys from, an encrypted key-export file: the same format as
+Element's "Export E2E room keys" (the file's content is passed as
+a string; PASSPHRASE unlocks it).  Imported keys are not marked
+as backed up, so an enabled backup picks them up.
+
+#+begin_src json
+{"id": 32, "cmd": "export_room_keys", "params": {"passphrase": "..."}}
+{"id": 32, "ok": {"keys": "-----BEGIN MEGOLM SESSION DATA-----\n..."}}
+
+{"id": 33, "cmd": "import_room_keys", "params": {
+  "keys": "-----BEGIN MEGOLM SESSION DATA-----\n...", "passphrase": "..."}}
+{"id": 33, "ok": {"imported": 12, "total": 12}}
+#+end_src
+
 ** Client flows
 
 Setup (a device that has room keys):

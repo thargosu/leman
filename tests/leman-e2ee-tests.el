@@ -44,6 +44,9 @@
 (declare-function leman-e2ee-ssss-check-key "leman-e2ee")
 (declare-function leman-e2ee-backup-dump "leman")
 (declare-function leman-e2ee-backup-recovery-key "leman-e2ee")
+(declare-function leman-e2ee--export-keys "leman-e2ee")
+(declare-function leman-e2ee--import-keys "leman-e2ee")
+(declare-function leman-e2ee--format-recovery-key "leman-e2ee")
 
 ;;;; Helpers
 
@@ -1278,6 +1281,34 @@ to the agent, newest first."
                       '((backup_recovery_key . ((recovery_key))))))
                (agent (car fake)))
     (should-not (leman-e2ee-backup-recovery-key agent))))
+
+(ert-deftest leman-e2ee--key-export-import-wrappers ()
+  (pcase-let* ((fake (leman-e2ee-tests--fake-agent
+                      '((export_room_keys . ((keys . "-----BEGIN MEGOLM SESSION DATA-----")))
+                        (import_room_keys . ((imported . 2) (total . 3))))))
+               (agent (car fake)))
+    (should (equal (leman-e2ee--export-keys agent "secret")
+                   "-----BEGIN MEGOLM SESSION DATA-----"))
+    (should (equal (leman-e2ee--import-keys agent "DATA" "secret")
+                   '((imported . 2) (total . 3))))
+    ;; The params reach the agent.
+    (let ((sent (mapcar #'leman-e2ee--decode (cdr fake))))
+      (should (equal (alist-get 'params
+                                (seq-find (lambda (r)
+                                            (equal (alist-get 'cmd r) "export_room_keys"))
+                                          sent))
+                     '((passphrase . "secret"))))
+      (should (equal (alist-get 'params
+                                (seq-find (lambda (r)
+                                            (equal (alist-get 'cmd r) "import_room_keys"))
+                                          sent))
+                     '((keys . "DATA") (passphrase . "secret")))))))
+
+(ert-deftest leman-e2ee--format-recovery-key ()
+  (should (equal (leman-e2ee--format-recovery-key "EsTjUCTr1234ABCD")
+                 "EsTj UCTr 1234 ABCD"))
+  (should (equal (leman-e2ee--format-recovery-key "Es")
+                 "Es")))
 
 (ert-deftest leman-e2ee-backup-dump ()
   (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))

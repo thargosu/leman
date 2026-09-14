@@ -924,6 +924,80 @@ async fn test_backup_restore_round_trip() {
     agent_b.request("quit", json!({}));
 }
 
+/// E4 follow-up: keys export/import in the Element key-export file
+/// format: one agent exports its keys, a fresh agent imports them
+/// and decrypts old history.
+#[tokio::test]
+async fn test_key_export_import() {
+    let store_a = TempDir::new().unwrap();
+    let mut agent_a = TestAgent::spawn();
+    assert!(
+        agent_a
+            .request(
+                "initialize",
+                json!({"user_id": "@bob:example.org", "device_id": "BOBDEVICE",
+                       "store_path": store_a.path().to_str().unwrap()})
+            )["ok"]
+            .is_object()
+    );
+
+    let alice =
+        OlmMachine::new(ruma::user_id!("@alice:example.org"), ruma::device_id!("ALICEDEVICE")).await;
+    let encrypted_event = exchange_and_encrypt(&mut agent_a, &alice).await;
+    agent_a
+        .request(
+            "decrypt_room_event",
+            json!({"room_id": "!room:example.org", "event": encrypted_event}),
+        );
+
+    // Export on agent A.
+    let exported = agent_a.request(
+        "export_room_keys",
+        json!({"passphrase": "hunter2"}),
+    );
+    let keys = exported["ok"]["keys"].as_str().unwrap();
+    assert!(keys.starts_with("-----BEGIN MEGOLM SESSION DATA-----"), "{keys}");
+
+    // Import on a fresh agent B, which then decrypts old history.
+    let store_b = TempDir::new().unwrap();
+    let mut agent_b = TestAgent::spawn();
+    assert!(
+        agent_b
+            .request(
+                "initialize",
+                json!({"user_id": "@bob:example.org", "device_id": "BOBDEVICE2",
+                       "store_path": store_b.path().to_str().unwrap()})
+            )["ok"]
+            .is_object()
+    );
+    let imported = agent_b.request(
+        "import_room_keys",
+        json!({"keys": keys, "passphrase": "hunter2"}),
+    );
+    assert_eq!(
+        imported["ok"]["imported"],
+        json!(1),
+        "one room key imported: {imported}"
+    );
+    // A wrong passphrase must fail.
+    let wrong = agent_b.request(
+        "import_room_keys",
+        json!({"keys": keys, "passphrase": "wrong"}),
+    );
+    assert!(wrong["err"].is_object(), "{wrong}");
+    let decrypted = agent_b.request(
+        "decrypt_room_event",
+        json!({"room_id": "!room:example.org", "event": encrypted_event}),
+    );
+    assert_eq!(
+        decrypted["ok"]["event"]["content"]["body"],
+        json!("It's a secret to everybody."),
+        "the importing device decrypts old history"
+    );
+    agent_a.request("quit", json!({}));
+    agent_b.request("quit", json!({}));
+}
+
 
 fn base64_encode(data: &[u8]) -> String {
     use std::io::Write;

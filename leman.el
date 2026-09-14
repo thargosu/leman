@@ -630,6 +630,69 @@ decryption fails, return EVENT unchanged."
                                      event))
       event)))
 
+(defvar leman-e2ee--room-keys-arrived-p nil
+  "Non-nil when the last sync delivered room keys to the agent.
+Used to trigger a decryption retry at the end of that sync.")
+
+(defun leman-e2ee--decrypt-event-struct (session room-id event)
+  "Decrypt raw encrypted EVENT of ROOM-ID with SESSION's agent.
+Return the `leman-event' struct; when decryption fails, the raw
+event is stashed in the struct's local slot, so that
+`leman-e2ee--retry-decryption' can decrypt it later, when the
+room's key arrives (e.g. forwarded by another device)."
+  (let* ((decrypted (leman-e2ee--decrypt-event session event room-id))
+         (event-struct (leman--make-event decrypted)))
+    (when (equal (leman-event-type event-struct) "m.room.encrypted")
+      (setf (leman-event-local event-struct)
+            (cons (cons 'encrypted-raw event) (leman-event-local event-struct))))
+    event-struct))
+
+(defun leman-e2ee--update-decrypted-event (event-struct decrypted room)
+  "Update EVENT-STRUCT in place from the decrypted event DECRYPTED.
+The struct is shared by the session's events table and the room's
+event lists, so updating it in place propagates everywhere; ROOM's
+buffer is refreshed."
+  (pcase-let* ((new (leman--make-event decrypted)))
+    (setf (leman-event-sender event-struct) (leman-event-sender new)
+          (leman-event-content event-struct) (leman-event-content new)
+          (leman-event-origin-server-ts event-struct) (leman-event-origin-server-ts new)
+          (leman-event-type event-struct) (leman-event-type new)
+          (leman-event-unsigned event-struct) (leman-event-unsigned new)
+          (leman-event-state-key event-struct) (leman-event-state-key new)
+          (leman-event-local event-struct)
+          (assq-delete-all 'encrypted-raw (leman-event-local event-struct))))
+  (when-let ((buffer (map-elt (leman-room-local room) 'buffer))
+             ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (when-let ((nodes (leman-room--ewoc-last-matching
+                         leman-ewoc
+                         (lambda (data)
+                           (and (leman-event-p data)
+                                (equal (leman-event-id data)
+                                       (leman-event-id event-struct)))))))
+        (with-silent-modifications
+          (ewoc-invalidate leman-ewoc nodes))))))
+
+(defun leman-e2ee--retry-decryption (session)
+  "Retry decryption of SESSION's stored undecryptable events.
+Events that failed to decrypt (their keys had not arrived yet) are
+kept with their raw form; when a retry succeeds, the stored event
+struct is updated in place and refreshed in its room's buffer.
+Returns the number of newly decrypted events."
+  (when-let ((agent (leman-session-e2ee session)))
+    (let ((count 0))
+      (dolist (room (leman-session-rooms session))
+        (dolist (event-struct (append (leman-room-timeline room)
+                                      (leman-room-state room)))
+          (when-let ((raw (and (equal (leman-event-type event-struct) "m.room.encrypted")
+                               (alist-get 'encrypted-raw
+                                          (leman-event-local event-struct)))))
+            (let ((decrypted (leman-e2ee--decrypt-event session raw (leman-room-id room))))
+              (unless (equal (alist-get 'type decrypted) "m.room.encrypted")
+                (leman-e2ee--update-decrypted-event event-struct decrypted room)
+                (cl-incf count))))))
+      count)))
+
 (defun leman-e2ee--sync-changes (session data)
   "Send the E2EE parts of the sync DATA to SESSION's agent.
 This must be called before the sync's next-batch token is
@@ -638,13 +701,21 @@ first could lose room keys).  Afterwards, the agent's outgoing
 requests are performed."
   (when-let ((agent (leman-session-e2ee session)))
     (condition-case err
-        (leman-e2ee-receive-sync-changes
-         agent
-         (alist-get 'events (alist-get 'to_device data))
-         (or (alist-get 'device_lists data) (list))
-         (or (alist-get 'device_one_time_keys_count data) (list))
-         (alist-get 'device_unused_fallback_key_types data)
-         (alist-get 'next_batch data))
+        (let ((response (leman-e2ee-receive-sync-changes
+                         agent
+                         (alist-get 'events (alist-get 'to_device data))
+                         (or (alist-get 'device_lists data) (list))
+                         (or (alist-get 'device_one_time_keys_count data) (list))
+                         (alist-get 'device_unused_fallback_key_types data)
+                         (alist-get 'next_batch data))))
+          (when (seq-find (lambda (event)
+                            (let ((type (or (alist-get 'type event) "")))
+                              (or (string-prefix-p "m.room_key" type)
+                                  (string-prefix-p "m.forwarded_room_key" type))))
+                          (alist-get 'to_device_events response))
+            ;; Room keys arrived: let the sync callback retry the
+            ;; decryption of events that failed before they arrived.
+            (setf leman-e2ee--room-keys-arrived-p t)))
       (leman-e2ee-error
        (leman-message "Leman E2EE: processing sync changes failed: %S" (cdr err))))
     (leman-e2ee--process-outgoing-requests session)
@@ -911,7 +982,10 @@ backup version's info comes from the homeserver."
                     agent backup-recovery (alist-get 'rooms downloaded))))
       (leman-message
        "Leman E2EE: restored %s of %s room keys from backup"
-       (alist-get 'imported result) (alist-get 'total result)))))
+       (alist-get 'imported result) (alist-get 'total result))
+      ;; The restored keys may decrypt events that were already
+      ;; fetched and shown as undecryptable.
+      (leman-e2ee--retry-decryption session))))
 
 (defun leman-e2ee--re-store-backup-secret (session agent recovery-key backup-recovery)
   "Store BACKUP-RECOVERY under SESSION's default secret-storage key.
@@ -1223,7 +1297,10 @@ backup is enabled."
             (leman-message "Leman E2EE: imported %s of %s room keys from %s"
                            (alist-get 'imported result)
                            (alist-get 'total result)
-                           (file-name-nondirectory file)))
+                           (file-name-nondirectory file))
+            ;; The session's keys may decrypt events that were already
+            ;; fetched and shown as undecryptable.
+            (leman-e2ee--retry-decryption session))
         (leman-e2ee-error
          (user-error "Leman E2EE: importing keys failed: %s
 (wrong passphrase or not a key-export file?)" (cdr err)))))))
@@ -1633,6 +1710,12 @@ Runs `leman-sync-callback-hook' with SESSION."
     (setf (leman-session-next-batch session) next-batch)
     ;; Run hooks which update buffers, etc.
     (run-hook-with-args 'leman-sync-callback-hook session)
+    (when leman-e2ee--room-keys-arrived-p
+      ;; Room keys arrived with this sync: events that could not be
+      ;; decrypted before (their placeholders are already in the
+      ;; buffers) may decrypt now.
+      (setf leman-e2ee--room-keys-arrived-p nil)
+      (leman-e2ee--retry-decryption session))
     ;; Update the mode-line unread indicator.
     (leman--update-unread-indicator)
     ;; Show sync message if appropriate, and run after-initial-sync-hook.
@@ -1751,10 +1834,10 @@ Also used for left rooms, in which case STATUS should be set to
                     ;; Push new events of TYPE to room's slot of ACCESSOR.
                     ;; Return a list of the event structs and the latest
                     ;; origin-server-ts pushed.
-                    `(let ((ts 0) (event-structs nil))
-                       (cl-loop for event across-ref (alist-get 'events ,type)
-                                do (setf event (leman-e2ee--decrypt-event session event id)
-                                          event (leman--make-event event))
+                     `(let ((ts 0) (event-structs nil))
+                        (cl-loop for event across-ref (alist-get 'events ,type)
+                                 do (setf event (leman-e2ee--decrypt-event-struct
+                                                 session id event))
                                 ;; Skip events already known to the session
                                 ;; (e.g. re-delivered after a limited timeline,
                                 ;; or by a second concurrent sync), otherwise

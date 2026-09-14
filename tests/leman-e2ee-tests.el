@@ -1142,6 +1142,76 @@ to the agent, newest first."
   (should-not (leman-e2ee--backup-stale-version-p
                (make-plz-error :curl-error '(7 . "connection refused")))))
 
+(ert-deftest leman-e2ee--decrypt-event-struct-stashes-raw ()
+  (let* ((session (make-leman-session :user (make-leman-user :id "@me:x.org")))
+         (raw '((type . "m.room.encrypted") (event_id . "$e1") (sender . "@a:x.org")
+                (origin_server_ts . 1)
+                (content . ((algorithm . "m.megolm.v1.aes-sha2"))))))
+    ;; Decryption fails (no agent): the raw event is stashed on the
+    ;; struct for later retries.
+    (let ((struct (leman-e2ee--decrypt-event-struct session "!r:x.org" raw)))
+      (should (equal (leman-event-type struct) "m.room.encrypted"))
+      (should (equal (alist-get 'encrypted-raw (leman-event-local struct)) raw)))
+    ;; Decryption succeeds: the struct is the decrypted event, with no
+    ;; stash.
+    (let ((session (make-leman-session
+                    :user (make-leman-user :id "@me:x.org")
+                    :e2ee (leman-e2ee--create :pending (make-hash-table :test #'eql)))))
+      (cl-letf (((symbol-function #'leman-e2ee-decrypt-event)
+                 (lambda (_agent _event)
+                   '((type . "m.room.message") (event_id . "$e1") (sender . "@a:x.org")
+                     (origin_server_ts . 1) (content . ((body . "hello")))))))
+        (let ((struct (leman-e2ee--decrypt-event-struct session "!r:x.org" raw)))
+          (should (equal (leman-event-type struct) "m.room.message"))
+          (should (equal (alist-get 'body (leman-event-content struct)) "hello"))
+          (should-not (alist-get 'encrypted-raw (leman-event-local struct))))))))
+
+(ert-deftest leman-e2ee--retry-decryption-updates-stored-events ()
+  (let* ((session (make-leman-session
+                   :user (make-leman-user :id "@me:x.org")
+                   :e2ee (leman-e2ee--create :pending (make-hash-table :test #'eql))))
+         (raw '((type . "m.room.encrypted") (event_id . "$e1") (sender . "@a:x.org")
+                (origin_server_ts . 1)
+                (content . ((algorithm . "m.megolm.v1.aes-sha2") (ciphertext . "x")))))
+         (undecrypted (leman-e2ee--decrypt-event-struct session "!r:x.org" raw))
+         (room (make-leman-room :id "!r:x.org" :timeline (list undecrypted))))
+    (setf (leman-session-rooms session) (list room))
+    ;; Still no keys: nothing changes.
+    (cl-letf (((symbol-function #'leman-e2ee--decrypt-event) (lambda (&rest _) raw)))
+      (should (= (leman-e2ee--retry-decryption session) 0))
+      (should (equal (leman-event-type undecrypted) "m.room.encrypted")))
+    ;; Keys arrived: the event is decrypted and updated in place.
+    (cl-letf (((symbol-function #'leman-e2ee--decrypt-event)
+               (lambda (&rest _)
+                 '((type . "m.room.message") (event_id . "$e1") (sender . "@a:x.org")
+                   (origin_server_ts . 1) (content . ((body . "hello")))))))
+      (should (= (leman-e2ee--retry-decryption session) 1))
+      (should (equal (leman-event-type undecrypted) "m.room.message"))
+      (should (equal (alist-get 'body (leman-event-content undecrypted)) "hello"))
+      (should-not (alist-get 'encrypted-raw (leman-event-local undecrypted)))
+      ;; Already-decrypted events are not retried.
+      (should (= (leman-e2ee--retry-decryption session) 0)))))
+
+(ert-deftest leman-e2ee--sync-changes-flags-room-keys ()
+  (let* ((session (make-leman-session
+                   :user (make-leman-user :id "@me:x.org")
+                   :e2ee (leman-e2ee--create :pending (make-hash-table :test #'eql)))))
+    (cl-letf (((symbol-function #'leman-e2ee-receive-sync-changes)
+               (lambda (&rest _)
+                 '((to_device_events . [((type . "m.room.encrypted"))]))))
+              (leman-e2ee--room-keys-arrived-p nil)
+              ((symbol-function #'leman-e2ee--process-outgoing-requests) #'ignore)
+              ((symbol-function #'leman-e2ee--announce-requests) #'ignore)
+              ((symbol-function #'leman-e2ee--backup-pump) #'ignore))
+      (leman-e2ee--sync-changes session '((next_batch . "s1")))
+      (should-not leman-e2ee--room-keys-arrived-p)
+      (cl-letf (((symbol-function #'leman-e2ee-receive-sync-changes)
+                 (lambda (&rest _)
+                   '((to_device_events . [((type . "m.room_key"))
+                                          ((type . "m.forwarded_room_key"))])))))
+        (leman-e2ee--sync-changes session '((next_batch . "s2")))
+        (should leman-e2ee--room-keys-arrived-p)))))
+
 (ert-deftest leman-e2ee--backup-pump-warns-once-when-stale ()
   (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
          (messages nil)

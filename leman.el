@@ -1190,6 +1190,40 @@ already has one, e.g. from Element)."
       (user-error "Leman E2EE: %s (see M-x leman-e2ee-backup-dump for the stored state)"
                   (string-join (nreverse reasons) "; "))))))
 
+(defun leman-e2ee--delete-backup-version (session version)
+  "Delete the backup VERSION on SESSION's homeserver."
+  (leman-e2ee--api-sync session (format "room_keys/version/%s" version)
+                        :method 'delete
+                        :version "v3"))
+
+(defun leman-e2ee--ensure-version-current (session version)
+  "Make the homeserver report VERSION as its current backup version.
+Some homeservers (conduit, conduwuit and continuwuity before the
+numeric-latest fix) derive the current version by comparing
+version ids as strings; a shorter, older id like \"69562\" then
+sorts after a newly created \"12151043\" and stays current
+forever, and every upload to the new version is rejected.  With
+the user's consent, delete such stale versions (the clients that
+hold their room keys re-upload them to the new version); signal
+`user-error' when the server keeps refusing."
+  (catch 'done
+    (dotimes (_ 4)
+      (let ((current (condition-case err
+                         (leman-e2ee--backup-version-info session)
+                       ;; No version at all: ours is trivially current.
+                       (user-error (throw 'done t))
+                       (plz-error (signal (car err) (cdr err))))))
+        (if (equal (alist-get 'version current) version)
+            (throw 'done t)
+          (let ((stale (alist-get 'version current)))
+            (unless (y-or-n-p
+                     (format "The homeserver keeps version %s current instead of the newly created %s (its version-id comparison is lexicographic; a known server bug).  Delete the stale version %s?  The clients holding its room keys will re-upload them to the new version. "
+                             stale version stale))
+              (user-error "Leman E2EE: the homeserver keeps backup version %s current instead of the new %s"
+                          stale version))
+            (leman-e2ee--delete-backup-version session stale)))))
+    (user-error "Leman E2EE: the homeserver never made the new backup version %s current" version)))
+
 (defun leman-e2ee--create-backup-version (session agent default-key-id default-recovery)
   "Create a fresh backup version keeping the existing default key.
 The new backup's decryption key is stored under the account's
@@ -1226,13 +1260,9 @@ working.  Backs up the room keys afterwards."
                          stored)))
     ;; Trust nothing: verify that the homeserver actually made the
     ;; new version current before pointing anything at it (some
-    ;; servers returned the new version id while keeping the old
+    ;; servers returned the new version id while keeping an older
     ;; version current, which made the fresh key useless).
-    (let ((current (ignore-errors (leman-e2ee--backup-version-info session))))
-      (unless (equal (alist-get 'version current) version)
-        (user-error
-         "Leman E2EE: the homeserver did not make the new backup version current (POST created %S; GET latest returns %S)"
-         version (or (alist-get 'version current) "nothing"))))
+    (leman-e2ee--ensure-version-current session version)
     (leman-e2ee-backup-enable agent recovery-key version)
     (leman-e2ee--account-data-put
      session "m.secret_storage.secret.m.megolm_backup.v1"
@@ -1296,11 +1326,7 @@ default key and display both recovery keys to save."
       (leman-message
        "Leman E2EE: replacing existing backup version %s (its backed-up keys stay in that version)"
        (alist-get 'version existing-version)))
-    (let ((current (ignore-errors (leman-e2ee--backup-version-info session))))
-      (unless (equal (alist-get 'version current) version)
-        (user-error
-         "Leman E2EE: the homeserver did not make the new backup version current (POST created %S; GET latest returns %S)"
-         version (or (alist-get 'version current) "nothing"))))
+    (leman-e2ee--ensure-version-current session version)
     (leman-e2ee-backup-enable agent recovery-key version)
     (leman-e2ee--account-data-put
      session (format "m.secret_storage.key.%s" key-id) content)

@@ -1662,8 +1662,8 @@ to the agent, newest first."
 
 (ert-deftest leman-e2ee--create-backup-version-verifies-current ()
   ;; Some homeservers return the new version id while keeping an old
-  ;; version current: creating must abort before pointing the agent
-  ;; and the secret at a version the server would not serve.
+  ;; version current: creating must not proceed while the server
+  ;; refuses to make the new version current.
   (let* ((fake (leman-e2ee-tests--fake-agent
                 '((backup_create . ((recovery_key . "EsNew")
                                     (algorithm . "m.megolm_backup.v1.curve25519-aes-sha2")
@@ -1679,10 +1679,48 @@ to the agent, newest first."
                (lambda (&rest _) '((version . "12150227"))))
               ((symbol-function #'leman-e2ee-backup-enable)
                (lambda (&rest _) (cl-incf enables)))
+              ((symbol-function #'y-or-n-p) (lambda (&rest _) nil))
               ((symbol-function #'leman-message) #'ignore))
       (should-error (leman-e2ee--create-backup-version session agent "kd" "EsDefault")
                     :type 'user-error)
       (should (= enables 0)))))
+
+(ert-deftest leman-e2ee--ensure-version-current-noop ()
+  (let ((deletes 0))
+    (cl-letf (((symbol-function #'leman-e2ee--backup-version-info)
+               (lambda (_session) '((version . "12150227"))))
+              ((symbol-function #'leman-e2ee--delete-backup-version)
+               (lambda (&rest _) (cl-incf deletes))))
+      (should (leman-e2ee--ensure-version-current nil "12150227"))
+      (should (= deletes 0)))))
+
+(ert-deftest leman-e2ee--ensure-version-current-deletes-stale ()
+  ;; The lexicographic-latest server bug: the shorter, older version
+  ;; stays current; deleting it makes the new version current.
+  (let* ((versions '("69562" "12150227"))
+         (deletes nil))
+    (cl-letf (((symbol-function #'leman-e2ee--backup-version-info)
+               (lambda (_session) `((version . ,(pop versions)))))
+              ((symbol-function #'leman-e2ee--delete-backup-version)
+               (lambda (_session version) (push version deletes)))
+              ((symbol-function #'y-or-n-p) (lambda (&rest _) t)))
+      (should (leman-e2ee--ensure-version-current nil "12150227"))
+      (should (equal deletes (list "69562"))))))
+
+(ert-deftest leman-e2ee--ensure-version-current-refusal-errors ()
+  (cl-letf (((symbol-function #'leman-e2ee--backup-version-info)
+             (lambda (_session) '((version . "69562"))))
+            ((symbol-function #'leman-e2ee--delete-backup-version)
+             (lambda (&rest _) (error "must not delete")))
+            ((symbol-function #'y-or-n-p) (lambda (&rest _) nil)))
+    (should-error (leman-e2ee--ensure-version-current nil "12150227")
+                  :type 'user-error)))
+
+(ert-deftest leman-e2ee--ensure-version-current-no-version-is-fine ()
+  ;; When the homeserver has no version at all, ours is current.
+  (cl-letf (((symbol-function #'leman-e2ee--backup-version-info)
+             (lambda (_session) (user-error "Leman E2EE: no key backup exists"))))
+    (should (leman-e2ee--ensure-version-current nil "12150227"))))
 
 (declare-function leman-e2ee-restore-keys "leman")
 (declare-function leman-e2ee--restore-with-agent-key "leman")

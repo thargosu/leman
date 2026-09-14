@@ -1,8 +1,12 @@
 #+TITLE: Leman.el
 
+#+begin_quote
+/YODELLING: Yodelling Or Does Emacs Lack Léman? It’s No Guess. 😏/
+#+end_quote
+
 A Matrix client for GNU Emacs.
 
-Leman grew out of [[https://github.com/alphapapa/ement.el][ement.el]] and is developed as an independent project:
+Léman grew out of [[https://github.com/alphapapa/ement.el][ement.el]] and is developed as an independent project:
 same GPL heritage, new design.
 
 #+EXPORT_FILE_NAME: leman.txt

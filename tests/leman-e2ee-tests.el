@@ -1184,13 +1184,50 @@ to the agent, newest first."
     (cl-letf (((symbol-function #'leman-e2ee--decrypt-event)
                (lambda (&rest _)
                  '((type . "m.room.message") (event_id . "$e1") (sender . "@a:x.org")
-                   (origin_server_ts . 1) (content . ((body . "hello")))))))
+                   (origin_server_ts . 1) (content . ((body . "hello"))))))
+              ;; The event is old: no notification runs for it.
+              ((symbol-function #'leman-notify) #'ignore))
       (should (= (leman-e2ee--retry-decryption session) 1))
       (should (equal (leman-event-type undecrypted) "m.room.message"))
       (should (equal (alist-get 'body (leman-event-content undecrypted)) "hello"))
       (should-not (alist-get 'encrypted-raw (leman-event-local undecrypted)))
       ;; Already-decrypted events are not retried.
       (should (= (leman-e2ee--retry-decryption session) 0)))))
+
+(ert-deftest leman-e2ee--retry-decryption-notifies-recent-events ()
+  ;; An event that only decrypted because its key arrived after it is
+  ;; notified (its placeholder was already ignored); old events
+  ;; decrypted by imported keys are not.
+  (let* ((session (make-leman-session
+                   :user (make-leman-user :id "@me:x.org")
+                   :e2ee (leman-e2ee--create :pending (make-hash-table :test #'eql))))
+         (now-ms (round (* 1000 (float-time))))
+         (raw-recent `((type . "m.room.encrypted") (event_id . "$e1")
+                       (sender . "@a:x.org") (origin_server_ts . ,now-ms)
+                       (content . ((algorithm . "m.megolm.v1.aes-sha2")))))
+         (raw-old `((type . "m.room.encrypted") (event_id . "$e2")
+                    (sender . "@a:x.org") (origin_server_ts . 1)
+                    (content . ((algorithm . "m.megolm.v1.aes-sha2")))))
+         (undecrypted (leman-e2ee--decrypt-event-struct session "!r:x.org" raw-recent))
+         (room (make-leman-room :id "!r:x.org" :timeline (list undecrypted)))
+         (notifies 0))
+    (setf (leman-session-rooms session) (list room))
+    (cl-letf (((symbol-function #'leman-e2ee--decrypt-event)
+               (lambda (_session raw _room-id)
+                 (if (equal (alist-get 'event_id raw) "$e1")
+                     `((type . "m.room.message") (event_id . "$e1") (sender . "@a:x.org")
+                       (origin_server_ts . ,now-ms) (content . ((body . "hello"))))
+                   '((type . "m.room.message") (event_id . "$e2") (sender . "@a:x.org")
+                     (origin_server_ts . 1) (content . ((body . "old")))))))
+              ((symbol-function #'leman-notify)
+               (lambda (&rest _) (cl-incf notifies))))
+      (leman-e2ee--retry-decryption session)
+      (should (= notifies 1))
+      ;; An old event (e.g. decrypted by importing keys) does not notify.
+      (push (leman-e2ee--decrypt-event-struct session "!r:x.org" raw-old)
+            (leman-room-timeline room))
+      (leman-e2ee--retry-decryption session)
+      (should (= notifies 1)))))
 
 (ert-deftest leman-e2ee--sync-changes-flags-room-keys ()
   (let* ((session (make-leman-session

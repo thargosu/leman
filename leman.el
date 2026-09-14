@@ -647,7 +647,16 @@ room's key arrives (e.g. forwarded by another device)."
             (cons (cons 'encrypted-raw event) (leman-event-local event-struct))))
     event-struct))
 
-(defun leman-e2ee--update-decrypted-event (event-struct decrypted room)
+(defcustom leman-e2ee-decrypt-notify-window 300
+  "Seconds within which a late-decrypted event still notifies.
+Events decrypted by `leman-e2ee--retry-decryption' only run the
+notification hook when they were sent within this many seconds,
+so that importing older keys does not replay old messages as
+notifications."
+  :type 'natnum
+  :group 'leman-notify)
+
+(defun leman-e2ee--update-decrypted-event (event-struct decrypted session room)
   "Update EVENT-STRUCT in place from the decrypted event DECRYPTED.
 The struct is shared by the session's events table and the room's
 event lists, so updating it in place propagates everywhere; ROOM's
@@ -671,7 +680,16 @@ buffer is refreshed."
                                 (equal (leman-event-id data)
                                        (leman-event-id event-struct)))))))
         (with-silent-modifications
-          (ewoc-invalidate leman-ewoc nodes))))))
+          (ewoc-invalidate leman-ewoc nodes)))))
+  ;; The event was already run through `leman-event-hook' while it
+  ;; was undecrypted (when it was ignored by, e.g., notifications).
+  ;; Notify again for recent events, which decrypt late only because
+  ;; their key arrived after they did.
+  (when (and (leman-event-origin-server-ts event-struct)
+             (> (leman-event-origin-server-ts event-struct)
+                (- (* 1000 (float-time))
+                   (* 1000 leman-e2ee-decrypt-notify-window))))
+    (leman-notify event-struct room session)))
 
 (defun leman-e2ee--retry-decryption (session)
   "Retry decryption of SESSION's stored undecryptable events.
@@ -689,7 +707,7 @@ Returns the number of newly decrypted events."
                                           (leman-event-local event-struct)))))
             (let ((decrypted (leman-e2ee--decrypt-event session raw (leman-room-id room))))
               (unless (equal (alist-get 'type decrypted) "m.room.encrypted")
-                (leman-e2ee--update-decrypted-event event-struct decrypted room)
+                (leman-e2ee--update-decrypted-event event-struct decrypted session room)
                 (cl-incf count))))))
       count)))
 

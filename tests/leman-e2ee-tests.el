@@ -213,12 +213,32 @@ to the agent, newest first."
   (let* ((decrypted-event (list (cons 'type "m.room.message")
                                 (cons 'content (list (cons 'body "decrypted!")))))
          (fake (leman-e2ee-tests--fake-agent
-                (list (cons 'decrypt_room_event (list (cons 'event decrypted-event))))))
+                (list (cons 'decrypt_room_event
+                            (list (cons 'event decrypted-event)
+                                  (cons 'shield "None"))))))
          (event (list (cons 'type "m.room.encrypted")
                       (cons 'room_id "!room:x.org")
                       (cons 'content (list (cons 'algorithm "m.megolm.v1.aes-sha2"))))))
+    ;; The shield state is carried on the returned event (the agent's
+    ;; Red/Grey objects are normalized).
     (should (equal (leman-e2ee-decrypt-event (car fake) event)
-                   decrypted-event))))
+                   (cons '(shield none) decrypted-event)))
+    ;; A missing shield (an older agent) still decrypts.
+    (let ((fake (leman-e2ee-tests--fake-agent
+                 (list (cons 'decrypt_room_event (list (cons 'event decrypted-event)))))))
+      (should (equal (leman-e2ee-decrypt-event (car fake) event)
+                     (cons '(shield none) decrypted-event))))
+    ;; The Red/Grey shape is normalized to (KIND CODE MESSAGE).
+    (let ((fake (leman-e2ee-tests--fake-agent
+                 (list (cons 'decrypt_room_event
+                             (list (cons 'event decrypted-event)
+                                   (cons 'shield
+                                         '((Red (code . "UnverifiedIdentity")
+                                                (message . "The sender's identity was not verified"))))))))))
+      (should (equal (leman-e2ee-decrypt-event (car fake) event)
+                     (cons '(shield red "UnverifiedIdentity"
+                                    "The sender's identity was not verified")
+                           decrypted-event))))))
 
 (ert-deftest leman-e2ee-decrypt-event-failure-returns-original ()
   (let* ((fake (leman-e2ee-tests--fake-agent

@@ -549,7 +549,16 @@ impl Agent {
         let event = serde_json::to_value(&decrypted.event)
             .context("serializing decrypted event")
             .map_err(crypto_error)?;
-        Ok(json!({"event": event}))
+        // The sdk's recommended decoration (None, or Red/Grey with a
+        // code and message): whether the sending device is verified.
+        let shield = decrypted
+            .encryption_info
+            .verification_state
+            .to_shield_state_strict();
+        let shield = serde_json::to_value(shield)
+            .context("serializing shield state")
+            .map_err(crypto_error)?;
+        Ok(json!({"event": event, "shield": shield}))
     }
 
     async fn update_tracked_users(&mut self, params: Value) -> CommandResult {

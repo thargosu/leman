@@ -227,13 +227,19 @@ or does not respond within TIMEOUT seconds
 (defun leman-e2ee-decrypt-event (agent event)
   "Decrypt EVENT (a m.room.encrypted event alist) with AGENT.
 EVENT must have a `room_id' key (events from sync responses
-don't; callers must add it).  Return the decrypted event alist,
-or EVENT unchanged if it isn't encrypted or decryption fails
-(e.g. the room key hasn't arrived yet; the caller should keep the
-encrypted event and retry when keys arrive)."
+don't; callers must add it).  Return the decrypted event alist
+with its authenticity ~shield~ state added (normalized by
+`leman-e2ee--normalize-shield'), or EVENT unchanged if it isn't
+encrypted or decryption fails (e.g. the room key hasn't arrived
+yet; the caller should keep the encrypted event and retry when
+keys arrive)."
   (if (and agent (equal (alist-get 'type event) "m.room.encrypted"))
       (condition-case err
-          (leman-e2ee-decrypt-room-event agent (alist-get 'room_id event) event)
+          (let ((response (leman-e2ee-decrypt-room-event
+                           agent (alist-get 'room_id event) event)))
+            (cons (cons 'shield (leman-e2ee--normalize-shield
+                                 (alist-get 'shield response)))
+                  (alist-get 'event response)))
         (leman-e2ee-error
          (leman-e2ee--log agent (format "decryption failed: %S" (cdr err)))
          event))
@@ -417,12 +423,30 @@ persisted, or to-device events (room keys) can be lost."
 
 (defun leman-e2ee-decrypt-room-event (agent room-id event)
   "Decrypt EVENT (a m.room.encrypted event) for ROOM-ID with AGENT.
-Return the decrypted event as an alist; signal
-`leman-e2ee-error' if it cannot be decrypted (e.g. session not
-found; the caller should retry when keys arrive)."
-  (alist-get 'event (leman-e2ee-request agent "decrypt_room_event"
-                                        (list (cons 'room_id room-id)
-                                              (cons 'event event)))))
+Return the response alist: the decrypted ~event~ and its
+authenticity ~shield~ state; signal `leman-e2ee-error' if it
+cannot be decrypted (e.g. session not found; the caller should
+retry when keys arrive)."
+  (leman-e2ee-request agent "decrypt_room_event"
+                      (list (cons 'room_id room-id)
+                            (cons 'event event))))
+
+(defun leman-e2ee--normalize-shield (shield)
+  "Normalize the agent's SHIELD state to (KIND CODE MESSAGE).
+KIND is `none', `red' or `grey'; CODE and MESSAGE describe the
+authenticity problem for the non-none kinds.  The agent reports
+the sdk's recommended decoration: \"None\", or a Red/Grey object."
+  (pcase shield
+    ("None" '(none))
+    ((pred listp)
+     (let ((kind (caar shield))
+           (info (cdar shield)))
+       (if (memq kind '(Red Grey))
+           (list (if (eq kind 'Red) 'red 'grey)
+                 (alist-get 'code info)
+                 (alist-get 'message info))
+         '(none))))
+    (_ '(none))))
 
 (defun leman-e2ee-update-tracked-users (agent users)
   "Track USERS' devices with AGENT (needed before encryption)."

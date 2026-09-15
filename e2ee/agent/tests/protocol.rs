@@ -595,6 +595,13 @@ async fn test_alice_bob_round_trip() {
         decrypted["ok"]["event"]["content"]["body"],
         json!("It's a secret to everybody."),
     );
+    // The shield state (the sdk's recommended decoration) is always
+    // present: "None", or a Red/Grey object with a code and message.
+    let shield = &decrypted["ok"]["shield"];
+    assert!(
+        shield == "None" || shield["Red"]["code"].is_string() || shield["Grey"]["code"].is_string(),
+        "shield state must be None or a Red/Grey object: {shield}"
+    );
 }
 
 /// Sessions and identity keys must survive an agent restart: after

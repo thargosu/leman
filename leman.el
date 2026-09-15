@@ -697,6 +697,9 @@ room's key arrives (e.g. forwarded by another device)."
     (when (equal (leman-event-type event-struct) "m.room.encrypted")
       (setf (leman-event-local event-struct)
             (cons (cons 'encrypted-raw event) (leman-event-local event-struct))))
+    (when-let ((shield (alist-get 'shield decrypted)))
+      (setf (leman-event-local event-struct)
+            (cons (cons 'shield shield) (leman-event-local event-struct))))
     event-struct))
 
 (defcustom leman-e2ee-decrypt-notify-window 300
@@ -720,8 +723,15 @@ buffer is refreshed."
           (leman-event-type event-struct) (leman-event-type new)
           (leman-event-unsigned event-struct) (leman-event-unsigned new)
           (leman-event-state-key event-struct) (leman-event-state-key new)
+          ;; The raw event is decrypted now: drop its stash and
+          ;; replace the shield state, keeping the other local data
+          ;; (e.g. reactions).
           (leman-event-local event-struct)
-          (assq-delete-all 'encrypted-raw (leman-event-local event-struct))))
+          (let ((local (assq-delete-all
+                        'encrypted-raw
+                        (assq-delete-all 'shield (leman-event-local event-struct)))))
+            (push (cons 'shield (alist-get 'shield decrypted)) local)
+            local)))
   (when-let ((buffer (map-elt (leman-room-local room) 'buffer))
              ((buffer-live-p buffer)))
     (with-current-buffer buffer

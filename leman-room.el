@@ -4131,6 +4131,20 @@ seconds."
 ;;                      :button-face 'leman-room-membership
 ;;                         :value (list (alist-get 'membership content))))))))
 
+(defun leman-room--format-shield (event)
+  "Return the authenticity marker for EVENT.
+The marker is only present on decrypted (encrypted) messages: a
+lock when the sending device is verified, a warning shield
+otherwise, with the reason in the tooltip (the sdk's shield
+state, stashed by the decrypt path)."
+  (pcase (alist-get 'shield (leman-event-local event))
+    (`(none)
+     (propertize " 🔒" 'help-echo "Encrypted message (the sending device is verified)"))
+    (`(red ,_code ,message)
+     (propertize " ⚠️" 'help-echo (format "Encrypted message: %s" message) 'face 'error))
+    (`(grey ,_code ,message)
+     (propertize " ⚠️" 'help-echo (format "Encrypted message: %s" message) 'face 'shadow))))
+
 (defun leman-room--format-event (event room session)
   "Return EVENT in ROOM on SESSION formatted.
 Formats according to `leman-room-message-format-spec', which see."
@@ -4164,13 +4178,15 @@ Formats according to `leman-room-message-format-spec', which see."
                        (propertize (leman--user-displayname-in room (leman-event-sender event))
                                    'help-echo (leman-user-id (leman-event-sender event))))
                'face 'leman-room-membership))
-            (_ (leman-room-wrap-prefix
-                 (format "[sender:%s type:%s]"
-                         (leman-user-id (leman-event-sender event))
-                         (leman-event-type event))
-                 'help-echo (format "%S" (leman-event-content event)))))
-          (propertize " "
-                      'display leman-room-event-separator-display-property)))
+             (_ (leman-room-wrap-prefix
+                  (format "[sender:%s type:%s]"
+                          (leman-user-id (leman-event-sender event))
+                          (leman-event-type event))
+                  'help-echo (format "%S" (leman-event-content event)))))
+           ;; Encrypted messages carry their authenticity marker.
+           (leman-room--format-shield event)
+           (propertize " "
+                       'display leman-room-event-separator-display-property)))
 
 (defun leman-room--format-reactions (event room)
   "Return formatted reactions to EVENT in ROOM."

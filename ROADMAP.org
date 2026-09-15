@@ -15,8 +15,9 @@ inherited from upstream.)
 | Threads (MSC3440), phase 1    | done   | Aggregation, chips, thread view, replies, edits    |
 | Threads, phase 2              | next   | See below                                          |
 | E2EE, phase 1 (decrypt)       | done   | Agent + sync integration; verified against a real homeserver |
-| E2EE, phase 2 (encrypt-send)  | next   | See E2 spec in ~e2ee/PROTOCOL.org~                 |
-| E2EE, phase 3+ (verify, backup) | later | See below                                          |
+| E2EE, phase 2 (encrypt-send)  | done   | Messages and emotes, fail-closed; Element/FluffyChat interop |
+| E2EE, phase 3 (verify)        | done   | Emoji SAS, cross-signing import, shields; QR is a follow-up |
+| E2EE, phase 4 (key backup)    | done   | Megolm backup v1 + SSSS; gossiping; old-version restore |
 | UI rework                     | vision | See plan below                                     |
 
 * Threads, phase 2 (polish)
@@ -88,6 +89,10 @@ Phasing:
        nil device ID silently disables E2EE.
      - The live sync path deduplicates events by ID (re-delivery
        after a limited timeline otherwise shows duplicates).
+     - Waiting for an agent reply must pump only the agent's
+       output; processing homeserver responses inside such a wait
+       nests arbitrary agent requests (the 2026-09-15 verification
+       hang).
 2. *Encrypt-send* ("E2"): send encrypted messages, automatic key
    distribution to member devices.  DONE 2026-09-13.
    + Working: ~encrypt_room_event~ (Olm session claiming, room key
@@ -100,7 +105,7 @@ Phasing:
    + Follow-up: encrypt reactions (m.reaction) and other non-message
      event types in encrypted rooms.
 3. *Verification* ("E3"): emoji SAS verification of devices.
-   DONE 2026-09-13 (emoji; QR and key import/export are follow-ups).
+   DONE 2026-09-15.
    + Working: the full SAS dance over to-device events —
      ~devices~, ~request_verification~/~verification_requests~,
      ~accept_verification~, ~start_sas~, ~accept_sas~,
@@ -110,17 +115,29 @@ Phasing:
      confirms or cancels, pumps outgoing requests throughout).
      A round-trip test drives both sides of the dance through the
      protocol (agent <-> an in-process second machine).
+     Private cross-signing keys are imported from secret storage
+     (~import_cross_signing_keys~), and every decryption returns
+     the sdk's authenticity ~shield~ state, rendered per message.
    + Until the user verifies, other clients still show the
      "device not verified" warning; after verification it goes away.
    + Follow-ups: QR verification, key import/export.
-4. *Key backup* ("E4", done, pending user testing): Megolm backup v1
-   plus secret storage (SSSS).  The agent creates/imports the backup
-   decryption key, backs up and imports room keys, and encrypts/
-   decrypts SSSS secrets; the client performs the HTTP calls, drives
-   the setup (~leman-e2ee-setup-backup~) and restore
-   (~leman-e2ee-restore-keys~) flows, and pumps room-key backups
-   after syncs.  Element interoperates (standard
-   ~m.megolm_backup.v1~ secret, SSSS default key).
+4. *Key backup* ("E4"): Megolm backup v1 plus secret storage (SSSS).
+   DONE 2026-09-15, user-tested against a real conduit-family
+   homeserver.  The agent creates/imports the backup decryption
+   key, backs up and imports room keys, and encrypts/decrypts SSSS
+   secrets; the client performs the HTTP calls, drives the setup
+   (~leman-e2ee-setup-backup~) and restore (~leman-e2ee-restore-keys~,
+   ~leman-e2ee-restore-old-backup~) flows, inspects state
+   (~leman-e2ee-backup-dump~), deletes stale versions, and pumps
+   room-key backups after syncs.  Room keys are also gossiped: a
+   decryption failure queues an ~m.room_key_request~ to the user's
+   own verified devices, which auto-forward the missing keys.
+   Element interoperates (standard ~m.megolm_backup.v1~ secret,
+   SSSS default key).
+   + Conduit quirks worked around: the lexicographic "latest"
+     backup version (post-create verification + stale-version
+     deletion) and the missing ~GET /room_keys/versions~ list
+     endpoint.
 
 TDD workflow (tests before code; monorepo, agent in ~e2ee/~):
 

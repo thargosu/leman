@@ -1847,6 +1847,23 @@ to the agent, newest first."
       (should (= pumps 1))
       (should retries))))
 
+(ert-deftest leman-e2ee-restore-old-backup-unsupported-homeserver ()
+  ;; Conduit-family homeservers don't implement the versions list:
+  ;; the command fails with a clear message, not a raw plz error.
+  (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))
+         (session (make-leman-session :user (make-leman-user :id "@vv:x.org"))))
+    (setf (leman-session-e2ee session) agent)
+    (cl-letf (((symbol-function #'leman-e2ee--backup-version-info) #'ignore)
+              ((symbol-function #'leman-e2ee--api-sync)
+               (lambda (_session _endpoint &rest _)
+                 (signal 'plz-error
+                         (list (make-plz-error :response
+                                               (make-plz-response :status 404)))))))
+      (let ((err (should-error (leman-e2ee-restore-old-backup session)
+                               :type 'user-error)))
+        (should (string-search "does not support listing key backup versions"
+                               (cadr err)))))))
+
 (ert-deftest leman-e2ee--delete-backup-version ()
   (let ((calls nil))
     (cl-letf (((symbol-function #'leman-e2ee--api-sync)

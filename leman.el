@@ -1487,7 +1487,13 @@ client)."
 The value is the ~versions~ object of GET /room_keys/versions:
 one entry per version, its value holding ~algorithm~ and
 ~auth_data~.  The version ids are normalized to strings."
-  (let ((response (leman-e2ee--api-sync session "room_keys/versions" :version "v3")))
+  (let ((response (condition-case err
+                      (leman-e2ee--api-sync session "room_keys/versions" :version "v3")
+                    ;; Conduit-family homeservers don't implement the
+                    ;; versions list (M_UNRECOGNIZED).
+                    (plz-error
+                     (user-error "Leman E2EE: this homeserver does not support listing key backup versions (%s)"
+                                 (cdr err))))))
     (mapcar (lambda (entry)
               (cons (format "%s" (car entry)) (cdr entry)))
             (alist-get 'versions response))))

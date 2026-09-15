@@ -4133,17 +4133,19 @@ seconds."
 
 (defun leman-room--format-shield (event)
   "Return the authenticity marker for EVENT.
-The marker is only present on decrypted (encrypted) messages: a
-lock when the sending device is verified, a warning shield
-otherwise, with the reason in the tooltip (the sdk's shield
-state, stashed by the decrypt path)."
+Decrypted (encrypted) messages get a lock when the sending device
+is verified, a warning shield otherwise, with the reason in the
+tooltip (the sdk's shield state, stashed by the decrypt path).
+Plaintext messages get an open lock."
   (pcase (alist-get 'shield (leman-event-local event))
     (`(none)
      (propertize " 🔒" 'help-echo "Encrypted message (the sending device is verified)"))
     (`(red ,_code ,message)
      (propertize " ⚠️" 'help-echo (format "Encrypted message: %s" message) 'face 'error))
     (`(grey ,_code ,message)
-     (propertize " ⚠️" 'help-echo (format "Encrypted message: %s" message) 'face 'shadow))))
+     (propertize " ⚠️" 'help-echo (format "Encrypted message: %s" message) 'face 'shadow))
+    (_ (when (equal (leman-event-type event) "m.room.message")
+         (propertize " 🔓" 'help-echo "Not encrypted")))))
 
 (defun leman-room--format-event (event room session)
   "Return EVENT in ROOM on SESSION formatted.

@@ -523,11 +523,14 @@ Reports that a backup request was performed.
 Imports room keys downloaded with
 ~GET /room_keys/keys?version=<version>~ (the ~rooms~ object of the
 response, as JSON).  The recovery key decrypts the sessions' session
-data.
+data.  With ~mark_backed_up~ false (importing an older version's
+keys), they are not marked as backed up under the current version:
+the backup pump re-uploads them to it.
 
 #+begin_src json
 {"id": 26, "cmd": "backup_import", "params": {
-  "recovery_key": "<base58>", "rooms": {...}}}
+  "recovery_key": "<base58>", "rooms": {...},
+  "mark_backed_up": false}}
 {"id": 26, "ok": {"imported": 30, "total": 30}}
 #+end_src
 

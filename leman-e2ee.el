@@ -620,13 +620,17 @@ PASSPHRASE unlocks the export (the same format as Element's
   "Return KEY grouped in 4-character chunks, like Element does."
   (mapconcat #'identity (seq-partition key 4) " "))
 
-(defun leman-e2ee-backup-import (agent recovery-key rooms)
+(defun leman-e2ee-backup-import (agent recovery-key rooms &optional mark-backed-up)
   "Import downloaded backup ROOMS into AGENT with RECOVERY-KEY.
 ROOMS is the ~rooms~ value of the GET /room_keys/keys response.
-Return an alist with ~imported~ and ~total~ counts."
+Unless MARK-BACKED-UP, the keys are not marked as backed up (they
+came from an older backup version; the pump re-uploads them to
+the current one).  Return an alist with ~imported~ and ~total~
+counts."
   (leman-e2ee-request agent "backup_import"
                       (list (cons 'recovery_key recovery-key)
-                            (cons 'rooms rooms))))
+                            (cons 'rooms rooms)
+                            (cons 'mark_backed_up (if mark-backed-up t :json-false)))))
 
 (defun leman-e2ee-ssss-create (agent)
   "Generate the secret storage default key on AGENT.

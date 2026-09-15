@@ -1122,7 +1122,16 @@ impl Agent {
             parsed.insert(room_id, sessions);
         }
 
-        let version = machine.backup_machine().backup_version().await;
+        // Importing keys of an older backup version (mark_backed_up
+        // false) must not mark them as backed up under the current
+        // version: they are re-uploaded to it by the backup pump.
+        let mark_backed_up =
+            params.get("mark_backed_up").and_then(Value::as_bool).unwrap_or(true);
+        let version = if mark_backed_up {
+            machine.backup_machine().backup_version().await
+        } else {
+            None
+        };
         let exported_keys = parsed
             .into_iter()
             .flat_map(|(room_id, sessions)| {

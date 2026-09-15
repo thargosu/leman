@@ -1482,6 +1482,108 @@ client)."
           (plz-error
            (user-error "Leman E2EE: restoring keys failed: %S" (cdr err)))))))
 
+(defun leman-e2ee--backup-versions (session)
+  "Return SESSION's homeserver's key backup versions.
+The value is the ~versions~ object of GET /room_keys/versions:
+one entry per version, its value holding ~algorithm~ and
+~auth_data~.  The version ids are normalized to strings."
+  (let ((response (leman-e2ee--api-sync session "room_keys/versions" :version "v3")))
+    (mapcar (lambda (entry)
+              (cons (format "%s" (car entry)) (cdr entry)))
+            (alist-get 'versions response))))
+
+(defun leman-e2ee-restore-old-backup (session)
+  "Import the room keys of an older key backup version of SESSION.
+The homeserver may still hold backup versions predating the
+current one (e.g. created while another client held keys no
+device holds anymore); their decryption keys are the values the
+account's m.megolm_backup.v1 secret stores under the
+secret-storage keys that were default at the time.  Pick a
+version, then enter the recovery key of one of those keys: the
+version's room keys are imported and re-backed-up to the current
+version by the backup pump."
+  (interactive (list (leman-complete-session)))
+  (let ((agent (leman-session-e2ee session)))
+    (unless agent
+      (user-error "Leman E2EE: no agent running (try reconnecting)"))
+    (let* ((current (ignore-errors
+                      (alist-get 'version (leman-e2ee--backup-version-info session))))
+           (old-versions (cl-loop for entry in (leman-e2ee--backup-versions session)
+                                  unless (equal (car entry) current)
+                                  collect entry)))
+      (when (null old-versions)
+        (user-error "Leman E2EE: no older backup versions exist on the homeserver"))
+      (let* ((choices (mapcar (lambda (entry)
+                                (cons (format "%s (%s)" (car entry)
+                                              (or (alist-get 'algorithm (cdr entry)) "?"))
+                                      entry))
+                              old-versions))
+             (chosen (cdr (assoc (completing-read
+                                  "Backup version to import the room keys of: "
+                                  (mapcar #'car choices) nil t)
+                                 choices #'equal))))
+        (leman-e2ee--unlock-and-import-old-backup
+         session agent (car chosen)
+         (list (cons 'algorithm (alist-get 'algorithm (cdr chosen)))
+               (cons 'auth_data (alist-get 'auth_data (cdr chosen)))))))))
+
+(defun leman-e2ee--unlock-and-import-old-backup (session agent version info)
+  "Unlock and import backup VERSION (described by INFO) of SESSION.
+Ask for the recovery key of one of the secret-storage keys that
+encrypted the version's decryption key; try every entry of the
+m.megolm_backup.v1 secret with it until one decrypts to the
+version's key, then download and import the version's room keys
+(not marked as backed up, so the pump re-uploads them to the
+current version)."
+  (let ((secret (ignore-errors
+                  (leman-e2ee--account-data-get
+                   session "m.secret_storage.secret.m.megolm_backup.v1")))
+        (found nil))
+    (unless (alist-get 'encrypted secret)
+      (user-error "Leman E2EE: the m.megolm_backup.v1 secret has no encrypted entries"))
+    (catch 'unlocked
+      (while (not found)
+        (let ((recovery-key (read-string
+                             (format "Recovery key of a secret-storage key holding version %s's key (empty to cancel): "
+                                     version))))
+          (cond ((equal recovery-key "")
+                 (user-error "Leman E2EE: cancelled"))
+                (t
+                 (dolist (entry (alist-get 'encrypted secret))
+                   (let* ((key-id (format "%s" (car entry)))
+                          (data (cdr entry))
+                          (content (ignore-errors
+                                     (leman-e2ee--account-data-get
+                                      session (format "m.secret_storage.key.%s" key-id)))))
+                     (when (and content
+                                (leman-e2ee-ssss-check-key agent key-id recovery-key content))
+                       (let* ((candidate (leman-e2ee-ssss-decrypt-secret
+                                          agent key-id recovery-key content
+                                          "m.megolm_backup.v1"
+                                          (alist-get 'iv data)
+                                          (alist-get 'ciphertext data)
+                                          (alist-get 'mac data)))
+                              (matches (and candidate
+                                            (equal (leman-e2ee-backup-verify
+                                                    agent candidate info)
+                                                   t))))
+                         (when matches
+                           (setf found (cons key-id candidate))
+                           (throw 'unlocked t))))))
+                 (unless found
+                   (leman-message "Leman E2EE: no stored entry's key unlocked with that recovery key")))))))
+    (let* ((downloaded (leman-e2ee--api-sync session "room_keys/keys"
+                                             :version "v3"
+                                             :params (list (list "version" version))))
+           (result (leman-e2ee-backup-import agent (cdr found)
+                                             (alist-get 'rooms downloaded) nil)))
+      (leman-message
+       "Leman E2EE: restored %s of %s room keys from backup version %s (key %s); they are being re-backed-up to the current version"
+       (alist-get 'imported result) (alist-get 'total result)
+       version (car found))
+      (leman-e2ee--backup-pump session agent)
+      (leman-e2ee--retry-decryption session))))
+
 (defun leman-e2ee--decrypt-ssss-secret (session agent default-key-id recovery-key name)
   "Decrypt the secret NAME from SESSION's secret storage.
 Uses the entry encrypted for the account's default secret-storage

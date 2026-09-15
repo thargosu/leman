@@ -209,7 +209,17 @@ or does not respond within TIMEOUT seconds
             (signal 'leman-e2ee-error
                     (list "exit" (or (leman-e2ee-exit agent)
                                      "agent is not running"))))
-           (t (accept-process-output process 0.1))))))
+           ;; NOTE: JUST-THIS-PROCESS: only the agent's output is
+           ;; processed while waiting.  Without it, other processes'
+           ;; filters (e.g. the sync's, and the outgoing requests'
+           ;; mark-as-sent responses) fire right here and run their
+           ;; own agent requests, nesting arbitrarily deep: with busy
+           ;; syncs this froze Emacs after confirming the emoji (the
+           ;; verification's MAC never got pumped).  Homeserver
+           ;; responses are processed at the next top-level wait
+           ;; instead (e.g. the dance's `sleep-for'); the agent's
+           ;; sequential protocol makes interleaved responses safe.
+           (t (accept-process-output process 0 100 t))))))
     (remhash id (leman-e2ee-pending agent))
     (cond
      (result

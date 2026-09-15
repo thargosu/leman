@@ -21,11 +21,16 @@ Coming soon.
 * Features
 
 + Rooms: message history, HTML rendering, avatars, images, spoilers
-+ Replies and [[https://github.com/matrix-org/matrix-spec-proposals/pull/3440][threads]] (MSC3440)
++ Replies and [[https://github.com/matrix-org/matrix-spec-proposals/pull/3440][threads]] (MSC3440), message editing and redaction
 + Reactions, including custom server emoji rendered as images
-+ Read receipts and typing indicators
-+ Desktop notifications (mentions, calls, etc.)
++ Sending messages, emotes, files, and images (drag-and-drop too)
++ Read receipts and unread markers; typing notifications while
+  composing
++ Desktop notifications (mentions, unread rooms, etc.), a
+  notifications buffer, and a mode-line unread indicator
 + Room lists: sidebar-friendly buffers, spaces, room directory
++ Room management: invites, tags, topics, direct messages, spaces,
+  member lists, user ignoring
 + Org-based message composition
 + End-to-end encryption via the bundled Rust agent (see below)
 
@@ -70,27 +75,39 @@ agent is running and where the program was looked up.
 
 Current support:
 
-+ Decryption of encrypted rooms, including history after key receipt
-+ Encryption of outgoing messages, with automatic key distribution to
-  member devices (fails closed: encrypted rooms never receive
++ Decryption of encrypted rooms, including history after key
+  receipt (undecryptable messages are retried automatically when
+  their keys arrive later) and placeholders for the rest
++ Encryption of outgoing messages, with automatic key distribution
+  to member devices (fails closed: encrypted rooms never receive
   plaintext, and unencrypted rooms are unaffected)
-+ Automatic key uploads, device list tracking, key claiming
-+ Room keys and sessions persisted in a local SQLite store
-  (~$XDG_DATA_HOME/leman/crypto/~)
-
++ Automatic key uploads, device list tracking, key claiming, and
+  room key gossiping: missing keys are requested from and
+  auto-forwarded between a user's own verified devices
++ Authenticity shields on encrypted messages (verified vs.
+  unverified sender, with the reason in the tooltip); plaintext
+  messages show an open lock
 + Emoji SAS device verification (~M-x leman-e2ee-verify~): after
-  verifying, other clients' "device not verified" warnings go away
+  verifying, other clients' "device not verified" warnings go away;
+  private cross-signing keys can be imported from secret storage
+  (~M-x leman-e2ee-import-cross-signing-keys~)
 + Key backup (Megolm backup + secret storage): ~M-x
   leman-e2ee-setup-backup~ creates the backup and displays both
   recovery keys (or adopts an existing setup from another client,
   e.g. Element); ~M-x leman-e2ee-restore-keys~ restores old message
-  history on a new device; room keys are backed up automatically
-  after syncs (~M-x leman-e2ee-backup-info~ shows the status,
-  ~M-x leman-e2ee-backup-dump~ the full stored state for
-  diagnostics)
+  history on a new device, and ~M-x leman-e2ee-restore-old-backup~
+  imports the room keys of older backup versions; room keys are
+  backed up automatically after syncs (~M-x leman-e2ee-backup-info~
+  shows the status, ~M-x leman-e2ee-backup-dump~ the full stored
+  state for diagnostics)
++ Session key export/import in Element's format (~M-x
+  leman-e2ee-export-keys~ and ~M-x leman-e2ee-import-keys~)
++ Automatic device naming, renameable with ~M-x leman-rename-device~
++ Room keys and sessions persisted in a local SQLite store
+  (~$XDG_DATA_HOME/leman/crypto/~)
 
-Not yet (planned, see ~ROADMAP.org~): encrypting reactions in
-encrypted rooms.
+Not yet (planned, see ~ROADMAP.org~): QR device verification and
+encrypting reactions in encrypted rooms.
 
 * Upgrading (package-vc)
 
@@ -109,8 +126,10 @@ Do not patch the installed clone in place: local changes make
   # Rust agent: tests, coverage, lint, audit
   cd e2ee/agent && cargo test && cargo llvm-cov --cobertura --output-path cobertura.xml && cargo clippy -- -D warnings && cargo audit
 
-  # Elisp: tests
-  emacs --batch -Q -L . -l tests/leman-tests.el -f ert-run-tests-batch
+  # Elisp: tests (the package's dependencies must be on the load path)
+  emacs --batch -Q -L . $(ls -d ~/.emacs.d/elpa/*/ | sed 's/^/-L /' | tr '\n' ' ') \
+    -l tests/leman-tests.el -l tests/leman-e2ee-tests.el -l tests/leman-notify-tests.el \
+    -f ert-run-tests-batch
 #+end_src
 
 Every push runs the full pipeline (tests, coverage, clippy, RustSec

@@ -226,19 +226,22 @@ It shouldn't usually be necessary to change this."
          (server (make-leman-server :name server-name :uri-prefix uri-prefix))
          (transaction-id (leman--initial-transaction-id))
          (initial-device-display-name (leman--device-display-name))
-         ;; NOTE: A fresh login must NOT claim a device ID (e.g. a
-         ;; deterministic one): a fresh login is a new device
-         ;; identity, and reusing a removed device's ID would
-         ;; resurrect its verified keys.  The server mints the ID;
-         ;; only session restoration reuses a device.
-         (device-id nil))
+         ;; A fresh login reclaims the user's existing E2EE device,
+         ;; if any: the login request carries the store's device ID,
+         ;; so the same device identity and its verified keys are
+         ;; kept across logins, like other Matrix clients do.  With
+         ;; no store, device-id is nil and the server mints one.
+         (device-id (leman-e2ee--existing-device-id user-id)))
+    (when device-id
+      (leman-message "Leman: reusing device %s (its keys and verifications are kept)"
+                     device-id))
     (make-leman-session :user user :server server :transaction-id transaction-id
                         :device-id device-id :initial-device-display-name initial-device-display-name
                         :events (make-hash-table :test #'equal))))
 
 (defun leman--password-login (session &optional password)
   "Log in to SESSION using PASSWORD, prompting if not given."
-  (pcase-let* (((cl-struct leman-session user initial-device-display-name) session)
+  (pcase-let* (((cl-struct leman-session user initial-device-display-name device-id) session)
                ((cl-struct leman-user id) user)
                (data (leman-alist "type" "m.login.password"
                                   "identifier"
@@ -246,8 +249,12 @@ It shouldn't usually be necessary to change this."
                                                "user" id)
                                   "password" (or password
                                                  (read-passwd (format "Password for %s: " id)))
-                                  ;; No device_id: the server mints one.
                                   "initial_device_display_name" initial-device-display-name)))
+    ;; NOTE: device_id is omitted when nil (an alist entry with a nil
+    ;; cdr would encode as null): the server then mints a device.
+    ;; Otherwise the login reclaims the existing device.
+    (when device-id
+      (setf data (append data (list (cons "device_id" device-id)))))
     ;; TODO: Clear password in callback (if we decide to hold on to it for retrying login timeouts).
     (leman-api session "login" :method 'post :data (json-encode data)
       :then (apply-partially #'leman--login-callback session))
@@ -255,15 +262,17 @@ It shouldn't usually be necessary to change this."
 
 (defun leman--sso-login-with-token (token session)
   "Submit SSO login TOKEN for SESSION."
-  (pcase-let* (((cl-struct leman-session user initial-device-display-name) session)
+  (pcase-let* (((cl-struct leman-session user initial-device-display-name device-id) session)
                ((cl-struct leman-user id) user)
                (data (leman-alist
                       "type" "m.login.token"
                       "identifier" (leman-alist "type" "m.id.user"
                                                 "user" id)
                       "token" token
-                      ;; No device_id: the server mints one.
                       "initial_device_display_name" initial-device-display-name)))
+    ;; NOTE: See `leman--password-login': device_id is omitted when nil.
+    (when device-id
+      (setf data (append data (list (cons "device_id" device-id)))))
     (leman-api session "login" :method 'post
       :data (json-encode data)
       :then (apply-partially #'leman--login-callback session))))
@@ -474,9 +483,9 @@ Useful in, e.g. `leman-disconnect-hook', which see."
 (defun leman-e2ee--start-agent (session &optional then)
   "Start an E2EE agent for SESSION, then call THEN, if given.
 THEN is also called when the agent can't be started (after a
-message is shown).  If SESSION has no device ID (e.g. the session
-was restored from disk, which doesn't save device IDs), it is
-fetched with the whoami API first."
+message is shown).  If SESSION has no device ID (e.g. a session
+saved by an older version), it is fetched with the whoami API
+first."
   (cl-labels ((start-agent
                ()
                (let ((user-id (leman-user-id (leman-session-user session)))
@@ -535,6 +544,28 @@ fetched with the whoami API first."
                        (alist-get 'description item)))
              emoji "   "))
 
+(defun leman-e2ee--device-annotation (devices)
+  "Return an affixation function annotating device candidates from DEVICES.
+Candidates are device IDs, which alone are hard to tell apart:
+each is annotated with its display name (dimmed) and, when the
+device is not verified, with an ~unverified~ marker.  Any
+completion UI with marginalia-like annotations (the default
+*Completions*, vertico, ...) displays it."
+  (lambda (candidates)
+    (mapcar
+     (lambda (candidate)
+       (let* ((device (seq-find (lambda (device)
+                                  (equal (alist-get 'device_id device) candidate))
+                                devices))
+              (name (alist-get 'display_name device))
+              (verified (alist-get 'verified device)))
+         (list candidate ""
+               (concat (when name
+                         (propertize (format "  %s" name) 'face 'shadow))
+                       (unless verified
+                         (propertize "  unverified" 'face 'warning))))))
+     candidates)))
+
 (defcustom leman-e2ee-verify-confirm-function
   #'leman-e2ee--verify-confirm
   "Function called with (DEVICE-ID EMOJI) to compare the SAS emoji.
@@ -553,121 +584,198 @@ Return non-nil to confirm the short auth string, nil to cancel."
                          (equal (alist-get 'device_id device) device-id))
                        (leman-e2ee-devices agent user-id))))
 
-(defun leman-e2ee--verify-step (agent user-id flow-id device-id)
-  "Perform one round of the verification dance for FLOW-ID of
-USER-ID on AGENT (verifying DEVICE-ID).  Return `done' when the
-device is verified, `cancelled' when the dance was cancelled, and
-nil to keep waiting."
-  (let* ((request (seq-find (lambda (request)
-                              (equal (alist-get 'flow_id request) flow-id))
-                            (leman-e2ee-verification-requests agent user-id)))
-         (state (alist-get 'state request)))
-    (cond
-     ((equal state "done") 'done)
-     ((equal state "cancelled") 'cancelled)
-     ((and (equal state "ready") (not (alist-get 'sas request)))
-      ;; The request is accepted on both sides; start the SAS.
-      (leman-e2ee-start-sas agent user-id flow-id)
-      nil)
-     (t
-      (let ((sas (ignore-errors
-                   (leman-e2ee-verification-sas agent user-id flow-id))))
-        (cond
-         ((and sas (alist-get 'cancelled sas)) 'cancelled)
-         ((and sas (alist-get 'done sas)) 'done)
-         ;; Their SAS start arrived before ours (or without ours):
-         ;; accept it, or the other device waits forever.
-         ((and sas (not (alist-get 'accepted sas)))
-          (leman-e2ee-accept-sas agent user-id flow-id)
-          nil)
-         ((and sas (alist-get 'can_be_presented sas))
-          (if (funcall leman-e2ee-verify-confirm-function
-                       (alist-get 'device_id request)
-                       (alist-get 'emoji sas))
-              (progn (leman-e2ee-confirm-sas agent user-id flow-id) nil)
-            (leman-e2ee-cancel-verification agent user-id flow-id)
-            'cancelled))
-         ;; No request and no SAS: the state machine garbage-collects
-         ;; both once the dance finishes; the device's trust state is
-         ;; then the remaining signal.
-         ((leman-e2ee--device-verified-p agent user-id device-id) 'done)
-         (t nil)))))))
+(defvar leman-e2ee--active-verification nil
+  "The verification dance in progress, or nil.
+A plist with :session, :user-id, :flow-id, :device-id,
+:prompted-p, and :prompt-timer keys (the latter two seeded nil, so
+that `setf' of `plist-get' mutates in place).  The dance advances
+with the session's syncs (`leman-e2ee--advance-verification'): its
+to-device events (the other side's accept, SAS start, and MACs)
+arrive with them, so no polling loop is needed.")
+
+(defun leman-e2ee--clear-verification ()
+  "Forget the active verification and cancel its prompt timer."
+  (when-let ((timer (plist-get leman-e2ee--active-verification :prompt-timer)))
+    (cancel-timer timer))
+  (setf leman-e2ee--active-verification nil))
+
+(defun leman-e2ee--finish-verification (device-id outcome &optional detail)
+  "Report that device DEVICE-ID OUTCOME (with DETAIL), and clear the dance."
+  (leman-message "Leman E2EE: device %s %s%s." device-id outcome (or detail ""))
+  (leman-e2ee--clear-verification))
+
+(defun leman-e2ee--prompt-sas (session device-id emoji)
+  "Prompt to compare the SAS EMOJI of SESSION's dance for DEVICE-ID.
+The prompt must not run on the sync callback's stack (it blocks on
+the user's answer), so it runs from a zero timer: answering
+non-nil confirms the short auth string, nil cancels the dance,
+and quitting (\\[keyboard-quit]) defers it to `leman-e2ee-verify'."
+  (let ((active leman-e2ee--active-verification))
+    ;; NOTE: :prompted-p and :prompt-timer are seeded (nil) when the
+    ;; dance is registered: `setf' of `plist-get' mutates an existing
+    ;; key in place but REBINDS for a new key, which would silently
+    ;; diverge this local from the global dance (the timer's identity
+    ;; check would then never pass).
+    (setf (plist-get active :prompted-p) t)
+    (setf (plist-get active :prompt-timer)
+          (run-at-time
+           0 nil
+           (lambda ()
+             ;; The dance may have finished while the prompt waited
+             ;; (e.g. cancelled elsewhere): then there is nothing to
+             ;; answer.
+             (when (eq leman-e2ee--active-verification active)
+               (condition-case err
+                   (if (funcall leman-e2ee-verify-confirm-function device-id emoji)
+                       (progn (leman-e2ee-confirm-sas
+                               (leman-session-e2ee session)
+                               (plist-get active :user-id)
+                               (plist-get active :flow-id))
+                              ;; Send the MAC now rather than at the next sync.
+                              (leman-e2ee--process-outgoing-requests session))
+                     (leman-e2ee-cancel-verification
+                      (leman-session-e2ee session)
+                      (plist-get active :user-id)
+                      (plist-get active :flow-id))
+                     (leman-e2ee--process-outgoing-requests session))
+                 (leman-e2ee-error
+                  (leman-message "Leman E2EE: verification of %s failed: %s"
+                                 device-id (alist-get 'message (cdr err))))
+                 (quit
+                  (leman-message "Leman E2EE: verification of %s deferred; run M-x leman-e2ee-verify to answer it"
+                                 device-id)))))))))
+
+(defun leman-e2ee--advance-verification (session agent)
+  "Advance the active verification dance for SESSION on AGENT.
+Called from the sync path once the sync's to-device events (the
+other side's accepts, SAS start, and MACs) reached the agent, so
+each sync moves the dance one step.  Errors are demoted by the
+caller: a dance step must never break syncing."
+  (when-let ((active leman-e2ee--active-verification)
+             ((eq (plist-get active :session) session)))
+    (pcase-let* (((map :user-id :flow-id :device-id) active)
+                 (request (seq-find (lambda (request)
+                                      (equal (alist-get 'flow_id request) flow-id))
+                                    (leman-e2ee-verification-requests agent user-id)))
+                 (state (alist-get 'state request)))
+      (cond
+       ((equal state "done")
+        (leman-e2ee--finish-verification device-id "is verified"))
+       ((equal state "cancelled")
+        (leman-e2ee--finish-verification device-id "was cancelled"))
+       ((and (equal state "ready") (not (alist-get 'sas request)))
+        ;; Both sides accepted the request: start the SAS.
+        (leman-e2ee-start-sas agent user-id flow-id))
+       ((null request)
+        ;; The state machine garbage-collects the request and the SAS
+        ;; once the dance finishes: the device's verified state is
+        ;; then the remaining signal.
+        (if (leman-e2ee--device-verified-p agent user-id device-id)
+            (leman-e2ee--finish-verification device-id "is verified")
+          (leman-e2ee--finish-verification device-id "did not complete"
+                                           " (the request expired or was cancelled)")))
+       (t
+        (let ((sas (ignore-errors
+                     (leman-e2ee-verification-sas agent user-id flow-id))))
+          (cond
+           ((and sas (alist-get 'done sas))
+            (leman-e2ee--finish-verification device-id "is verified"))
+           ((and sas (alist-get 'cancelled sas))
+            (leman-e2ee--finish-verification
+             device-id "was cancelled"
+             (if-let ((code (alist-get 'cancel_code sas)))
+                 (format " (%s%s)" code
+                         (if-let ((reason (alist-get 'cancel_reason sas)))
+                             (concat ": " reason) ""))
+               "")))
+           ;; Their SAS start arrived before ours (or without ours):
+           ;; accept it, or the other device waits forever.
+           ((and sas (not (alist-get 'accepted sas)))
+            (leman-e2ee-accept-sas agent user-id flow-id))
+           ((and sas (alist-get 'can_be_presented sas)
+                 (not (plist-get active :prompted-p)))
+            (leman-e2ee--prompt-sas session device-id (alist-get 'emoji sas)))
+           ;; Otherwise: keep waiting for the next sync.
+           )))))))
 
 (defun leman-e2ee-verify (session)
   "Verify a device with SESSION's E2EE agent (emoji SAS).
-Pick a device, run the interactive verification dance, and
-compare the short auth string with the other device.  An incoming
-verification request for the device is accepted; otherwise a new
-one is started."
+Pick a device, start or accept the verification request, and
+return; the dance then advances with the session's syncs via
+`leman-e2ee--advance-verification', prompting for the emoji
+comparison when the short auth string can be presented.  If a
+verification is already in progress for SESSION, continue it
+instead (e.g. to answer a deferred prompt).  An incoming
+verification request for the picked device is accepted; otherwise
+a new one is started."
   (interactive (list (leman-complete-session)))
   (let ((agent (leman-session-e2ee session)))
     (unless agent
       (user-error "Leman E2EE: no agent running (try reconnecting)"))
-    (let* ((own-user (leman-user-id (leman-session-user session)))
-           (user-id (read-string
-                     (format "Verify a device of user (default %s): " own-user)
-                     nil nil own-user))
-           (devices (leman-e2ee-devices agent user-id))
-           (choices (mapcar (lambda (device)
-                              (cons (alist-get 'device_id device)
-                                    (alist-get 'display_name device)))
-                            devices))
-           (device-id (completing-read "Device: " choices nil t)))
-      ;; A locally-verified device may still be unsigned (verified
-      ;; before the private cross-signing keys were imported): the
-      ;; signature is only uploaded during a dance, so re-running is
-      ;; the only way to sign it.
-      (when-let ((device (seq-find (lambda (device)
-                                     (equal (alist-get 'device_id device) device-id))
-                                   devices)))
-        (when (and (equal (alist-get 'verified device) t)
-                   (not (y-or-n-p
-                         (format "Device %s is already verified; run the dance again to sign it? "
-                                 device-id))))
-          (user-error "Leman E2EE: device %s is already verified" device-id)))
-      (let* ((existing (seq-find (lambda (request)
-                                   (equal (alist-get 'device_id request) device-id))
-                                 (leman-e2ee-verification-requests agent user-id)))
-             (flow-id (if (and existing
-                               (not (alist-get 'we_started existing))
-                               (member (alist-get 'state existing) '("created" "ready")))
-                          (progn
-                            (leman-e2ee-accept-verification
-                             agent user-id (alist-get 'flow_id existing))
-                            (alist-get 'flow_id existing))
-                        (leman-e2ee-request-verification agent user-id device-id))))
-        (message "Leman E2EE: verifying %s of %s; accept the request on the other device."
-                 device-id user-id)
-        ;; The dance's to-device events travel with the session's
-        ;; syncs; pump the agent's outgoing requests each round.
-        ;; This must remain asynchronous: confirming the emoji queues
-        ;; the MAC request, and waiting synchronously for a slow
-        ;; homeserver here makes Emacs appear to hang immediately after
-        ;; the user answers `y'.
-        (catch 'finished
-          (cl-loop for round from 1 upto 90
-                   do (leman-e2ee--process-outgoing-requests session)
-                      (let ((result (leman-e2ee--verify-step
-                                     agent user-id flow-id device-id)))
-                        (pcase result
-                          (`done
-                           (message "Leman E2EE: device %s is verified." device-id)
-                           (throw 'finished t))
-                          (`cancelled
-                           (let* ((sas (ignore-errors
-                                         (leman-e2ee-verification-sas
-                                          agent user-id flow-id)))
-                                  (code (alist-get 'cancel_code sas))
-                                  (reason (alist-get 'cancel_reason sas)))
-                             (message "Leman E2EE: verification of %s was cancelled (%s%s)."
-                                      device-id
-                                      (or code "unknown code")
-                                      (if reason (format ": %s" reason) "")))
-                           (throw 'finished t))))
-                      (sleep-for 2)
-                   finally (message "Leman E2EE: verification of %s timed out; run `M-x leman-e2ee-verify' again."
-                                    device-id)))
-        (leman-e2ee--process-outgoing-requests session)))))
+    (if (and leman-e2ee--active-verification
+             (eq (plist-get leman-e2ee--active-verification :session) session))
+        ;; Resume the dance (e.g. to answer a deferred prompt).
+        (let ((device-id (plist-get leman-e2ee--active-verification :device-id)))
+          (when-let ((timer (plist-get leman-e2ee--active-verification :prompt-timer)))
+            (cancel-timer timer)
+            (setf (plist-get leman-e2ee--active-verification :prompt-timer) nil
+                  (plist-get leman-e2ee--active-verification :prompted-p) nil))
+          (message "Leman E2EE: continuing verification of %s." device-id)
+          (leman-e2ee--advance-verification session agent))
+      (let* ((own-user (leman-user-id (leman-session-user session)))
+             (user-id (read-string
+                       (format "Verify a device of user (default %s): " own-user)
+                       nil nil own-user))
+             (devices (leman-e2ee-devices agent user-id))
+             (device-ids (mapcar (lambda (device)
+                                   (alist-get 'device_id device))
+                                 (seq-remove (lambda (device)
+                                               ;; Deleted devices have no
+                                               ;; keys left to verify.
+                                               (alist-get 'deleted device))
+                                             devices)))
+             (device-id (if device-ids
+                            (let ((completion-extra-properties
+                                   (list :affixation-function
+                                         (leman-e2ee--device-annotation devices))))
+                              (completing-read "Device: " device-ids nil t))
+                          (user-error "Leman E2EE: no devices to verify for %s"
+                                      user-id))))
+        ;; A locally-verified device may still be unsigned (verified
+        ;; before the private cross-signing keys were imported): the
+        ;; signature is only uploaded during a dance, so re-running is
+        ;; the only way to sign it.
+        (when-let ((device (seq-find (lambda (device)
+                                       (equal (alist-get 'device_id device) device-id))
+                                     devices)))
+          (when (and (equal (alist-get 'verified device) t)
+                     (not (y-or-n-p
+                           (format "Device %s is already verified; run the dance again to sign it? "
+                                   device-id))))
+            (user-error "Leman E2EE: device %s is already verified" device-id)))
+        (let* ((existing (seq-find (lambda (request)
+                                     (equal (alist-get 'device_id request) device-id))
+                                   (leman-e2ee-verification-requests agent user-id)))
+               (flow-id (if (and existing
+                                 (not (alist-get 'we_started existing))
+                                 (member (alist-get 'state existing) '("created" "ready")))
+                            (progn
+                              (leman-e2ee-accept-verification
+                               agent user-id (alist-get 'flow_id existing))
+                              (alist-get 'flow_id existing))
+                          (leman-e2ee-request-verification agent user-id device-id))))
+          (setf leman-e2ee--active-verification
+                ;; NOTE: :prompted-p and :prompt-timer are seeded so
+                ;; that later `setf' of `plist-get' mutates this list
+                ;; in place (a new key would rebind and diverge the
+                ;; dance's copies -- see `leman-e2ee--prompt-sas').
+                (list :session session :user-id user-id :flow-id flow-id
+                      :device-id device-id :prompted-p nil :prompt-timer nil))
+          (message "Leman E2EE: verifying %s of %s; accept the request on the other device."
+                   device-id user-id)
+          ;; The dance's to-device events travel with the session's
+          ;; syncs; send the request now rather than at the next sync.
+          (leman-e2ee--process-outgoing-requests session))))))
 
 (defun leman-e2ee--decrypt-event (session event &optional room-id)
   "Decrypt EVENT (from ROOM-ID) with SESSION's E2EE agent.
@@ -801,7 +909,19 @@ requests are performed."
             (setf leman-e2ee--room-keys-arrived-p t)))
       (leman-e2ee-error
        (leman-message "Leman E2EE: processing sync changes failed: %S" (cdr err))))
-    (leman-e2ee--process-outgoing-requests session)
+    ;; The verification dance advances now that the sync's to-device
+    ;; events (the other side's accepts, SAS start, and MACs) reached
+    ;; the agent; the pump then sends the dance's own requests.
+    ;; Neither step may break the sync chain: a dead agent request
+    ;; must cost a message, not stop syncing.
+    (condition-case err
+        (leman-e2ee--advance-verification session agent)
+      (error
+       (leman-message "Leman E2EE: advancing verification failed: %S" err)))
+    (condition-case err
+        (leman-e2ee--process-outgoing-requests session)
+      (error
+       (leman-message "Leman E2EE: performing outgoing requests failed: %S" err)))
     (leman-e2ee--announce-requests session agent)
     (leman-e2ee--backup-pump session agent)))
 
@@ -2087,12 +2207,23 @@ PLZ-ERROR is the error passed by `plz'."
                    reason (leman-user-id (leman-session-user session)))
           ;; Set QUIET to allow the just-printed message to remain visible.
           (leman--sync session :timeout timeout :quiet t))
-      ;; Unrecognized errors:
+      ;; Unrecognized errors: report them, then retry after a pause.
+      ;; This runs in plz's sentinel, where signaling an error would
+      ;; just stop the sync chain permanently (as a blip like a
+      ;; dropped connection once did).
       (pcase curl-error
         (`(,code . ,message)
-         (signal 'leman-api-error (list (format "Leman: Network error: %s: %s" code message)
-                                        plz-error)))
-        (_ (signal 'leman-api-error (list "Leman: Unrecognized network error" plz-error)))))))
+         (message "Leman: Network error: %s: %s" code message))
+        (_ (message "Leman: Unrecognized network error: %S" plz-error)))
+      (when leman-auto-sync
+        (message "Leman: Syncing again in 5 seconds...")
+        (run-at-time
+         5 nil (lambda ()
+                 ;; The session may have been disconnected or already
+                 ;; be syncing again meanwhile.
+                 (when (and (rassq session leman-sessions)
+                            (not (map-elt leman-syncs session)))
+                   (leman--sync session :timeout timeout :quiet t))))))))
 
 (defun leman--sync-read-json (session sync-start-time)
   "Print a message, then parse the sync response for SESSION.
@@ -2174,15 +2305,22 @@ Runs `leman-sync-callback-hook' with SESSION."
     ;; we should store account-data events in a hash table or alist rather than just a
     ;; list of events.
     (cl-callf2 append (cl-coerce account-data-events 'list) (leman-session-account-data session))
-    ;; Process invited and joined rooms.
-    (leman-with-progress-reporter (:when (leman--sync-messages-p session)
-                                         :reporter ("Leman: Reading events..." 0 num-events))
-      ;; Left rooms.
-      (mapc (apply-partially #'leman--push-left-room-events session) left-rooms)
-      ;; Invited rooms.
-      (mapc (apply-partially #'leman--push-invite-room-events session) invited-rooms)
-      ;; Joined rooms.
-      (mapc (apply-partially #'leman--push-joined-room-events session) joined-rooms))
+    ;; Process invited and joined rooms.  Errors are demoted: the sync
+    ;; callback is the only place the next sync is started, so an
+    ;; error here must cost a message, not stop syncing (a malformed
+    ;; event's room is then skipped: the next-batch token still
+    ;; advances, matching the tradeoff noted below).
+    (condition-case err
+        (leman-with-progress-reporter (:when (leman--sync-messages-p session)
+                                             :reporter ("Leman: Reading events..." 0 num-events))
+          ;; Left rooms.
+          (mapc (apply-partially #'leman--push-left-room-events session) left-rooms)
+          ;; Invited rooms.
+          (mapc (apply-partially #'leman--push-invite-room-events session) invited-rooms)
+          ;; Joined rooms.
+          (mapc (apply-partially #'leman--push-joined-room-events session) joined-rooms))
+      (error (message "Leman: Error processing sync events: %s"
+                      (error-message-string err))))
     ;; TODO: Process "left" rooms (remove room structs, etc).
     ;; NOTE: We update the next-batch token before updating any room buffers.  This means
     ;; that any errors in updating room buffers (like for unexpected event formats that
@@ -2193,24 +2331,32 @@ Runs `leman-sync-callback-hook' with SESSION."
     ;; on every sync, causing the same error each time.  It would seem preferable to
     ;; maintain at least some usability rather than to keep repeating a broken behavior.
     (setf (leman-session-next-batch session) next-batch)
-    ;; Run hooks which update buffers, etc.
-    (run-hook-with-args 'leman-sync-callback-hook session)
-    (when leman-e2ee--room-keys-arrived-p
-      ;; Room keys arrived with this sync: events that could not be
-      ;; decrypted before (their placeholders are already in the
-      ;; buffers) may decrypt now.
-      (setf leman-e2ee--room-keys-arrived-p nil)
-      (leman-e2ee--retry-decryption session))
-    ;; Update the mode-line unread indicator.
-    (leman--update-unread-indicator)
-    ;; Show sync message if appropriate, and run after-initial-sync-hook.
-    (when (leman--sync-messages-p session)
-      (message (concat "Leman: Sync done."
-                       (unless (leman-session-has-synced-p session)
-                         (run-hook-with-args 'leman-after-initial-sync-hook session)
-                         ;; Show tip after initial sync.
-                         (setf (leman-session-has-synced-p session) t)
-                         "  Use commands `leman-list-rooms' or `leman-view-room' to view a room."))))))
+    (condition-case err
+        (progn
+          ;; Run hooks which update buffers, etc.
+          (run-hook-with-args 'leman-sync-callback-hook session)
+          (when leman-e2ee--room-keys-arrived-p
+            ;; Room keys arrived with this sync: events that could not be
+            ;; decrypted before (their placeholders are already in the
+            ;; buffers) may decrypt now.
+            (setf leman-e2ee--room-keys-arrived-p nil)
+            (leman-e2ee--retry-decryption session))
+          ;; Update the mode-line unread indicator.
+          (leman--update-unread-indicator)
+          ;; Show sync message if appropriate, and run after-initial-sync-hook.
+          (when (leman--sync-messages-p session)
+            (message (concat "Leman: Sync done."
+                             (unless (leman-session-has-synced-p session)
+                               (run-hook-with-args 'leman-after-initial-sync-hook session)
+                               ;; Show tip after initial sync.
+                               (setf (leman-session-has-synced-p session) t)
+                               "  Use commands `leman-list-rooms' or `leman-view-room' to view a room.")))))
+      (error (message "Leman: Error after sync: %s"
+                      (error-message-string err))))
+    ;; A hook may have errored before `leman--auto-sync' (in the hook)
+    ;; started the next sync: keep the chain alive.
+    (when (and leman-auto-sync (not (map-elt leman-syncs session)))
+      (leman--sync session :quiet t))))
 
 (defun leman--push-invite-room-events (session invited-room)
   "Push events for INVITED-ROOM into that room in SESSION."
@@ -2427,12 +2573,14 @@ Adds sender to `leman-users' when necessary."
 Returns nil if unable to read `leman-sessions-file'."
   (cl-labels ((plist-to-session (plist)
                 (pcase-let* (((map (:user user-data) (:server server-data)
-                                   (:token token) (:transaction-id transaction-id))
+                                   (:token token) (:transaction-id transaction-id)
+                                   (:device-id device-id))
                               plist)
                              (user (apply #'make-leman-user user-data))
                              (server (apply #'make-leman-server server-data))
                              (session (make-leman-session :user user :server server
-                                                          :token token :transaction-id transaction-id)))
+                                                          :token token :transaction-id transaction-id
+                                                          :device-id device-id)))
                   (setf (leman-session-events session) (make-hash-table :test #'equal))
                   session)))
     (when (file-exists-p leman-sessions-file)
@@ -2457,15 +2605,18 @@ Returns nil if unable to read `leman-sessions-file'."
   ;; NOTE: This writes all current sessions, even if there are multiple active ones and only one
   ;; is being disconnected.  That's probably okay, but it might be something to keep in mind.
   (cl-labels ((session-plist (session)
-                (pcase-let* (((cl-struct leman-session user server token transaction-id) session)
+                (pcase-let* (((cl-struct leman-session user server token transaction-id device-id) session)
                              ((cl-struct leman-user (id user-id) username) user)
                              ((cl-struct leman-server (name server-name) uri-prefix) server))
+                  ;; The device ID is saved so the login can reclaim
+                  ;; the device (and E2EE can skip the whoami call).
                   (list :user (list :id user-id
                                     :username username)
                         :server (list :name server-name
                                       :uri-prefix uri-prefix)
                         :token token
-                        :transaction-id transaction-id))))
+                        :transaction-id transaction-id
+                        :device-id device-id))))
     (message "Leman: Writing sessions...")
     (with-temp-file leman-sessions-file
       (pcase-let* ((print-level nil)

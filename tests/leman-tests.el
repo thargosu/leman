@@ -731,6 +731,24 @@ re-created); each re-render must not start another download."
       (should (string-match-p "unable to decrypt" formatted))
       (should-not (string-match-p "secret" formatted)))))
 
+(ert-deftest leman--sessions-round-trip-device-id ()
+  "The device ID round-trips through the saved sessions file.
+Restoring it lets the login reclaim the device (and E2EE skip its
+whoami call), so verifications survive restarts."
+  (let* ((leman-sessions-file (make-temp-file "leman-sessions-test-"))
+         (session (make-leman-session
+                   :user (make-leman-user :id "@vv:x.org" :username "vv")
+                   :server (make-leman-server :name "x.org" :uri-prefix "https://x.org")
+                   :token "tok"
+                   :transaction-id 42
+                   :device-id "ABC"))
+         (leman-sessions (list (cons "@vv:x.org" session))))
+    (leman--write-sessions leman-sessions)
+    (let ((restored (cdr (car (leman--read-sessions)))))
+      (should (equal (leman-session-device-id restored) "ABC"))
+      (should (equal (leman-session-token restored) "tok"))
+      (should (equal (leman-user-id (leman-session-user restored)) "@vv:x.org")))))
+
 (provide 'leman-tests)
 
 ;;; leman-tests.el ends here

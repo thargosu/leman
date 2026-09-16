@@ -315,20 +315,51 @@ that cargo must be found on the `exec-path'."
   "Return NAME with characters unsafe for file names replaced."
   (replace-regexp-in-string "[^[:alnum:]._-]" "_" name))
 
+(defun leman-e2ee--store-dir (user-id device-id)
+  "Return the crypto store directory for USER-ID and DEVICE-ID."
+  (expand-file-name
+   (concat (leman-e2ee--sanitize-name device-id) "/")
+   (expand-file-name
+    (concat "crypto/" (leman-e2ee--sanitize-name user-id) "/")
+    leman-e2ee-data-directory)))
+
 (defun leman-e2ee--store-path (user-id device-id)
   "Return the crypto store directory for USER-ID and DEVICE-ID.
 The store is kept per device: a device's crypto identity must
 never be reused under another device.  The directory is created
 and restricted to the current user."
-  (let* ((user-dir (expand-file-name
-                    (concat "crypto/" (leman-e2ee--sanitize-name user-id) "/")
-                    leman-e2ee-data-directory))
-         (path (expand-file-name
-                (concat (leman-e2ee--sanitize-name device-id) "/")
-                user-dir)))
+  (let ((path (leman-e2ee--store-dir user-id device-id)))
     (make-directory path t)
     (set-file-modes (directory-file-name path) #o700)
     path))
+
+(defun leman-e2ee--existing-device-id (user-id)
+  "Return the device ID of USER-ID's most recent crypto store, or nil.
+A device's identity lives as long as its store: a fresh login for
+a user who already has a store reclaims that device (the login
+request carries its ID), keeping its keys and verifications
+across logins, like other Matrix clients do.  The store's
+database must exist for a directory to count: a store-less
+directory holds no keys worth keeping."
+  (let ((user-dir (expand-file-name
+                   (concat "crypto/" (leman-e2ee--sanitize-name user-id) "/")
+                   leman-e2ee-data-directory)))
+    (when (file-directory-p user-dir)
+      (cl-labels ((store-p (name)
+                    (and (file-directory-p (expand-file-name name user-dir))
+                         (file-exists-p (expand-file-name
+                                         "matrix-sdk-crypto.sqlite3"
+                                         (expand-file-name name user-dir)))))
+                  (mtime (name)
+                    (file-attribute-modification-time
+                     (file-attributes (expand-file-name name user-dir)))))
+        (when-let ((stores (seq-filter #'store-p
+                                       (directory-files
+                                        user-dir nil
+                                        directory-files-no-dot-files-regexp))))
+          ;; Newest store first.
+          (car (seq-sort (lambda (a b) (time-less-p (mtime b) (mtime a)))
+                         stores)))))))
 
 (defun leman-e2ee--discard-store (user-id device-id)
   "Delete the crypto store of USER-ID's DEVICE-ID.

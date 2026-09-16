@@ -26,13 +26,19 @@
 (declare-function leman--session-revoked-cleanup "leman")
 (declare-function leman-session-revoked-p "leman-api")
 (declare-function leman--sync-failed "leman")
+(declare-function leman--sync-callback "leman")
 (declare-function leman-api-session-revoked-p "leman-api")
 (declare-function leman-room--send-typing "leman-room")
 (declare-function leman-e2ee--decrypt-event "leman")
 (declare-function leman-e2ee--encrypt-content "leman")
 (declare-function leman-e2ee--format-emoji "leman")
 (declare-function leman-e2ee--perform-outgoing-request "leman")
-(declare-function leman-e2ee--verify-step "leman")
+(declare-function leman-e2ee--advance-verification "leman")
+(declare-function leman-e2ee--prompt-sas "leman")
+(declare-function leman-e2ee--device-annotation "leman")
+(declare-function leman-e2ee--existing-device-id "leman-e2ee")
+(declare-function leman--password-login "leman")
+(declare-function leman--new-session "leman")
 (declare-function leman-e2ee--process-outgoing-requests "leman")
 (declare-function leman-e2ee--process-outgoing-requests-sync "leman")
 (declare-function leman-e2ee--sync-changes "leman")
@@ -681,7 +687,17 @@ to the agent, newest first."
                           (list (cons 'symbol "🐟") (cons 'description "fish"))))
                  "🦋 butterfly   🐟 fish")))
 
-(ert-deftest leman-e2ee--verify-step-starts-sas-when-ready ()
+(defun leman-e2ee-tests--start-verification (session user-id flow-id device-id)
+  "Register the active verification dance for SESSION.
+Clears `leman-e2ee--active-verification' beforehand; the caller
+must still clear it afterwards (e.g. with `unwind-protect')."
+  ;; The keys are seeded like `leman-e2ee-verify' does: `setf' of
+  ;; `plist-get' only mutates in place for existing keys.
+  (setf leman-e2ee--active-verification
+        (list :session session :user-id user-id :flow-id flow-id
+              :device-id device-id :prompted-p nil :prompt-timer nil)))
+
+(ert-deftest leman-e2ee--advance-verification-starts-sas-when-ready ()
   ;; A ready request without a SAS object: send start, keep waiting.
   (let* ((fake (leman-e2ee-tests--fake-agent
                 (list (cons 'verification_requests
@@ -689,12 +705,17 @@ to the agent, newest first."
                                         (vector (list (cons 'flow_id "flow1")
                                                       (cons 'state "ready")
                                                       (cons 'sas nil)))))))))
-           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1" "ABC")))
-    (should (null result))
-    (should (equal (alist-get 'cmd (leman-e2ee--decode (car (cdr (cdr fake)))))
-                   "start_sas"))))
+         (session (make-leman-session :e2ee (car fake))))
+    (unwind-protect
+        (progn
+          (leman-e2ee-tests--start-verification session "@vv:x.org" "flow1" "ABC")
+          (leman-e2ee--advance-verification session (car fake))
+          (should leman-e2ee--active-verification)
+          (should (equal (alist-get 'cmd (leman-e2ee--decode (car (cdr (cdr fake)))))
+                         "start_sas")))
+      (setf leman-e2ee--active-verification nil))))
 
-(ert-deftest leman-e2ee--verify-step-accepts-their-sas-start ()
+(ert-deftest leman-e2ee--advance-verification-accepts-their-sas-start ()
   ;; Their SAS start arrived (a SAS object exists but we have not
   ;; accepted it): accept it, or the other device waits forever.
   (let* ((fake (leman-e2ee-tests--fake-agent
@@ -708,14 +729,19 @@ to the agent, newest first."
                                   (cons 'can_be_presented nil)
                                   (cons 'done nil)
                                   (cons 'cancelled nil))))))
-           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1" "ABC")))
-    (should (null result))
-    (should (equal (alist-get 'cmd (leman-e2ee--decode (car (cdr (cdr fake)))))
-                   "accept_sas"))))
+         (session (make-leman-session :e2ee (car fake))))
+    (unwind-protect
+        (progn
+          (leman-e2ee-tests--start-verification session "@vv:x.org" "flow1" "ABC")
+          (leman-e2ee--advance-verification session (car fake))
+          (should leman-e2ee--active-verification)
+          (should (equal (alist-get 'cmd (leman-e2ee--decode (car (cdr (cdr fake)))))
+                         "accept_sas")))
+      (setf leman-e2ee--active-verification nil))))
 
-(ert-deftest leman-e2ee--verify-step-presents-emoji-and-confirms ()
-  ;; The emoji can be compared: ask the user, then confirm (the dance
-  ;; only finishes once both sides' MACs arrived).
+(ert-deftest leman-e2ee--advance-verification-presents-emoji-once ()
+  ;; The emoji can be compared: schedule the prompt (once; the dance
+  ;; is prompted from a timer, at top level).
   (let* ((fake (leman-e2ee-tests--fake-agent
                 (list (cons 'verification_requests
                             (list (cons 'requests
@@ -731,50 +757,129 @@ to the agent, newest first."
                                   (cons 'emoji
                                         (vector (list (cons 'symbol "🦋")
                                                       (cons 'description "butterfly")))))))))
-           (asked nil)
-           (leman-e2ee-verify-confirm-function
-            (lambda (_device-id emoji)
-              (setq asked emoji) t))
-           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1" "ABC")))
-    (should (null result))
-    (should (equal asked
-                   (vector (list (cons 'symbol "🦋")
-                                 (cons 'description "butterfly")))))
-    (should (equal (alist-get 'cmd (leman-e2ee--decode (car (cdr (cdr fake)))))
-                   "confirm_sas"))))
+         (session (make-leman-session :e2ee (car fake)))
+         (callbacks nil))
+    (cl-letf (((symbol-function #'run-at-time)
+               (lambda (_seconds _repeat function &rest _args)
+                 (push function callbacks)
+                 'fake-timer)))
+      (unwind-protect
+          (progn
+            (leman-e2ee-tests--start-verification session "@vv:x.org" "flow1" "ABC")
+            (leman-e2ee--advance-verification session (car fake))
+            (should (= (length callbacks) 1))
+            (should (plist-get leman-e2ee--active-verification :prompted-p))
+            ;; Already prompted: the next sync does not re-prompt.
+            (leman-e2ee--advance-verification session (car fake))
+            (should (= (length callbacks) 1)))
+        (setf leman-e2ee--active-verification nil)))))
 
-(ert-deftest leman-e2ee--verify-step-cancels-on-emoji-mismatch ()
-  (let* ((fake (leman-e2ee-tests--fake-agent
-                (list (cons 'verification_requests
-                            (list (cons 'requests
-                                        (vector (list (cons 'flow_id "flow1")
-                                                      (cons 'state "ready")
-                                                      (cons 'sas t))))))
-                      (cons 'verification_sas
-                            (list (cons 'accepted t)
-                                  (cons 'can_be_presented t)
-                                  (cons 'done nil)
-                                  (cons 'cancelled nil)
-                                  (cons 'emoji
-                                        (vector (list (cons 'symbol "🦋")
-                                                      (cons 'description "butterfly")))))))))
-           (leman-e2ee-verify-confirm-function (lambda (_device _emoji) nil))
-           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1" "ABC")))
-    (should (eq result 'cancelled))
-    (should (equal (alist-get 'cmd (leman-e2ee--decode (car (cdr (cdr fake)))))
-                   "cancel_verification"))))
+(ert-deftest leman-e2ee--prompt-sas-confirms-and-pumps ()
+  ;; Answering yes confirms the SAS and pumps the MAC request out.
+  (let* ((fake (leman-e2ee-tests--fake-agent nil))
+         (session (make-leman-session :e2ee (car fake)))
+         (timer-fn nil)
+         (pumps 0)
+         (leman-e2ee-verify-confirm-function (lambda (&rest _) t)))
+    (cl-letf (((symbol-function #'run-at-time)
+               (lambda (_seconds _repeat function &rest _args)
+                 (setf timer-fn function)
+                 'fake-timer))
+              ((symbol-function #'leman-e2ee--process-outgoing-requests)
+               (lambda (&rest _) (cl-incf pumps))))
+      (unwind-protect
+          (progn
+            (leman-e2ee-tests--start-verification session "@vv:x.org" "flow1" "ABC")
+            (leman-e2ee--prompt-sas session "ABC" (vector))
+            (funcall timer-fn)
+            (should (= pumps 1))
+            (should (equal (alist-get 'cmd (leman-e2ee--decode (car (cdr (cdr fake)))))
+                           "confirm_sas")))
+        (setf leman-e2ee--active-verification nil)))))
 
-(ert-deftest leman-e2ee--verify-step-finishes ()
+(ert-deftest leman-e2ee--prompt-sas-cancels-on-emoji-mismatch ()
+  (let* ((fake (leman-e2ee-tests--fake-agent nil))
+         (session (make-leman-session :e2ee (car fake)))
+         (timer-fn nil)
+         (pumps 0)
+         (leman-e2ee-verify-confirm-function (lambda (&rest _) nil)))
+    (cl-letf (((symbol-function #'run-at-time)
+               (lambda (_seconds _repeat function &rest _args)
+                 (setf timer-fn function)
+                 'fake-timer))
+              ((symbol-function #'leman-e2ee--process-outgoing-requests)
+               (lambda (&rest _) (cl-incf pumps))))
+      (unwind-protect
+          (progn
+            (leman-e2ee-tests--start-verification session "@vv:x.org" "flow1" "ABC")
+            (leman-e2ee--prompt-sas session "ABC" (vector))
+            (funcall timer-fn)
+            (should (= pumps 1))
+            (should (equal (alist-get 'cmd (leman-e2ee--decode (car (cdr (cdr fake)))))
+                           "cancel_verification")))
+        (setf leman-e2ee--active-verification nil)))))
+
+(ert-deftest leman-e2ee--prompt-sas-defers-on-quit ()
+  ;; C-g during the prompt defers it: the dance stays active and
+  ;; `leman-e2ee-verify' can re-prompt.
+  (let* ((fake (leman-e2ee-tests--fake-agent nil))
+         (session (make-leman-session :e2ee (car fake)))
+         (timer-fn nil)
+         (leman-e2ee-verify-confirm-function (lambda (&rest _) (signal 'quit nil))))
+    (cl-letf (((symbol-function #'run-at-time)
+               (lambda (_seconds _repeat function &rest _args)
+                 (setf timer-fn function)
+                 'fake-timer)))
+      (unwind-protect
+          (progn
+            (leman-e2ee-tests--start-verification session "@vv:x.org" "flow1" "ABC")
+            (leman-e2ee--prompt-sas session "ABC" (vector))
+            (funcall timer-fn)
+            (should (eq (plist-get leman-e2ee--active-verification :session) session))
+            (should-not (alist-get 'cmd (leman-e2ee--decode (car (cdr (cdr fake)))))))
+        (setf leman-e2ee--active-verification nil)))))
+
+(ert-deftest leman-e2ee--prompt-sas-ignores-cleared-dance ()
+  ;; The dance may finish (e.g. cancelled elsewhere) while the prompt
+  ;; waits: answering it must then do nothing.
+  (let* ((fake (leman-e2ee-tests--fake-agent nil))
+         (session (make-leman-session :e2ee (car fake)))
+         (timer-fn nil)
+         (leman-e2ee-verify-confirm-function (lambda (&rest _) t)))
+    (cl-letf (((symbol-function #'run-at-time)
+               (lambda (_seconds _repeat function &rest _args)
+                 (setf timer-fn function)
+                 'fake-timer)))
+      (unwind-protect
+          (progn
+            (leman-e2ee-tests--start-verification session "@vv:x.org" "flow1" "ABC")
+            (leman-e2ee--prompt-sas session "ABC" (vector))
+            (setf leman-e2ee--active-verification nil)
+            (funcall timer-fn)
+            (should (null (cdr (cdr fake)))))  ; nothing was sent to the agent
+        (setf leman-e2ee--active-verification nil)))))
+
+(ert-deftest leman-e2ee--advance-verification-finishes ()
   (let* ((fake (leman-e2ee-tests--fake-agent
                 (list (cons 'verification_requests
                             (list (cons 'requests
                                         (vector (list (cons 'flow_id "flow1")
                                                       (cons 'state "done")
                                                       (cons 'sas t)))))))))
-           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1" "ABC")))
-    (should (eq result 'done))))
+         (session (make-leman-session :e2ee (car fake)))
+         (messages nil))
+    (cl-letf (((symbol-function #'leman-message)
+               (lambda (format &rest args)
+                 (push (apply #'format format args) messages))))
+      (unwind-protect
+          (progn
+            (leman-e2ee-tests--start-verification session "@vv:x.org" "flow1" "ABC")
+            (leman-e2ee--advance-verification session (car fake))
+            (should (null leman-e2ee--active-verification))
+            (should (string-match-p "is verified" (car messages))))
+        (setf leman-e2ee--active-verification nil)))))
 
-(ert-deftest leman-e2ee--verify-step-finishes-on-sas-done ()
+(ert-deftest leman-e2ee--advance-verification-finishes-on-sas-done ()
   ;; A request may lag behind its SAS (both still in flight); a done
   ;; SAS means verified even if the request state hasn't caught up.
   (let* ((fake (leman-e2ee-tests--fake-agent
@@ -788,10 +893,15 @@ to the agent, newest first."
                                   (cons 'can_be_presented nil)
                                   (cons 'done t)
                                   (cons 'cancelled nil))))))
-           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1" "ABC")))
-    (should (eq result 'done))))
+         (session (make-leman-session :e2ee (car fake))))
+    (unwind-protect
+        (progn
+          (leman-e2ee-tests--start-verification session "@vv:x.org" "flow1" "ABC")
+          (leman-e2ee--advance-verification session (car fake))
+          (should (null leman-e2ee--active-verification)))
+      (setf leman-e2ee--active-verification nil))))
 
-(ert-deftest leman-e2ee--verify-step-finishes-when-garbage-collected ()
+(ert-deftest leman-e2ee--advance-verification-finishes-when-garbage-collected ()
   ;; After the dance completes, the state machine garbage-collects the
   ;; done request and SAS; the device's verified state is the
   ;; remaining signal.
@@ -802,10 +912,15 @@ to the agent, newest first."
                             (list (cons 'devices
                                         (vector (list (cons 'device_id "ABC")
                                                       (cons 'verified t)))))))))
-           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1" "ABC")))
-    (should (eq result 'done))))
+         (session (make-leman-session :e2ee (car fake))))
+    (unwind-protect
+        (progn
+          (leman-e2ee-tests--start-verification session "@vv:x.org" "flow1" "ABC")
+          (leman-e2ee--advance-verification session (car fake))
+          (should (null leman-e2ee--active-verification)))
+      (setf leman-e2ee--active-verification nil))))
 
-(ert-deftest leman-e2ee--verify-step-keeps-waiting-when-gone-but-unverified ()
+(ert-deftest leman-e2ee--advance-verification-reports-expiry-when-gone-but-unverified ()
   (let* ((fake (leman-e2ee-tests--fake-agent
                 (list (cons 'verification_requests
                             (list (cons 'requests (vector))))
@@ -813,16 +928,39 @@ to the agent, newest first."
                             (list (cons 'devices
                                         (vector (list (cons 'device_id "ABC")
                                                       (cons 'verified nil)))))))))
-           (result (leman-e2ee--verify-step (car fake) "@vv:x.org" "flow1" "ABC")))
-    (should (null result))))
+         (session (make-leman-session :e2ee (car fake)))
+         (messages nil))
+    (cl-letf (((symbol-function #'leman-message)
+               (lambda (format &rest args)
+                 (push (apply #'format format args) messages))))
+      (unwind-protect
+          (progn
+            (leman-e2ee-tests--start-verification session "@vv:x.org" "flow1" "ABC")
+            (leman-e2ee--advance-verification session (car fake))
+            (should (null leman-e2ee--active-verification))
+            (should (string-match-p "did not complete" (car messages))))
+        (setf leman-e2ee--active-verification nil)))))
 
-(ert-deftest leman-e2ee-verify-pumps-requests-asynchronously ()
-  "Verification must not synchronously wait for the post-SAS MAC request."
+(ert-deftest leman-e2ee--advance-verification-ignores-other-sessions ()
+  ;; Only the active dance's own session advances.
+  (let* ((fake (leman-e2ee-tests--fake-agent nil))
+         (session (make-leman-session :e2ee (car fake)))
+         (other (make-leman-session :e2ee (car fake))))
+    (unwind-protect
+        (progn
+          (leman-e2ee-tests--start-verification other "@vv:x.org" "flow1" "ABC")
+          (leman-e2ee--advance-verification session (car fake))
+          (should (null (cdr (cdr fake)))))  ; nothing was sent to the agent
+      (setf leman-e2ee--active-verification nil))))
+
+(ert-deftest leman-e2ee-verify-starts-dance-and-pumps-asynchronously ()
+  "Verification must not synchronously wait for the homeserver or the agent."
   (let* ((agent (leman-e2ee--create))
          (session (make-leman-session
                    :e2ee agent
                    :user (make-leman-user :id "@me:x.org")))
-         (async-pumps 0))
+         (async-pumps 0)
+         dance)
     (cl-letf (((symbol-function #'read-string)
                (lambda (&rest _) "@me:x.org"))
               ((symbol-function #'completing-read)
@@ -841,12 +979,108 @@ to the agent, newest first."
               ((symbol-function #'leman-e2ee--process-outgoing-requests-sync)
                (lambda (&rest _)
                  (error "verification must not synchronously pump requests")))
-              ((symbol-function #'leman-e2ee--verify-step)
-               (lambda (&rest _) 'done)))
+              (leman-e2ee--active-verification nil))
+      (unwind-protect
+          (progn
+            (leman-e2ee-verify session)
+            (setf dance leman-e2ee--active-verification))
+        (setf leman-e2ee--active-verification nil)))
+    (should (= async-pumps 1))
+    ;; The dance is registered and advances from the sync path.
+    (should (eq (plist-get dance :session) session))
+    (should (equal (plist-get dance :flow-id) "flow1"))
+    (should (equal (plist-get dance :device-id) "ABC"))))
+
+(ert-deftest leman-e2ee-verify-resumes-active-dance ()
+  ;; Verifying again while a dance is in progress continues it (e.g.
+  ;; to answer a deferred prompt) instead of starting a new one.
+  (let* ((session (make-leman-session
+                   :e2ee (leman-e2ee--create)
+                   :user (make-leman-user :id "@me:x.org")))
+         (advanced 0))
+    (cl-letf (((symbol-function #'leman-e2ee--advance-verification)
+               (lambda (&rest _) (cl-incf advanced)))
+              (leman-e2ee--active-verification nil))
+      (leman-e2ee-tests--start-verification session "@me:x.org" "flow1" "ABC")
       (leman-e2ee-verify session))
-    ;; Once before inspecting the completed state, and once to flush
-    ;; anything the final state transition may have queued.
-    (should (= async-pumps 2))))
+    (should (= advanced 1))
+    (setf leman-e2ee--active-verification nil)))
+
+(ert-deftest leman-e2ee--device-annotation-annotates ()
+  ;; Device candidates are annotated with the display name (dimmed)
+  ;; and, when unverified, with a marker: the ID alone is hard to
+  ;; tell apart.
+  (let* ((devices (vector (list (cons 'device_id "ABC")
+                                (cons 'display_name "Element on phone")
+                                (cons 'verified t))
+                          (list (cons 'device_id "DEF")
+                                (cons 'display_name "FluffyChat")
+                                (cons 'verified nil))
+                          (list (cons 'device_id "GHI"))))
+         (result (funcall (leman-e2ee--device-annotation devices)
+                          (list "ABC" "DEF" "GHI"))))
+    (should (equal (nth 0 result) '("ABC" "" "  Element on phone")))
+    (should (equal (nth 1 result) '("DEF" "" "  FluffyChat  unverified")))
+    ;; An unknown verified state counts as unverified (unnamed device).
+    (should (equal (nth 2 result) '("GHI" "" "  unverified")))
+    ;; The annotation text is dimmed; the marker is face-marked.
+    (should (eq (get-text-property 2 'face (nth 2 (nth 0 result))) 'shadow))
+    (should (eq (get-text-property 13 'face (nth 2 (nth 1 result))) 'warning))))
+
+(ert-deftest leman-e2ee-verify-offers-live-devices-with-annotations ()
+  ;; Deleted devices are not offered (there are no keys left to
+  ;; verify), and the picker annotates the rest with their names.
+  (let* ((agent (leman-e2ee--create))
+         (session (make-leman-session
+                   :e2ee agent
+                   :user (make-leman-user :id "@me:x.org")))
+         (collections nil) (affixations nil) (async-pumps 0))
+    (cl-letf (((symbol-function #'read-string)
+               (lambda (&rest _) "@me:x.org"))
+              ((symbol-function #'completing-read)
+               (lambda (_prompt collection &rest _)
+                 (push collection collections)
+                 (push (plist-get completion-extra-properties
+                                  :affixation-function)
+                       affixations)
+                 "ABC"))
+              ((symbol-function #'leman-e2ee-devices)
+               (lambda (&rest _)
+                 (vector (list (cons 'device_id "DEL")
+                               (cons 'display_name "Old device")
+                               (cons 'verified t)
+                               (cons 'deleted t))
+                         (list (cons 'device_id "ABC")
+                               (cons 'display_name "Element on phone")
+                               (cons 'verified nil)))))
+              ((symbol-function #'leman-e2ee-verification-requests)
+               (lambda (&rest _) (vector)))
+              ((symbol-function #'leman-e2ee-request-verification)
+               (lambda (&rest _) "flow1"))
+              ((symbol-function #'leman-e2ee--process-outgoing-requests)
+               (lambda (&rest _) (cl-incf async-pumps)))
+              (leman-e2ee--active-verification nil))
+      (unwind-protect (leman-e2ee-verify session)
+        (setf leman-e2ee--active-verification nil)))
+    ;; Only the live device is offered, with its annotation function.
+    (should (equal (car collections) '("ABC")))
+    (should (= 1 (length affixations)))
+    (should (functionp (car affixations)))))
+
+(ert-deftest leman-e2ee-verify-errors-without-live-devices ()
+  (let* ((agent (leman-e2ee--create))
+         (session (make-leman-session
+                   :e2ee agent
+                   :user (make-leman-user :id "@me:x.org"))))
+    (cl-letf (((symbol-function #'read-string)
+               (lambda (&rest _) "@me:x.org"))
+              ((symbol-function #'leman-e2ee-devices)
+               (lambda (&rest _)
+                 (vector (list (cons 'device_id "DEL")
+                               (cons 'display_name "Old device")
+                               (cons 'deleted t)))))
+              (leman-e2ee--active-verification nil))
+      (should-error (leman-e2ee-verify session) :type 'user-error))))
 
 ;;;; Incoming request announcements
 
@@ -1007,6 +1241,63 @@ to the agent, newest first."
     (leman-e2ee--discard-store "@vv:x.org" "ABC")
     (should-not (file-directory-p abc))
     (should (file-directory-p def))))
+
+(ert-deftest leman-e2ee--existing-device-id-picks-newest-store ()
+  (let* ((leman-e2ee-data-directory (make-temp-file "leman-store-test-" 'dir))
+         (abc (leman-e2ee--store-path "@vv:x.org" "ABC"))
+         (def (leman-e2ee--store-path "@vv:x.org" "DEF")))
+    ;; Without store databases, no device is reclaimable.
+    (should (null (leman-e2ee--existing-device-id "@vv:x.org")))
+    ;; With databases, the most recently modified store wins.
+    (write-region "db" nil (expand-file-name "matrix-sdk-crypto.sqlite3" abc))
+    (sleep-for 0.02)
+    (write-region "db" nil (expand-file-name "matrix-sdk-crypto.sqlite3" def))
+    (should (equal (leman-e2ee--existing-device-id "@vv:x.org") "DEF"))
+    ;; Another user's stores are not theirs.
+    (should (null (leman-e2ee--existing-device-id "@other:x.org")))))
+
+(ert-deftest leman--new-session-reclaims-existing-device ()
+  ;; A fresh login for a user with an E2EE store reclaims that
+  ;; device's identity (its keys and verifications are kept).
+  (let* ((leman-e2ee-data-directory (make-temp-file "leman-store-test-" 'dir))
+         (device-dir (leman-e2ee--store-path "@vv:x.org" "ABC")))
+    (write-region "db" nil (expand-file-name "matrix-sdk-crypto.sqlite3" device-dir))
+    (let ((session (leman--new-session "@vv:x.org" "https://x.org")))
+      (should (equal (leman-session-device-id session) "ABC"))))
+  ;; Without a store, the server mints a device (nil device ID).
+  (let ((leman-e2ee-data-directory (make-temp-file "leman-store-test-" 'dir)))
+    (should (null (leman-session-device-id
+                   (leman--new-session "@vv:x.org" "https://x.org"))))))
+
+(ert-deftest leman--password-login-carries-reclaimed-device-id ()
+  ;; The login request carries the reclaimed device ID so the server
+  ;; logs in as the same device; without one it is omitted entirely
+  ;; (an entry with a nil cdr would encode as null).
+  (let (bodies)
+    (cl-letf (((symbol-function #'leman-api)
+               (lambda (_session _endpoint &rest args)
+                 (push (plist-get args :data) bodies)))
+              ((symbol-function #'read-passwd) (lambda (&rest _) "secret")))
+      (let ((session (make-leman-session
+                      :user (make-leman-user :id "@vv:x.org")
+                      :initial-device-display-name "test"
+                      :device-id "ABC")))
+        (leman--password-login session))
+      (let ((session (make-leman-session
+                      :user (make-leman-user :id "@vv:x.org")
+                      :initial-device-display-name "test")))
+        (leman--password-login session)))
+    (should (equal (json-read-from-string (car (cdr bodies)))
+                   '((type . "m.login.password")
+                     (identifier . ((type . "m.id.user") (user . "@vv:x.org")))
+                     (password . "secret")
+                     (initial_device_display_name . "test")
+                     (device_id . "ABC"))))
+    (should (equal (json-read-from-string (car bodies))
+                   '((type . "m.login.password")
+                     (identifier . ((type . "m.id.user") (user . "@vv:x.org")))
+                     (password . "secret")
+                     (initial_device_display_name . "test"))))))
 
 (ert-deftest leman--response-soft-logout-p ()
   (should (leman--response-soft-logout-p
@@ -1309,6 +1600,72 @@ to the agent, newest first."
                                           ((type . "m.forwarded_room_key"))])))))
         (leman-e2ee--sync-changes session '((next_batch . "s2")))
         (should leman-e2ee--room-keys-arrived-p)))))
+
+(ert-deftest leman-e2ee--sync-changes-survives-dance-and-pump-errors ()
+  ;; The sync path is the only place syncs restart from: a failed
+  ;; dance step or a dead agent request must cost a message, not stop
+  ;; syncing (announce and the backup pump still run).
+  (let* ((session (make-leman-session
+                   :user (make-leman-user :id "@me:x.org")
+                   :e2ee (leman-e2ee--create :pending (make-hash-table :test #'eql))))
+         (announced 0) (pumped 0) (messages nil))
+    (cl-letf (((symbol-function #'leman-e2ee-receive-sync-changes) #'ignore)
+              ((symbol-function #'leman-e2ee--advance-verification)
+               (lambda (&rest _) (signal 'leman-e2ee-error '("timeout" "no response"))))
+              ((symbol-function #'leman-e2ee--process-outgoing-requests)
+               (lambda (&rest _) (signal 'leman-e2ee-error '("timeout" "no response"))))
+              ((symbol-function #'leman-e2ee--announce-requests)
+               (lambda (&rest _) (cl-incf announced)))
+              ((symbol-function #'leman-e2ee--backup-pump)
+               (lambda (&rest _) (cl-incf pumped)))
+              ((symbol-function #'leman-message)
+               (lambda (format &rest args)
+                 (push (apply #'format format args) messages))))
+      (leman-e2ee--sync-changes session '((next_batch . "s1"))))
+    (should (= announced 1))
+    (should (= pumped 1))
+    (should (= 2 (length messages)))
+    ;; The advance error was demoted first, then the pump's.
+    (should (string-match-p "advancing verification failed" (cadr messages)))
+    (should (string-match-p "performing outgoing requests failed" (car messages)))))
+
+(ert-deftest leman--sync-callback-keeps-syncing-through-hook-error ()
+  ;; The sync callback is the only place the next sync is started: an
+  ;; error in a hook must not stop the chain.
+  (let* ((session (make-leman-session :user (make-leman-user :id "@me:x.org")))
+         (syncs 0)
+         (messages nil))
+    (cl-letf (((symbol-function #'leman-e2ee--sync-changes) #'ignore)
+              ((symbol-function #'leman--sync)
+               (lambda (&rest _) (cl-incf syncs)))
+              ((symbol-function #'message)
+               (lambda (format &rest args)
+                 (push (apply #'format format args) messages)))
+              (leman-sync-callback-hook
+               (list (lambda (_session) (error "hook bug"))))
+              (leman-auto-sync t)
+              (leman-syncs nil))
+      (leman--sync-callback session '((next_batch . "s2"))))
+    (should (= syncs 1))
+    (should (equal (leman-session-next-batch session) "s2"))
+    (should (string-match-p "hook bug" (car messages)))))
+
+(ert-deftest leman--sync-callback-does-not-double-sync ()
+  ;; When a hook (e.g. `leman--auto-sync') already started the next
+  ;; sync, the chain-keeping tail must not start another one.
+  (let* ((session (make-leman-session :user (make-leman-user :id "@me:x.org")))
+         (syncs 0))
+    (cl-letf (((symbol-function #'leman-e2ee--sync-changes) #'ignore)
+              ((symbol-function #'leman--sync)
+               (lambda (&rest _)
+                 (cl-incf syncs)
+                 ;; The real sync registers itself; mimic that.
+                 (setf (map-elt leman-syncs session) 'fake-process)))
+              (leman-sync-callback-hook (list #'leman--auto-sync))
+              (leman-auto-sync t)
+              (leman-syncs nil))
+      (leman--sync-callback session '((next_batch . "s2"))))
+    (should (= syncs 1))))
 
 (ert-deftest leman-e2ee--backup-pump-warns-once-when-stale ()
   (let* ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql)))

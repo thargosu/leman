@@ -7,10 +7,13 @@ use anyhow::{anyhow, Context, Result};
 use matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent;
 use matrix_sdk_crypto::{
     secret_storage::{AesHmacSha2EncryptedData, SecretStorageKey},
-    store::types::{BackupDecryptionKey, CrossSigningKeyExport},
+    store::{
+        CryptoStore as _,
+        types::{BackupDecryptionKey, CrossSigningKeyExport, PendingChanges},
+    },
     types::events::room::encrypted::EncryptedEvent,
     types::requests::{AnyOutgoingRequest, OutgoingVerificationRequest},
-    DecryptionSettings, EncryptionSettings, EncryptionSyncChanges, OlmMachine,
+    Account, DecryptionSettings, EncryptionSettings, EncryptionSyncChanges, OlmMachine,
     TrustRequirement,
 };
 use ruma::{
@@ -205,6 +208,23 @@ impl Agent {
             .await
             .context("opening crypto store")
             .map_err(crypto_error)?;
+        // The login that precedes each connection may have re-claimed
+        // the device (the request carried its ID): the homeserver then
+        // resets it, discarding the uploaded device keys (other
+        // clients then report the session as not supporting
+        // encryption).  The persisted account still believes them
+        // shared, and matrix-sdk-crypto offers no re-upload, so clear
+        // the flag directly: the first outgoing_requests pump then
+        // re-uploads the unchanged keys.
+        if let Some(account) = store.load_account().await.map_err(crypto_error)? {
+            let mut pickle = account.pickle();
+            pickle.shared = false;
+            let account = Account::from_pickle(pickle).map_err(crypto_error)?;
+            store
+                .save_pending_changes(PendingChanges { account: Some(account) })
+                .await
+                .map_err(crypto_error)?;
+        }
         let machine = OlmMachine::with_store(&user_id, &device_id, store, None)
             .await
             .map_err(crypto_error)?;

@@ -534,6 +534,26 @@ fn test_initialize() {
     assert_eq!(ok["user_id"], json!("@bob:example.org"));
 }
 
+/// Device keys and signatures are only fetched by a /keys/query.  The
+/// tracked-users set is persisted, so after a restart nothing would
+/// re-query it (signature uploads don't trigger device list changes)
+/// and the devices command would report a stale, typically
+/// all-unverified trust view.  Initialize must therefore mark the
+/// tracked users (including the machine's own user) dirty, so the
+/// first outgoing_requests pump fetches fresh keys.
+#[test]
+fn test_initialize_refreshes_keys_queries() {
+    let mut agent = TestAgent::spawn();
+    let store = TempDir::new().unwrap();
+    agent.request("initialize", initialize_params(&store));
+    let outgoing = agent.request("outgoing_requests", json!({}));
+    let requests = outgoing["ok"]["requests"].as_array().unwrap();
+    let has_keys_query = requests
+        .iter()
+        .any(|request| request["path"] == json!("/_matrix/client/v3/keys/query"));
+    assert!(has_keys_query, "expected a keys/query after initialize");
+}
+
 /// The elisp side re-encodes sync data with `json-serialize', which
 /// encodes absent sync fields (nil) as empty objects ({}), not null.
 /// The agent must accept both forms for all optional sync fields.

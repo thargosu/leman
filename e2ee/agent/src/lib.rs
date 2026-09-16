@@ -208,6 +208,23 @@ impl Agent {
         let machine = OlmMachine::with_store(&user_id, &device_id, store, None)
             .await
             .map_err(crypto_error)?;
+        // The device keys, signatures and cross-signing identities are
+        // only fetched by a /keys/query.  The tracked-users set is
+        // persisted, so after a restart nothing would re-query it:
+        // signature uploads (e.g. other clients verifying a device) do
+        // not trigger device list changes, and re-tracking known users
+        // is a no-op.  The devices command would then report a stale
+        // (typically all-unverified) trust view.  Refresh everything:
+        // the first outgoing_requests pump then fetches fresh keys for
+        // every tracked user, as other clients do on startup.
+        machine
+            .update_tracked_users([machine.user_id()])
+            .await
+            .map_err(crypto_error)?;
+        machine
+            .mark_all_tracked_users_as_dirty()
+            .await
+            .map_err(crypto_error)?;
         let identity_keys = machine.identity_keys();
         let response = json!({
             "user_id": user_id,

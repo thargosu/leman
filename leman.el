@@ -725,22 +725,34 @@ a new one is started."
       (let* ((own-user (leman-user-id (leman-session-user session)))
              (user-id (read-string
                        (format "Verify a device of user (default %s): " own-user)
-                       nil nil own-user))
-             (devices (leman-e2ee-devices agent user-id))
-             (device-ids (mapcar (lambda (device)
-                                   (alist-get 'device_id device))
-                                 (seq-remove (lambda (device)
-                                               ;; Deleted devices have no
-                                               ;; keys left to verify.
-                                               (alist-get 'deleted device))
-                                             devices)))
-             (device-id (if device-ids
-                            (let ((completion-extra-properties
-                                   (list :affixation-function
-                                         (leman-e2ee--device-annotation devices))))
-                              (completing-read "Device: " device-ids nil t))
-                          (user-error "Leman E2EE: no devices to verify for %s"
-                                      user-id))))
+                       nil nil own-user)))
+        ;; The picker's ~verified~ state is Leman's own view.  Devices
+        ;; verified by other clients carry their signatures on the
+        ;; homeserver; without the account's private cross-signing keys
+        ;; the agent cannot trust the signing chain, so such devices
+        ;; show as unverified (only verifications done from here count
+        ;; locally).
+        (when (and (equal user-id own-user)
+                   (let ((status (ignore-errors
+                                   (leman-e2ee-cross-signing-status agent))))
+                     (and status (not (alist-get 'has_master status)))))
+          (leman-message
+           "Leman E2EE: the agent does not hold the private cross-signing keys, so devices verified by other clients show as unverified; import them with M-x leman-e2ee-import-cross-signing-keys (needs them in secret storage) or verify the devices from here"))
+        (let* ((devices (leman-e2ee-devices agent user-id))
+               (device-ids (mapcar (lambda (device)
+                                     (alist-get 'device_id device))
+                                   (seq-remove (lambda (device)
+                                                 ;; Deleted devices have no
+                                                 ;; keys left to verify.
+                                                 (alist-get 'deleted device))
+                                               devices)))
+               (device-id (if device-ids
+                              (let ((completion-extra-properties
+                                     (list :affixation-function
+                                           (leman-e2ee--device-annotation devices))))
+                                (completing-read "Device: " device-ids nil t))
+                            (user-error "Leman E2EE: no devices to verify for %s"
+                                        user-id))))
         ;; A locally-verified device may still be unsigned (verified
         ;; before the private cross-signing keys were imported): the
         ;; signature is only uploaded during a dance, so re-running is
@@ -775,7 +787,7 @@ a new one is started."
                    device-id user-id)
           ;; The dance's to-device events travel with the session's
           ;; syncs; send the request now rather than at the next sync.
-          (leman-e2ee--process-outgoing-requests session))))))
+          (leman-e2ee--process-outgoing-requests session)))))))
 
 (defun leman-e2ee--decrypt-event (session event &optional room-id)
   "Decrypt EVENT (from ROOM-ID) with SESSION's E2EE agent.

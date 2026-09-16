@@ -1082,6 +1082,42 @@ must still clear it afterwards (e.g. with `unwind-protect')."
               (leman-e2ee--active-verification nil))
       (should-error (leman-e2ee-verify session) :type 'user-error))))
 
+(ert-deftest leman-e2ee-verify-hints-about-missing-cross-signing-keys ()
+  ;; Devices verified by other clients only count once the agent holds
+  ;; the private cross-signing keys: without them the trust view shows
+  ;; everything unverified, and the user must be told why.
+  (let* ((fake (leman-e2ee-tests--fake-agent
+                (list (cons 'cross_signing_status
+                            (list (cons 'has_master nil)
+                                  (cons 'has_self_signing nil)
+                                  (cons 'has_user_signing nil))))))
+         (session (make-leman-session
+                   :e2ee (car fake)
+                   :user (make-leman-user :id "@me:x.org")))
+         (messages nil))
+    (cl-letf (((symbol-function #'leman-message)
+               (lambda (format &rest args)
+                 (push (apply #'format format args) messages)))
+              ((symbol-function #'read-string)
+               (lambda (&rest _) "@me:x.org"))
+              ((symbol-function #'completing-read)
+               (lambda (&rest _) "ABC"))
+              ((symbol-function #'leman-e2ee-devices)
+               (lambda (&rest _)
+                 (vector (list (cons 'device_id "ABC")
+                               (cons 'display_name "Element")
+                               (cons 'verified nil)))))
+              ((symbol-function #'leman-e2ee-verification-requests)
+               (lambda (&rest _) (vector)))
+              ((symbol-function #'leman-e2ee-request-verification)
+               (lambda (&rest _) "flow1"))
+              ((symbol-function #'leman-e2ee--process-outgoing-requests)
+               (lambda (&rest _)))
+              (leman-e2ee--active-verification nil))
+      (unwind-protect (leman-e2ee-verify session)
+        (setf leman-e2ee--active-verification nil)))
+    (should (string-match-p "cross-signing" (car messages)))))
+
 ;;;; Incoming request announcements
 
 (ert-deftest leman-e2ee--announce-requests-announces-new-incoming ()

@@ -270,8 +270,20 @@ Lists a user's known devices (the machine's own user by default).
    "verified": false, "deleted": false}]}}
 #+end_src
 
-~verified~ is the device's trust state (signature and cross-signing
-checks, plus local trust).
+~verified~ is the device's trust state: local trust (a SAS
+verification done by this machine) or a valid cross-signing chain
+(the device is signed by its owner's self-signing key, and for the
+machine's own user the master key counts as trusted only when the
+machine holds the matching *private* cross-signing keys, e.g. via
+~import_cross_signing_keys~).
+
+NOTE: this is the machine's *local* view, computed from its cached
+keys.  The homeserver stores no trust flags: it only stores the
+signatures, which are fetched by ~/keys/query~.  Signature uploads
+do not trigger device list changes, and the tracked-users set is
+persisted, so ~initialize~ marks all tracked users dirty to force
+a fresh query; without it a restarted machine would report a stale
+(typically all-unverified) view.
 
 ** ~request_verification~
 

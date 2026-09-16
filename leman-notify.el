@@ -285,7 +285,7 @@ If ROOM has no existing buffer, do nothing."
       ;; If event has no body, it was probably redacted or something, so don't notify.
       (truncate-string-to-width body 60)
       (notifications-notify :title title :body body
-                            :app-name "Leman.el"
+                            :app-name "Léman"
                             :app-icon (or (when avatar
                                             (leman-notify--temp-file
                                              (plist-get (cdr (get-text-property 0 'display avatar)) :data)))

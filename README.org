@@ -1,4 +1,4 @@
-#+TITLE: Leman.el
+#+TITLE: Léman
 
 #+begin_quote
 /YODELLING: Yodelling Or Does Emacs Lack Léman? It’s No Guess. 😏/
@@ -45,7 +45,7 @@ Coming soon.
 With =package-vc= (Emacs 29+):
 
 #+begin_src elisp
-  (package-vc-install "https://github.com/thargosu/leman.el")
+  (package-vc-install "https://github.com/thargosu/leman")
 #+end_src
 
 Then:

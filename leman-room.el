@@ -116,14 +116,14 @@ Should be used to, e.g. propagate variables to the minibuffer.")
   "Hook run in compose buffers when created.
 Used to, e.g. call `leman-room-compose-org'.")
 
-(declare-function leman-room-list "leman-room-list.el")
+(declare-function leman-room-list "leman-room-list")
 (declare-function leman-view-space "leman-directory")
 (declare-function leman-notify-switch-to-mentions-buffer "leman-notify")
 (declare-function leman-notify-switch-to-notifications-buffer "leman-notify")
-(declare-function leman--update-unread-indicator "leman.el")
-(declare-function leman--make-event "leman.el")
-(declare-function leman-e2ee--decrypt-event-struct "leman.el")
-(declare-function leman-e2ee--retry-decryption "leman.el")
+(declare-function leman--update-unread-indicator "leman")
+(declare-function leman--make-event "leman")
+(declare-function leman-e2ee--decrypt-event-struct "leman")
+(declare-function leman-e2ee--retry-decryption "leman")
 
 (defvar leman-room-mode-self-insert-keymap (make-sparse-keymap)
   "The `leman-room-mode' keymap under `leman-room-self-insert-mode'.
@@ -1704,11 +1704,11 @@ are passed to `browse-url'."
                (cadr (leman--read-multiple-choice
                       (format "Room <%s> not joined on current session.  Join it, or load link with browser?"
                               (or room-alias room-id))
-                      '((?j "join" "Join room in leman.el")
+                      '((?j "join" "Join room in Léman")
                         (?w "web browser" "Open URL in web browser"))
                       "\
 You are not currently joined to that room.  You can either join the room
-in leman.el, or visit the link URL in your web browser."))
+in Léman, or visit the link URL in your web browser."))
              ("join"
               (leman-join-room (or room-alias room-id) leman-session
                                :then (when event-id
@@ -2102,7 +2102,7 @@ are sync batch tokens.  Used for, e.g. filling gaps in
                             plz-error))))))
 
 ;; NOTE: `declare-function' doesn't recognize cl-defun forms, so this declaration doesn't work.
-(declare-function leman--sync "leman.el" t t)
+(declare-function leman--sync "leman" t t)
 (defun leman-room-sync (session &optional force)
   "Sync SESSION (interactively, current buffer's).
 If FORCE (interactively, with prefix), cancel any outstanding
@@ -2595,8 +2595,8 @@ Convert the events to `leman-event' structs, discarding events
 already known to SESSION, and return the new events as a list."
   ;; NOTE: The events are converted in place in the vector, which is
   ;; regrettable, but it's how we discard already-seen events.
-  (declare (function leman--make-event "leman.el")
-           (function leman--put-event "leman.el"))
+  (declare (function leman--make-event "leman")
+           (function leman--put-event "leman"))
   (cl-loop for event across-ref chunk
            do (if (gethash (alist-get 'event_id event) (leman-session-events session))
                   ;; Duplicate event: set to nil to be ignored.
@@ -2636,8 +2636,8 @@ If SET-PREV-BATCH is nil, don't set ROOM's prev-batch slot to the
 \"prev_batch\" token in response DATA (this should be set,
 e.g. when filling timeline gaps as opposed to retrieving messages
 before the earliest-seen message)."
-  (declare (function leman--make-event "leman.el")
-           (function leman--put-event "leman.el"))
+  (declare (function leman--make-event "leman")
+           (function leman--put-event "leman"))
   (pcase-let* (((cl-struct leman-room local) room)
 	       ((map _start end chunk state) data)
                 ((map buffer) local)
@@ -3135,7 +3135,7 @@ from sync responses with unexpected formats; nils, e.g. from
 `leman-room--process-retro-chunk'.  Since event slots are
 iterable by many functions which expect structs (e.g.
 `leman--user-displayname-in'), convert or discard such entries."
-  (declare (function leman--make-event "leman.el"))
+  (declare (function leman--make-event "leman"))
   (cl-loop for event in events
            when event
            collect (if (leman-event-p event)

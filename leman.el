@@ -132,7 +132,7 @@ Writes the session file when Emacs is killed."
              (add-hook 'kill-emacs-hook #'leman--kill-emacs-hook)
            (remove-hook 'kill-emacs-hook #'leman--kill-emacs-hook))))
 
-(defcustom leman-sessions-file "~/.cache/leman.el"
+(defcustom leman-sessions-file "~/.cache/leman"
   ;; FIXME: Expand correct XDG cache directory (new in Emacs 27).
   "Save username and access token to this file."
   :type 'file)
@@ -2885,7 +2885,7 @@ To be called after initial sync."
 
 (require 'transient)
 
-;; These files are not required by leman.el (leman-tabulated-room-list
+;; These files are not required by leman (leman-tabulated-room-list
 ;; requires leman, so it cannot be required here), but their commands
 ;; are autoloaded.
 (declare-function leman-list-rooms "leman-room-list")

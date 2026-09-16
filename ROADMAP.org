@@ -1,6 +1,6 @@
 #+TITLE: Leman Roadmap
 
-Roadmap and plans for Leman.el.  (Supersedes the notes lost with
+Roadmap and plans for Léman.  (Supersedes the notes lost with
 the old ~meta/notes~ worktree; ~NOTES.org~ remains a symlink
 inherited from upstream.)
 

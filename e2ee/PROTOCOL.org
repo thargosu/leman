@@ -1,6 +1,6 @@
 #+TITLE: Leman E2EE Agent Protocol
 
-The protocol between Leman.el (the client) and the ~leman-agent~
+The protocol between Léman (the client) and the ~leman-agent~
 subprocess (the agent), which wraps the ~matrix-sdk-crypto~ state
 machine.  Protocol version 1.
 

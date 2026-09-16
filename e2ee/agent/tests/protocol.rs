@@ -554,57 +554,6 @@ fn test_initialize_refreshes_keys_queries() {
     assert!(has_keys_query, "expected a keys/query after initialize");
 }
 
-/// A login that re-claims the device (the request carried its ID)
-/// resets it on the homeserver, discarding the uploaded device keys.
-/// The persisted account believes them still shared, so initialize
-/// must clear that flag: the first outgoing_requests pump of a fresh
-/// connection then re-uploads the unchanged keys, healing the
-/// session (other clients otherwise report it as not supporting
-/// encryption).
-#[test]
-fn test_initialize_uploads_device_keys_after_relogin() {
-    let store = TempDir::new().unwrap();
-
-    // First connection: a fresh account uploads its device keys.
-    let mut agent = TestAgent::spawn();
-    agent.request("initialize", initialize_params(&store));
-    let outgoing = agent.request("outgoing_requests", json!({}));
-    let upload = outgoing["ok"]["requests"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|request| request["path"] == json!("/_matrix/client/v3/keys/upload"))
-        .expect("a keys/upload on the first connection")
-        .clone();
-    assert!(
-        upload["body"].as_str().unwrap().contains("device_keys"),
-        "the first upload must carry the device keys: {upload}"
-    );
-    // Report it as sent: the account is then marked as shared, as in
-    // a normal session.
-    agent.request(
-        "mark_request_as_sent",
-        json!({"request_id": upload["id"], "response": {"one_time_key_counts": {}}}),
-    );
-    drop(agent);
-
-    // A fresh connection on the same device (e.g. after a relogin)
-    // must re-upload the device keys.
-    let mut agent = TestAgent::spawn();
-    agent.request("initialize", initialize_params(&store));
-    let outgoing = agent.request("outgoing_requests", json!({}));
-    let upload = outgoing["ok"]["requests"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|request| request["path"] == json!("/_matrix/client/v3/keys/upload"))
-        .expect("device keys must be re-uploaded after a relogin");
-    assert!(
-        upload["body"].as_str().unwrap().contains("device_keys"),
-        "the re-upload must carry the device keys: {upload}"
-    );
-}
-
 /// The elisp side re-encodes sync data with `json-serialize', which
 /// encodes absent sync fields (nil) as empty objects ({}), not null.
 /// The agent must accept both forms for all optional sync fields.

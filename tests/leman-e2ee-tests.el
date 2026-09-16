@@ -36,8 +36,8 @@
 (declare-function leman-e2ee--advance-verification "leman")
 (declare-function leman-e2ee--prompt-sas "leman")
 (declare-function leman-e2ee--device-annotation "leman")
-(declare-function leman-e2ee--existing-device-id "leman-e2ee")
 (declare-function leman--password-login "leman")
+(declare-function leman--sso-login-with-token "leman")
 (declare-function leman--new-session "leman")
 (declare-function leman-e2ee--process-outgoing-requests "leman")
 (declare-function leman-e2ee--process-outgoing-requests-sync "leman")
@@ -1278,61 +1278,57 @@ must still clear it afterwards (e.g. with `unwind-protect')."
     (should-not (file-directory-p abc))
     (should (file-directory-p def))))
 
-(ert-deftest leman-e2ee--existing-device-id-picks-newest-store ()
-  (let* ((leman-e2ee-data-directory (make-temp-file "leman-store-test-" 'dir))
-         (abc (leman-e2ee--store-path "@vv:x.org" "ABC"))
-         (def (leman-e2ee--store-path "@vv:x.org" "DEF")))
-    ;; Without store databases, no device is reclaimable.
-    (should (null (leman-e2ee--existing-device-id "@vv:x.org")))
-    ;; With databases, the most recently modified store wins.
-    (write-region "db" nil (expand-file-name "matrix-sdk-crypto.sqlite3" abc))
-    (sleep-for 0.02)
-    (write-region "db" nil (expand-file-name "matrix-sdk-crypto.sqlite3" def))
-    (should (equal (leman-e2ee--existing-device-id "@vv:x.org") "DEF"))
-    ;; Another user's stores are not theirs.
-    (should (null (leman-e2ee--existing-device-id "@other:x.org")))))
-
-(ert-deftest leman--new-session-reclaims-existing-device ()
-  ;; A fresh login for a user with an E2EE store reclaims that
-  ;; device's identity (its keys and verifications are kept).
+(ert-deftest leman--new-session-does-not-reclaim-existing-device ()
+  ;; A fresh login must receive a new device ID even if an old store
+  ;; remains.  Reclaiming it can make the homeserver remove its keys.
   (let* ((leman-e2ee-data-directory (make-temp-file "leman-store-test-" 'dir))
          (device-dir (leman-e2ee--store-path "@vv:x.org" "ABC")))
     (write-region "db" nil (expand-file-name "matrix-sdk-crypto.sqlite3" device-dir))
     (let ((session (leman--new-session "@vv:x.org" "https://x.org")))
-      (should (equal (leman-session-device-id session) "ABC"))))
-  ;; Without a store, the server mints a device (nil device ID).
-  (let ((leman-e2ee-data-directory (make-temp-file "leman-store-test-" 'dir)))
-    (should (null (leman-session-device-id
-                   (leman--new-session "@vv:x.org" "https://x.org"))))))
+      (should (null (leman-session-device-id session))))))
 
-(ert-deftest leman--password-login-carries-reclaimed-device-id ()
-  ;; The login request carries the reclaimed device ID so the server
-  ;; logs in as the same device; without one it is omitted entirely
-  ;; (an entry with a nil cdr would encode as null).
+(ert-deftest leman--password-login-omits-device-id ()
+  ;; An absent device ID must stay absent: an alist entry with a nil
+  ;; cdr would encode as null instead of asking the server to mint one.
   (let (bodies)
     (cl-letf (((symbol-function #'leman-api)
                (lambda (_session _endpoint &rest args)
                  (push (plist-get args :data) bodies)))
               ((symbol-function #'read-passwd) (lambda (&rest _) "secret")))
-      (let ((session (make-leman-session
-                      :user (make-leman-user :id "@vv:x.org")
-                      :initial-device-display-name "test"
-                      :device-id "ABC")))
-        (leman--password-login session))
+      ;; Ignore even a stale in-memory ID: this login creates a new
+      ;; device rather than reclaiming the old one.
+      (leman--password-login
+       (make-leman-session
+        :user (make-leman-user :id "@vv:x.org")
+        :initial-device-display-name "test"
+        :device-id "ABC"))
       (let ((session (make-leman-session
                       :user (make-leman-user :id "@vv:x.org")
                       :initial-device-display-name "test")))
         (leman--password-login session)))
-    (should (equal (json-read-from-string (car (cdr bodies)))
-                   '((type . "m.login.password")
+    (dolist (body bodies)
+      (should (equal (json-read-from-string body)
+                     '((type . "m.login.password")
+                       (identifier . ((type . "m.id.user") (user . "@vv:x.org")))
+                       (password . "secret")
+                       (initial_device_display_name . "test")))))))
+
+(ert-deftest leman--sso-login-omits-device-id ()
+  "An SSO login also creates a new device."
+  (let (body)
+    (cl-letf (((symbol-function #'leman-api)
+               (lambda (_session _endpoint &rest args)
+                 (setf body (plist-get args :data)))))
+      (leman--sso-login-with-token
+       "token"
+       (make-leman-session
+        :user (make-leman-user :id "@vv:x.org")
+        :initial-device-display-name "test"
+        :device-id "ABC")))
+    (should (equal (json-read-from-string body)
+                   '((type . "m.login.token")
                      (identifier . ((type . "m.id.user") (user . "@vv:x.org")))
-                     (password . "secret")
-                     (initial_device_display_name . "test")
-                     (device_id . "ABC"))))
-    (should (equal (json-read-from-string (car bodies))
-                   '((type . "m.login.password")
-                     (identifier . ((type . "m.id.user") (user . "@vv:x.org")))
-                     (password . "secret")
+                     (token . "token")
                      (initial_device_display_name . "test"))))))
 
 (ert-deftest leman--response-soft-logout-p ()

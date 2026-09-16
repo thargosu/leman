@@ -733,8 +733,7 @@ re-created); each re-render must not start another download."
 
 (ert-deftest leman--sessions-round-trip-device-id ()
   "The device ID round-trips through the saved sessions file.
-Restoring it lets the login reclaim the device (and E2EE skip its
-whoami call), so verifications survive restarts."
+Restoring it lets E2EE skip its whoami call."
   (let* ((leman-sessions-file (make-temp-file "leman-sessions-test-"))
          (session (make-leman-session
                    :user (make-leman-user :id "@vv:x.org" :username "vv")

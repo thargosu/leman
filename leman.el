@@ -226,22 +226,17 @@ It shouldn't usually be necessary to change this."
          (server (make-leman-server :name server-name :uri-prefix uri-prefix))
          (transaction-id (leman--initial-transaction-id))
          (initial-device-display-name (leman--device-display-name))
-         ;; A fresh login reclaims the user's existing E2EE device,
-         ;; if any: the login request carries the store's device ID,
-         ;; so the same device identity and its verified keys are
-         ;; kept across logins, like other Matrix clients do.  With
-         ;; no store, device-id is nil and the server mints one.
-         (device-id (leman-e2ee--existing-device-id user-id)))
-    (when device-id
-      (leman-message "Leman: reusing device %s (its keys and verifications are kept)"
-                     device-id))
+         ;; A fresh login must not claim an existing device: some
+         ;; homeservers clear its uploaded keys, leaving it unable to
+         ;; encrypt.  Saved sessions retain their device ID instead.
+         (device-id nil))
     (make-leman-session :user user :server server :transaction-id transaction-id
                         :device-id device-id :initial-device-display-name initial-device-display-name
                         :events (make-hash-table :test #'equal))))
 
 (defun leman--password-login (session &optional password)
   "Log in to SESSION using PASSWORD, prompting if not given."
-  (pcase-let* (((cl-struct leman-session user initial-device-display-name device-id) session)
+  (pcase-let* (((cl-struct leman-session user initial-device-display-name) session)
                ((cl-struct leman-user id) user)
                (data (leman-alist "type" "m.login.password"
                                   "identifier"
@@ -249,12 +244,8 @@ It shouldn't usually be necessary to change this."
                                                "user" id)
                                   "password" (or password
                                                  (read-passwd (format "Password for %s: " id)))
+                                  ;; No device_id: the server mints one.
                                   "initial_device_display_name" initial-device-display-name)))
-    ;; NOTE: device_id is omitted when nil (an alist entry with a nil
-    ;; cdr would encode as null): the server then mints a device.
-    ;; Otherwise the login reclaims the existing device.
-    (when device-id
-      (setf data (append data (list (cons "device_id" device-id)))))
     ;; TODO: Clear password in callback (if we decide to hold on to it for retrying login timeouts).
     (leman-api session "login" :method 'post :data (json-encode data)
       :then (apply-partially #'leman--login-callback session))
@@ -262,17 +253,15 @@ It shouldn't usually be necessary to change this."
 
 (defun leman--sso-login-with-token (token session)
   "Submit SSO login TOKEN for SESSION."
-  (pcase-let* (((cl-struct leman-session user initial-device-display-name device-id) session)
+  (pcase-let* (((cl-struct leman-session user initial-device-display-name) session)
                ((cl-struct leman-user id) user)
                (data (leman-alist
                       "type" "m.login.token"
                       "identifier" (leman-alist "type" "m.id.user"
                                                 "user" id)
                       "token" token
+                      ;; No device_id: the server mints one.
                       "initial_device_display_name" initial-device-display-name)))
-    ;; NOTE: See `leman--password-login': device_id is omitted when nil.
-    (when device-id
-      (setf data (append data (list (cons "device_id" device-id)))))
     (leman-api session "login" :method 'post
       :data (json-encode data)
       :then (apply-partially #'leman--login-callback session))))
@@ -2620,8 +2609,8 @@ Returns nil if unable to read `leman-sessions-file'."
                 (pcase-let* (((cl-struct leman-session user server token transaction-id device-id) session)
                              ((cl-struct leman-user (id user-id) username) user)
                              ((cl-struct leman-server (name server-name) uri-prefix) server))
-                  ;; The device ID is saved so the login can reclaim
-                  ;; the device (and E2EE can skip the whoami call).
+                  ;; The device ID is saved so a restored session can
+                  ;; start E2EE without a whoami request.
                   (list :user (list :id user-id
                                     :username username)
                         :server (list :name server-name

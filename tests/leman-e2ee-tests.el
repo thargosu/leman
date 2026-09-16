@@ -1008,8 +1008,8 @@ must still clear it afterwards (e.g. with `unwind-protect')."
 
 (ert-deftest leman-e2ee--device-annotation-annotates ()
   ;; Device candidates are annotated with the display name (dimmed)
-  ;; and, when unverified, with a marker: the ID alone is hard to
-  ;; tell apart.
+  ;; and a trust marker: green ~verified~, warning ~unverified~.  The
+  ;; ID alone is hard to tell apart.
   (let* ((devices (vector (list (cons 'device_id "ABC")
                                 (cons 'display_name "Element on phone")
                                 (cons 'verified t))
@@ -1019,12 +1019,12 @@ must still clear it afterwards (e.g. with `unwind-protect')."
                           (list (cons 'device_id "GHI"))))
          (result (funcall (leman-e2ee--device-annotation devices)
                           (list "ABC" "DEF" "GHI"))))
-    (should (equal (nth 0 result) '("ABC" "" "  Element on phone")))
+    (should (equal (nth 0 result) '("ABC" "" "  Element on phone  verified")))
     (should (equal (nth 1 result) '("DEF" "" "  FluffyChat  unverified")))
     ;; An unknown verified state counts as unverified (unnamed device).
     (should (equal (nth 2 result) '("GHI" "" "  unverified")))
-    ;; The annotation text is dimmed; the marker is face-marked.
-    (should (eq (get-text-property 2 'face (nth 2 (nth 0 result))) 'shadow))
+    ;; The annotation text is dimmed; the markers are face-marked.
+    (should (eq (get-text-property 20 'face (nth 2 (nth 0 result))) 'success))
     (should (eq (get-text-property 13 'face (nth 2 (nth 1 result))) 'warning))))
 
 (ert-deftest leman-e2ee-verify-offers-live-devices-with-annotations ()

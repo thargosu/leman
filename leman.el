@@ -547,10 +547,10 @@ first."
 (defun leman-e2ee--device-annotation (devices)
   "Return an affixation function annotating device candidates from DEVICES.
 Candidates are device IDs, which alone are hard to tell apart:
-each is annotated with its display name (dimmed) and, when the
-device is not verified, with an ~unverified~ marker.  Any
-completion UI with marginalia-like annotations (the default
-*Completions*, vertico, ...) displays it."
+each is annotated with its display name (dimmed) and a marker
+stating the trust state, green ~verified~ or warning-colored
+~unverified~.  Any completion UI with marginalia-like annotations
+(the default *Completions*, vertico, ...) displays it."
   (lambda (candidates)
     (mapcar
      (lambda (candidate)
@@ -562,9 +562,9 @@ completion UI with marginalia-like annotations (the default
          (list candidate ""
                (concat (when name
                          (propertize (format "  %s" name) 'face 'shadow))
-                       (unless verified
-                         (propertize "  unverified" 'face 'warning))))))
-     candidates)))
+                       (propertize (format "  %s" (if verified "verified" "unverified"))
+                                   'face (if verified 'success 'warning))))))
+      candidates)))
 
 (defcustom leman-e2ee-verify-confirm-function
   #'leman-e2ee--verify-confirm

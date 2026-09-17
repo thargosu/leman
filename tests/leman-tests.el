@@ -748,6 +748,33 @@ Restoring it lets E2EE skip its whoami call."
       (should (equal (leman-session-token restored) "tok"))
       (should (equal (leman-user-id (leman-session-user restored)) "@vv:x.org")))))
 
+(ert-deftest leman-ignore-user-sends-empty-object-values ()
+  ;; The spec requires each ignored user's value to be an empty
+  ;; object; elisp's nil would encode as null (AGENTS.md), so the
+  ;; body is built by hand and sent verbatim.
+  ;; NOTE: Session account-data holds raw decoded events (sync
+  ;; responses), not event structs; empty map values decode to nil
+  ;; cdrs (e.g. IGNORED = ((@bad:x.org))).
+  (let* ((ignored-alist (list (cons '@bad:x.org nil)))
+         (content-alist (list (cons 'ignored_users ignored-alist)))
+         (session (make-leman-session
+                   :user (make-leman-user :id "@me:x.org")
+                   :server (make-leman-server :name "x.org" :uri-prefix "https://x.org")
+                   :account-data
+                   (list (list (cons 'type "m.ignored_user_list")
+                               (cons 'content content-alist)))))
+         (requests nil))
+    (cl-letf (((symbol-function #'leman-api)
+               (lambda (_session _endpoint &rest args)
+                 (push (plist-get args :data) requests))))
+      (leman-ignore-user "@other:x.org" session)
+      (should (equal (car requests)
+                     "{\"ignored_users\":{\"@other:x.org\":{},\"@bad:x.org\":{}}}"))
+      ;; Unignoring removes the entry without corrupting the rest.
+      (leman-ignore-user "@other:x.org" session 'unignore)
+      (should (equal (car requests)
+                     "{\"ignored_users\":{\"@bad:x.org\":{}}}")))))
+
 (provide 'leman-tests)
 
 ;;; leman-tests.el ends here

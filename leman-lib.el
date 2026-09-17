@@ -111,7 +111,7 @@ that stray such forms don't remain if the function is removed."
 
 ;;;;; Emacs 28 color features.
 
-;; Copied from Emacs 28.  See <https://github.com/alphapapa/ement.el/issues/99>.
+;; Copied from Emacs 28.
 
 ;; TODO(future): Remove these workarounds when dropping support for Emacs <28.
 
@@ -304,9 +304,28 @@ If UNIGNORE-P (interactively, with prefix), un-ignore USER."
         (setf ignored-users (map-delete ignored-users (intern user-id)))
       ;; Empty maps are used to list ignored users.
       (setf (map-elt ignored-users user-id) nil))
-    (leman-put-account-data session "m.ignored_user_list" (leman-alist "ignored_users" ignored-users)
-      :then (lambda (data)
-              (leman-debug "PUT successful" data)
+    ;; The spec requires each ignored user's value to be an empty
+    ;; object, which elisp cannot represent (an entry with a nil cdr
+    ;; re-encodes as null; see AGENTS.md): build the JSON body by
+    ;; hand, sending it verbatim.
+    (leman-api session (format "user/%s/account_data/m.ignored_user_list"
+                               (url-hexify-string
+                                (leman-user-id (leman-session-user session))))
+      :method 'put
+      :data (concat "{\"ignored_users\":{"
+                    (mapconcat (lambda (ignored)
+                                 ;; Keys are interned symbols for user
+                                 ;; IDs from `json-read'; a fresh
+                                 ;; account's setf'd entry is
+                                 ;; string-keyed.
+                                 (let ((ignored-id (car ignored)))
+                                   (format "%S:{}"
+                                           (if (symbolp ignored-id)
+                                               (symbol-name ignored-id)
+                                             ignored-id))))
+                               ignored-users ",")
+                    "}}")
+      :then (lambda (_data)
               (message "Leman: User %s %s." user-id (if unignore-p "unignored" "ignored"))))))
 
 (defun leman-invite-user (user-id room session)
@@ -1839,30 +1858,35 @@ Or call ELSE with error data if request fails.  Also puts members
 on `leman-users', updating their displayname and avatar URL
 slots, and puts them on ROOM's `members' table."
   (declare (indent defun))
-  (pcase-let* (((cl-struct leman-room id members) room)
-               (endpoint (format "rooms/%s/joined_members" (url-hexify-string id))))
-    (leman-api session endpoint
-      :else else
-      :then (lambda (data)
-              (clrhash members)
-              (mapc (lambda (member)
-                      (pcase-let* ((`(,id-symbol
-                                      . ,(map ('avatar_url avatar-url)
-                                              ('display_name display-name)))
-                                    member)
-                                   (member-id (symbol-name id-symbol))
-                                   (user (or (gethash member-id leman-users)
-                                             (puthash member-id (make-leman-user :id member-id)
-                                                      leman-users))))
-                        (setf (leman-user-displayname user) display-name
-                              (leman-user-avatar-url user) avatar-url)
-                        (puthash member-id user members)))
-                    (alist-get 'joined data))
-              (setf (alist-get 'fetched-members-p (leman-room-local room)) t)
-              (when then
-                ;; Finally, call the given callback.
-                (funcall then data))))
-    (message "Leman: Getting joined members in %s..." (leman--format-room room))))
+  (leman-api session (format "rooms/%s/joined_members" (url-hexify-string (leman-room-id room)))
+    :else else
+    :then (lambda (data)
+            (leman--put-joined-members room data)
+            (when then
+              ;; Finally, call the given callback.
+              (funcall then data))))
+  (message "Leman: Getting joined members in %s..." (leman--format-room room)))
+
+(defun leman--put-joined-members (room data)
+  "Put the joined members from a /joined_members response DATA in ROOM.
+Also puts them on `leman-users', updating their displayname and
+avatar URL slots."
+  (let ((members (leman-room-members room)))
+    (clrhash members)
+    (mapc (lambda (member)
+            (pcase-let* ((`(,id-symbol
+                            . ,(map ('avatar_url avatar-url)
+                                    ('display_name display-name)))
+                          member)
+                         (member-id (symbol-name id-symbol))
+                         (user (or (gethash member-id leman-users)
+                                   (puthash member-id (make-leman-user :id member-id)
+                                            leman-users))))
+              (setf (leman-user-displayname user) display-name
+                    (leman-user-avatar-url user) avatar-url)
+              (puthash member-id user members)))
+          (alist-get 'joined data))
+    (setf (alist-get 'fetched-members-p (leman-room-local room)) t)))
 
 (cl-defun leman--human-format-duration (seconds &optional abbreviate)
   "Return human-formatted string describing duration SECONDS.

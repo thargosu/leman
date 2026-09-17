@@ -213,6 +213,45 @@ to the agent, newest first."
             (should (alist-get 'body request))))
       (leman-e2ee-stop agent))))
 
+(ert-deftest leman-e2ee-real-mark-request-as-sent-null-maps ()
+  :tags '(e2ee-real)
+  (skip-unless (leman-e2ee-tests--agent-program))
+  (let* ((leman-e2ee-agent-program (leman-e2ee-tests--agent-program))
+         (store (make-temp-file "leman-e2ee-test-" t))
+         (agent (leman-e2ee-start "@bob:example.org" "TESTDEVICE" store)))
+    (unwind-protect
+        (progn
+          (leman-e2ee-update-tracked-users agent (vector "@alice:example.org"))
+          (let ((query (leman-e2ee-tests--find-outgoing-request agent "/keys/query")))
+            (should query)
+            ;; This is exactly what elisp sends for a decoded,
+            ;; spec-conformant {"device_keys": {"@alice:x.org": {}},
+            ;; "failures": {}}: json-read turns empty maps into nil
+            ;; cdrs, json-encode into null (AGENTS.md, the
+            ;; nil-overload class).  If the mark fails here, the
+            ;; machine never learns any device keys.
+            (leman-e2ee-mark-request-as-sent
+             agent (alist-get 'id query)
+             (list (cons 'device_keys '((@alice:x.org)))
+                   (cons 'failures nil)))))
+      (leman-e2ee-stop agent))))
+
+(defun leman-e2ee-tests--find-outgoing-request (agent path-suffix)
+  "Return AGENT's first outgoing request whose path ends with PATH-SUFFIX.
+Performs and reports the machine's keys/upload requests encountered
+on the way (its first pump always uploads device keys)."
+  (or (catch 'found
+        (dotimes (_ 5)
+          (let ((requests (leman-e2ee-outgoing-requests agent)))
+            (seq-do (lambda (request)
+                      (if (string-suffix-p path-suffix (alist-get 'path request))
+                          (throw 'found request)
+                        (leman-e2ee-mark-request-as-sent
+                         agent (alist-get 'id request)
+                         (list (cons 'one_time_key_counts '((signed_curve25519 . 0)))))))
+                    requests))))
+      nil))
+
 ;;;; Decrypting events
 
 (ert-deftest leman-e2ee-decrypt-event ()
@@ -582,6 +621,67 @@ to the agent, newest first."
       (should (string-match-p "/send/m.room.encrypted/" (car request)))
       (should (string-match-p "opaque" (cdr request)))
       (should-not (string-match-p "\"body\"" (cdr request))))))
+
+
+(ert-deftest leman-encrypt-content-fails-closed-without-agent ()
+  ;; An encrypted room never receives plaintext, even when no agent is
+  ;; running: sending must signal instead of falling back.
+  (let* ((session (make-leman-session))
+         (room (make-leman-room :id "!room:x.org"))
+         (message-should-error))
+    (setf (leman-room-state room)
+          (list (make-leman-event :id "$enc-state" :type "m.room.encryption"
+                                  :content '((algorithm . "m.megolm.v1.aes-sha2")))))
+    (should-error (leman-e2ee--encrypt-content session room (leman-alist "body" "hi"))
+                  :type 'leman-e2ee-error)))
+
+(ert-deftest leman-encrypt-content-completes-lazily-loaded-members ()
+  ;; The default sync filter lazy-loads members: encryption must
+  ;; fetch the joined members when the locally known set is smaller
+  ;; than the summary's joined count, or quiet members would never
+  ;; receive the room key.
+  (let* ((encrypted-content (list (cons 'algorithm "m.megolm.v1.aes-sha2")
+                                  (cons 'ciphertext "opaque")))
+         (fake (leman-e2ee-tests--fake-agent
+                (list (cons 'encrypt_room_event
+                            (list (cons 'status "ok")
+                                  (cons 'event (list (cons 'type "m.room.encrypted")
+                                                     (cons 'content encrypted-content))))))))
+         (session (make-leman-session :transaction-id (leman--initial-transaction-id)))
+         (room (make-leman-room :id "!room:x.org"
+                                :members (make-hash-table :test #'equal)
+                                :summary '((m.joined_member_count . 3))))
+         (requests nil) (api-calls nil))
+    (setf (leman-session-e2ee session) (car fake))
+    (setf (leman-room-state room)
+          (list (make-leman-event :id "$enc-state" :type "m.room.encryption"
+                                  :content '((algorithm . "m.megolm.v1.aes-sha2")))))
+    (puthash "@me:x.org" (make-leman-user :id "@me:x.org") (leman-room-members room))
+    (cl-letf (((symbol-function #'leman-e2ee--api-sync)
+               (lambda (_session endpoint)
+                 (push endpoint api-calls)
+                 ;; A real /joined_members response lists ALL joined
+                 ;; members, including the local user.
+                 '((joined . [(@me:x.org (display_name . "Me"))
+                              (@quiet:x.org (display_name . "Quiet"))
+                              (@lurker:x.org (display_name . "Lurker"))]))))
+              ((symbol-function #'leman-api)
+               (lambda (_session endpoint &rest args)
+                 (push (cons endpoint (plist-get args :data)) requests))))
+      (let ((leman-encrypt-send-content-function #'leman-e2ee--encrypt-content))
+        (leman-send-message room session :body "hi")))
+    ;; The joined members were fetched and all three members are
+    ;; tracked in the agent's encrypt command.
+    (should (equal api-calls (list "rooms/%21room%3Ax.org/joined_members")))
+    (let* ((sent (mapcar #'leman-e2ee--decode (cdr fake)))
+           (encrypt (seq-find (lambda (line)
+                                (equal (alist-get 'cmd line) "encrypt_room_event"))
+                              sent)))
+      (should encrypt)
+      (let ((users (append (alist-get 'users (alist-get 'params encrypt)) nil)))
+        (should (= 3 (length users)))
+        (should (member "@quiet:x.org" users))
+        (should (member "@lurker:x.org" users))))))
 
 ;;;; Verification (E3)
 
@@ -1667,7 +1767,7 @@ must still clear it afterwards (e.g. with `unwind-protect')."
   (let* ((session (make-leman-session :user (make-leman-user :id "@me:x.org")))
          (syncs 0)
          (messages nil))
-    (cl-letf (((symbol-function #'leman-e2ee--sync-changes) #'ignore)
+    (cl-letf (((symbol-function #'leman-e2ee--sync-changes) #'always)
               ((symbol-function #'leman--sync)
                (lambda (&rest _) (cl-incf syncs)))
               ((symbol-function #'message)
@@ -1681,6 +1781,97 @@ must still clear it afterwards (e.g. with `unwind-protect')."
     (should (= syncs 1))
     (should (equal (leman-session-next-batch session) "s2"))
     (should (string-match-p "hook bug" (car messages)))))
+
+(ert-deftest leman--session-start-sync-stops-previous-session ()
+  ;; Re-login for the same user replaces the registered session and
+  ;; stops the previous session's outstanding sync: leaving the old
+  ;; chain running would duplicate event processing and notifications.
+  (let* ((old (make-leman-session :user (make-leman-user :id "@me:x.org")
+                                  :e2ee 'fake-agent))
+         (new (make-leman-session :user (make-leman-user :id "@me:x.org")))
+         (stopped-sessions nil) (deleted nil) (leman-syncs nil) (leman-sessions nil))
+    (setf (alist-get "@me:x.org" leman-sessions nil nil #'equal) old)
+    (setf (alist-get old leman-syncs nil nil #'equal) 'fake-process)
+    (cl-letf (((symbol-function #'leman-e2ee-stop)
+               (lambda (agent) (push agent stopped-sessions)))
+              ((symbol-function #'delete-process)
+               (lambda (process) (push process deleted)))
+              ((symbol-function #'leman-e2ee--start-agent)
+               (lambda (_session _then)))
+              ;; The fake process passes the `plz-else' reset through.
+              ((symbol-function #'process-get) #'ignore)
+              ((symbol-function #'process-put) #'ignore))
+      (setf (process-get 'fake-process :plz-else) nil)
+      (leman--session-start-sync new))
+    (should (eq (alist-get "@me:x.org" leman-sessions nil nil #'equal) new))
+    (should (equal stopped-sessions (list 'fake-agent)))
+    (should (member 'fake-process deleted))
+    (should-not (alist-get old leman-syncs nil nil #'equal))))
+
+(ert-deftest leman--sync-retry-delay-honors-429 ()
+  (let ((no-response (make-plz-error))
+        (rate-limited (make-plz-error
+                       :response (make-plz-response
+                                  :status 429
+                                  :body "{\"retry_after_ms\":2500}")))
+        (rate-limited-no-delay (make-plz-error
+                                :response (make-plz-response
+                                           :status 429
+                                           :body "{}"))))
+    (should (null (leman--sync-retry-delay no-response)))
+    (should (equal (leman--sync-retry-delay rate-limited) 2.5))
+    (should (null (leman--sync-retry-delay rate-limited-no-delay)))))
+
+(ert-deftest leman--sync-failed-429-schedules-retry ()
+  ;; A rate-limited sync must not be retried immediately (hammering a
+  ;; struggling homeserver): a delayed retry is scheduled instead.
+  (let* ((session (make-leman-session :user (make-leman-user :id "@me:x.org")))
+         (timers nil) (syncs 0) (leman-syncs nil) (leman-sessions (list (cons 'x session))))
+    (cl-letf (((symbol-function #'run-at-time)
+               (lambda (delay _repeat fn &rest _)
+                 (push (list delay fn) timers)))
+              ((symbol-function #'leman--sync)
+               (lambda (&rest _) (cl-incf syncs)))
+              ((symbol-function #'message) #'ignore)
+              (leman-auto-sync t))
+      (leman--sync-failed session 40
+                          (make-plz-error
+                           :response (make-plz-response
+                                      :status 429
+                                      :body "{\"retry_after_ms\":2500}")))
+      (should (= (length timers) 1))
+      (should (equal (caar timers) 2.5))
+      ;; The scheduled retry checks the session is still registered
+      ;; and not already syncing, then syncs again.
+      (funcall (nth 1 (car timers)))
+      (should (= syncs 1))
+      ;; Already syncing: no second sync.
+      (setf (map-elt leman-syncs session) 'fake-process)
+      (funcall (nth 1 (car timers)))
+      (should (= syncs 1)))))
+
+(ert-deftest leman--sync-callback-skips-next-batch-when-agent-failed ()
+  ;; When the agent could not receive the sync's changes, the
+  ;; next-batch token is not persisted: the homeserver redelivers the
+  ;; to-device events (room keys) with the next sync instead of
+  ;; dropping them.
+  (let* ((session (make-leman-session :user (make-leman-user :id "@me:x.org"))))
+    (cl-letf (((symbol-function #'leman-e2ee--sync-changes) #'ignore)
+              ((symbol-function #'leman--sync) #'ignore)
+              ((symbol-function #'message) #'ignore)
+              (leman-sync-callback-hook nil)
+              (leman-auto-sync nil)
+              (leman-syncs nil))
+      (leman--sync-callback session '((next_batch . "s2"))))
+    (should-not (leman-session-next-batch session))
+    (let ((leman-syncs nil))
+      (cl-letf (((symbol-function #'leman-e2ee--sync-changes) #'always)
+                ((symbol-function #'leman--sync) #'ignore)
+                ((symbol-function #'message) #'ignore)
+                (leman-sync-callback-hook nil)
+                (leman-auto-sync nil))
+        (leman--sync-callback session '((next_batch . "s3"))))
+      (should (equal (leman-session-next-batch session) "s3")))))
 
 (ert-deftest leman--sync-callback-does-not-double-sync ()
   ;; When a hook (e.g. `leman--auto-sync') already started the next

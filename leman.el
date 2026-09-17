@@ -160,11 +160,13 @@ Alist mapping user IDs to a list of room aliases/IDs to open buffers for."
   :type '(alist :key-type (string :tag "Local user ID")
                 :value-type (repeat (string :tag "Room alias/ID"))))
 
-(defcustom leman-disconnect-hook '(leman-kill-buffers leman--stop-idle-timer)
+(defcustom leman-disconnect-hook '(leman--stop-idle-timer)
   ;; FIXME: Put private functions in a private hook.
   "Functions called when disconnecting.
 That is, when calling command `leman-disconnect'.  Functions are
-called with no arguments."
+called with no arguments.  Room buffers are left alive by
+default; `leman-kill-buffers' may be added to kill all Leman
+buffers."
   :type 'hook)
 
 (defcustom leman-view-room-display-buffer-action '(display-buffer-same-window)
@@ -331,12 +333,29 @@ user is prompted."
                                     collect (string-trim-left flow (rx "m.login."))))
           session password)))))
 
+(defun leman--stop-session-sync (session)
+  "Stop SESSION's outstanding sync process and E2EE agent.
+Used when re-login replaces a session; buffers are left alive."
+  (when-let ((agent (leman-session-e2ee session)))
+    (leman-e2ee-stop agent))
+  (when-let ((process (alist-get session leman-syncs nil nil #'equal)))
+    ;; Disable the sync process's ELSE handler, preventing error
+    ;; messages, but still allowing `plz--respond' to clean up the
+    ;; buffer, etc.  (As in `leman-disconnect'.)
+    (setf (process-get process :plz-else) #'ignore)
+    (delete-process process))
+  (setf (alist-get session leman-syncs nil nil #'equal) nil))
+
 (defun leman--session-start-sync (session)
-  "Register SESSION in `leman-sessions' and start syncing it."
-  ;; HACK: If session is already in leman-sessions, this replaces it.  I think that's okay...
-  (setf (alist-get (leman-user-id (leman-session-user session))
-                   leman-sessions nil nil #'equal)
-        session)
+  "Register SESSION in `leman-sessions' and start syncing it.
+If another session for the same user is registered, it is stopped
+first: a re-login must not leave the old session's sync chain
+running (duplicated event processing and notifications)."
+  (let ((user-id (leman-user-id (leman-session-user session))))
+    (when-let ((existing (alist-get user-id leman-sessions nil nil #'equal)))
+      (unless (eq existing session)
+        (leman--stop-session-sync existing)))
+    (setf (alist-get user-id leman-sessions nil nil #'equal) session))
   (leman-e2ee--start-agent session
                            (lambda ()
                              (leman--sync session :timeout leman-initial-sync-timeout))))
@@ -890,41 +909,55 @@ agent is running)."
 This must be called before the sync's next-batch token is
 persisted (to-device events are ephemeral; persisting the token
 first could lose room keys).  Afterwards, the agent's outgoing
-requests are performed."
-  (when-let ((agent (leman-session-e2ee session)))
-    (condition-case err
-        (let ((response (leman-e2ee-receive-sync-changes
-                         agent
-                         (alist-get 'events (alist-get 'to_device data))
-                         (or (alist-get 'device_lists data) (list))
-                         (or (alist-get 'device_one_time_keys_count data) (list))
-                         (alist-get 'device_unused_fallback_key_types data)
-                         (alist-get 'next_batch data))))
-          (when (seq-find (lambda (event)
-                            (let ((type (or (alist-get 'type event) "")))
-                              (or (string-prefix-p "m.room_key" type)
-                                  (string-prefix-p "m.forwarded_room_key" type))))
-                          (alist-get 'to_device_events response))
-            ;; Room keys arrived: let the sync callback retry the
-            ;; decryption of events that failed before they arrived.
-            (setf leman-e2ee--room-keys-arrived-p t)))
-      (leman-e2ee-error
-       (leman-message "Leman E2EE: processing sync changes failed: %S" (cdr err))))
-    ;; The verification dance advances now that the sync's to-device
-    ;; events (the other side's accepts, SAS start, and MACs) reached
-    ;; the agent; the pump then sends the dance's own requests.
-    ;; Neither step may break the sync chain: a dead agent request
-    ;; must cost a message, not stop syncing.
-    (condition-case err
-        (leman-e2ee--advance-verification session agent)
-      (error
-       (leman-message "Leman E2EE: advancing verification failed: %S" err)))
-    (condition-case err
-        (leman-e2ee--process-outgoing-requests session)
-      (error
-       (leman-message "Leman E2EE: performing outgoing requests failed: %S" err)))
-    (leman-e2ee--announce-requests session agent)
-    (leman-e2ee--backup-pump session agent)))
+requests are performed.  Return non-nil when the agent received
+the sync's changes (or when there is no agent): the caller
+persists the next-batch token only then."
+  (if-let ((agent (leman-session-e2ee session)))
+      (let (received-p)
+        (condition-case err
+            (let ((response (leman-e2ee-receive-sync-changes
+                             agent
+                             (alist-get 'events (alist-get 'to_device data))
+                             (or (alist-get 'device_lists data) (list))
+                             (or (alist-get 'device_one_time_keys_count data) (list))
+                             (alist-get 'device_unused_fallback_key_types data)
+                             (alist-get 'next_batch data))))
+              (setf received-p t)
+              (when (seq-find (lambda (event)
+                                (let ((type (or (alist-get 'type event) "")))
+                                  (or (string-prefix-p "m.room_key" type)
+                                      (string-prefix-p "m.forwarded_room_key" type))))
+                              (alist-get 'to_device_events response))
+                ;; Room keys arrived: let the sync callback retry the
+                ;; decryption of events that failed before they arrived.
+                (setf leman-e2ee--room-keys-arrived-p t)))
+          ;; Any failure here (agent error, dead agent, or an
+          ;; unexpected bug) must cost a message, not the sync chain:
+          ;; the callback is the only place syncs restart from.
+          (leman-e2ee-error
+           (leman-message "Leman E2EE: processing sync changes failed: %S (the sync's to-device events will be redelivered)"
+                          (cdr err)))
+          (error
+           (leman-message "Leman E2EE: processing sync changes failed: %S (the sync's to-device events will be redelivered)"
+                          (error-message-string err))))
+        ;; The verification dance advances now that the sync's to-device
+        ;; events (the other side's accepts, SAS start, and MACs) reached
+        ;; the agent; the pump then sends the dance's own requests.
+        ;; Neither step may break the sync chain: a dead agent request
+        ;; must cost a message, not stop syncing.
+        (condition-case err
+            (leman-e2ee--advance-verification session agent)
+          (error
+           (leman-message "Leman E2EE: advancing verification failed: %S" err)))
+        (condition-case err
+            (leman-e2ee--process-outgoing-requests session)
+          (error
+           (leman-message "Leman E2EE: performing outgoing requests failed: %S" err)))
+        (leman-e2ee--announce-requests session agent)
+        (leman-e2ee--backup-pump session agent)
+        received-p)
+    ;; No agent: nothing to receive; the caller may persist the token.
+    t))
 
 (defun leman-e2ee--announce-requests (session agent)
   "Tell the user about incoming verification requests for SESSION.
@@ -1304,8 +1337,10 @@ already has one, e.g. from Element)."
                            (alist-get 'key
                                       (leman-e2ee--account-data-get
                                        session "m.secret_storage.default_key"))))
+         ;; Not `read-string': the recovery key unlocks all room keys
+         ;; and the private cross-signing keys; don't echo it.
          (recovery-key
-          (read-string
+          (read-passwd
            (if default-key-id
                (format "Secret storage recovery key (the account's recovery key, e.g. Element's \"Recovery key\", for secret-storage key %s): "
                        default-key-id)
@@ -1670,7 +1705,7 @@ current version)."
       (user-error "Leman E2EE: the m.megolm_backup.v1 secret has no encrypted entries"))
     (catch 'unlocked
       (while (not found)
-        (let ((recovery-key (read-string
+        (let ((recovery-key (read-passwd
                              (format "Recovery key of a secret-storage key holding version %s's key (empty to cancel): "
                                      version))))
           (cond ((equal recovery-key "")
@@ -1809,7 +1844,7 @@ signatures to complete verifications and to trust the backup."
   (let ((agent (leman-session-e2ee session)))
     (unless agent
       (user-error "Leman E2EE: no agent running (try reconnecting)"))
-    (let ((recovery-key (read-string "Secret storage recovery key: ")))
+    (let ((recovery-key (read-passwd "Secret storage recovery key: ")))
       (or (leman-e2ee--import-cross-signing session agent recovery-key)
           (user-error "Leman E2EE: no cross-signing secrets are stored for the account's default key")))))
 
@@ -1902,6 +1937,10 @@ keys\" and can be imported by other clients (or by leman with
                    (file (read-file-name "Export keys to: " nil "~/leman-room-keys.txt")))
               (with-temp-file file
                 (insert keys))
+              ;; The export holds every room key the account has
+              ;; (encrypted with the passphrase): restrict it to the
+              ;; current user.
+              (set-file-modes file #o600)
               (leman-message "Leman E2EE: exported room keys to %s" file))
           (leman-e2ee-error
            (user-error "Leman E2EE: exporting keys failed: %s" (cdr err))))))))
@@ -2017,47 +2056,75 @@ public key belongs to no stored entry, that version's key is not
 recoverable from secret storage and the backup must be reset (in
 Element: Settings -> Encryption) before a fresh setup.\n")))))
 
+(defun leman-e2ee--complete-members (session room)
+  "Return ROOM's member user IDs, completing the set if necessary.
+The default sync filter lazy-loads members, so ROOM's `members'
+table may be missing quiet members, who would then never receive
+the room key.  When the locally known member count is less than
+the sync summary's joined count, fetch the joined members first
+(synchronously: the send path needs the complete set before
+sharing the room key)."
+  (let ((summary-count (alist-get 'm.joined_member_count (leman-room-summary room))))
+    (when (and summary-count
+               (< (hash-table-count (leman-room-members room)) summary-count))
+      (leman--put-joined-members
+       room (leman-e2ee--api-sync
+             session (format "rooms/%s/joined_members"
+                             (url-hexify-string (leman-room-id room))))))
+    (hash-table-keys (leman-room-members room))))
+
 (defun leman-e2ee--encrypt-content (session room content)
   "Encrypt CONTENT for ROOM on SESSION, for sending.
 Return (CONTENT . EVENT-TYPE): the encrypted content with event
 type \"m.room.encrypted\", or the original content with
 \"m.room.message\" when the room is not encrypted.  Signal
-`leman-e2ee-error' if the room is encrypted but encryption fails
-(failing closed: never send plaintext into an encrypted room)."
+`leman-e2ee-error' when the room is encrypted but encryption is
+not possible (failing closed: never send plaintext into an
+encrypted room, even when no agent is running)."
   (let ((agent (leman-session-e2ee session)))
-    (if (and agent (leman-room--encrypted-p room))
-        (let ((room-id (leman-room-id room))
-              (members (hash-table-keys (leman-room-members room))))
-          ;; Track the members' devices and complete the initial
-          ;; keys/query before encrypting, else the room key would be
-          ;; shared with nobody.  The send path must pump
-          ;; synchronously: the retries below need the claims and
-          ;; shares to have been performed and reported.
-          (leman-e2ee-update-tracked-users agent members)
-          (leman-e2ee--process-outgoing-requests-sync session)
-          ;; Encrypt, retrying while the agent still needs key claims.
-          (let ((response nil))
-            (cl-loop for attempt from 1 upto 3
-                     do (setf response (leman-e2ee-encrypt-event
-                                        agent room-id "m.room.message" content members))
-                     while (equal (alist-get 'status response) "claims_pending")
-                     do (leman-e2ee--process-outgoing-requests-sync session))
-            (if (equal (alist-get 'status response) "ok")
-                ;; Send the key shares before (or with) the event.
-                (progn (leman-e2ee--process-outgoing-requests-sync session)
-                       (cons (alist-get 'content (alist-get 'event response))
-                             "m.room.encrypted"))
-              (signal 'leman-e2ee-error
-                      (list "encrypt" "unable to encrypt after retries")))))
-      ;; Not encrypted (or no agent): send as usual.  If the room's
-      ;; timeline contains encrypted events, the room really is
-      ;; encrypted but encryption isn't active for us: warn loudly
-      ;; rather than silently sending plaintext into it.
+    (cond
+     ((and agent (leman-room--encrypted-p room))
+      (let ((room-id (leman-room-id room))
+            (members (leman-e2ee--complete-members session room)))
+        ;; Track the members' devices and complete the initial
+        ;; keys/query before encrypting, else the room key would be
+        ;; shared with nobody.  The send path must pump
+        ;; synchronously: the retries below need the claims and
+        ;; shares to have been performed and reported.
+        (leman-e2ee-update-tracked-users agent members)
+        (leman-e2ee--process-outgoing-requests-sync session)
+        ;; Encrypt, retrying while the agent still needs key claims.
+        (let ((response nil))
+          (cl-loop for attempt from 1 upto 3
+                   do (setf response (leman-e2ee-encrypt-event
+                                      agent room-id "m.room.message" content members))
+                   while (equal (alist-get 'status response) "claims_pending")
+                   do (leman-e2ee--process-outgoing-requests-sync session))
+          (if (equal (alist-get 'status response) "ok")
+              ;; Send the key shares before (or with) the event.
+              (progn (leman-e2ee--process-outgoing-requests-sync session)
+                     (cons (alist-get 'content (alist-get 'event response))
+                           "m.room.encrypted"))
+            (signal 'leman-e2ee-error
+                    (list "encrypt" "unable to encrypt after retries"))))))
+     ((leman-room--encrypted-p room)
+      ;; The room's state says it's encrypted, but we can't encrypt:
+      ;; sending plaintext would expose the message to the server and
+      ;; break other members' authenticity shields.
+      (signal 'leman-e2ee-error
+              (list "encrypt"
+                    (format "room %s is encrypted but no E2EE agent is running; see M-x leman-e2ee-status"
+                            (leman-room-id room)))))
+     ;; Not encrypted: send as usual.  If the room's timeline
+     ;; contains encrypted events, the room really is encrypted but
+     ;; its state is missing the encryption event: warn loudly rather
+     ;; than silently sending plaintext into it.
+     (t
       (when (cl-find "m.room.encrypted" (leman-room-timeline room)
                      :test #'equal :key #'leman-event-type)
         (leman-message "Leman E2EE: WARNING: room %s has encrypted messages, but this message will NOT be encrypted (no agent or room state missing encryption)"
                        (leman-room-id room)))
-      (cons content "m.room.message"))))
+      (cons content "m.room.message")))))
 
 ;;; Functions
 
@@ -2109,7 +2176,6 @@ To be called from `leman-disconnect-hook'."
   "Return an initial transaction ID for a new session."
   ;; We generate a somewhat-random initial transaction ID to avoid
   ;; potential transaction ID conflicts between sessions and clients.
-  ;; See <https://github.com/alphapapa/ement.el/issues/36>.
   (cl-parse-integer
    (secure-hash 'sha256 (prin1-to-string (list (current-time) (system-name))))
    :end 8 :radix 16))
@@ -2178,6 +2244,18 @@ If FORCE is nil, signal an error instead."
              (when next-batch
                (list "timeout" "30000")))))
 
+(defun leman--sync-retry-delay (plz-error)
+  "Return the delay in seconds before syncing again after PLZ-ERROR.
+A rate-limited homeserver's ~retry_after_ms~ is honored; any other
+failure returns nil (the caller waits the default 5 seconds)."
+  (let ((response (plz-error-response plz-error)))
+    (when (and response (= (plz-response-status response) 429))
+      (when-let ((delay (ignore-errors
+                          (alist-get 'retry_after_ms
+                                     (json-read-from-string
+                                      (plz-response-body response))))))
+        (and (numberp delay) (> delay 0) (/ (float delay) 1000))))))
+
 (defun leman--sync-failed (session timeout plz-error)
   "Handle a failed sync request for SESSION.
 TIMEOUT is the request's timeout, which is used when re-syncing.
@@ -2204,10 +2282,16 @@ PLZ-ERROR is the error passed by `plz'."
     (if reason
         (if (not leman-auto-sync)
             (run-hook-with-args 'leman-interrupted-sync-hook session)
-          (message "Leman: Sync %s (%s).  Syncing again..."
-                   reason (leman-user-id (leman-session-user session)))
-          ;; Set QUIET to allow the just-printed message to remain visible.
-          (leman--sync session :timeout timeout :quiet t))
+          (let ((delay (or (leman--sync-retry-delay plz-error) 5)))
+            (message "Leman: Sync %s (%s).  Syncing again in %s seconds..."
+                     reason (leman-user-id (leman-session-user session)) delay)
+            (run-at-time
+             delay nil (lambda ()
+                         ;; The session may have been disconnected or
+                         ;; already be syncing again meanwhile.
+                         (when (and (rassq session leman-sessions)
+                                    (not (map-elt leman-syncs session)))
+                           (leman--sync session :timeout timeout :quiet t))))))
       ;; Unrecognized errors: report them, then retry after a pause.
       ;; This runs in plz's sentinel, where signaling an error would
       ;; just stop the sync chain permanently (as a blip like a
@@ -2284,80 +2368,85 @@ Runs `leman-sync-callback-hook' with SESSION."
   (setf (map-elt leman-syncs session) nil)
   ;; Send the sync's E2EE parts to the agent (this must happen before
   ;; the next-batch token is persisted, or to-device events like room
-  ;; keys can be lost), then perform its outgoing requests.
-  (leman-e2ee--sync-changes session data)
-  (pcase-let* (((map rooms ('next_batch next-batch) ('account_data (map ('events account-data-events))))
-                data)
-               ((map ('join joined-rooms) ('invite invited-rooms) ('leave left-rooms)) rooms)
-               (num-events (+
-                            ;; HACK: In `leman--push-joined-room-events', we do something
-                            ;; with each event 3 times, so we multiply this by 3.
-                            ;; FIXME: That calculation doesn't seem to be quite right, because
-                            ;; the progress reporter never seems to hit 100% before it's done.
-                            (* 3 (cl-loop for (_id . room) in joined-rooms
-                                          sum (length (map-nested-elt room '(state events)))
-                                          sum (length (map-nested-elt room '(timeline events)))))
-                            (cl-loop for (_id . room) in invited-rooms
-                                     sum (length (map-nested-elt room '(invite_state events)))))))
-    ;; Append account data events.
-    ;; TODO: Since only one event of each type is allowed in account data (the spec
-    ;; doesn't seem to make this clear, but see
-    ;; <https://github.com/matrix-org/matrix-js-sdk/blob/d0b964837f2820940bd93e718a2450b5f528bffc/src/store/memory.ts#L292>),
-    ;; we should store account-data events in a hash table or alist rather than just a
-    ;; list of events.
-    (cl-callf2 append (cl-coerce account-data-events 'list) (leman-session-account-data session))
-    ;; Process invited and joined rooms.  Errors are demoted: the sync
-    ;; callback is the only place the next sync is started, so an
-    ;; error here must cost a message, not stop syncing (a malformed
-    ;; event's room is then skipped: the next-batch token still
-    ;; advances, matching the tradeoff noted below).
-    (condition-case err
-        (leman-with-progress-reporter (:when (leman--sync-messages-p session)
-                                             :reporter ("Leman: Reading events..." 0 num-events))
-          ;; Left rooms.
-          (mapc (apply-partially #'leman--push-left-room-events session) left-rooms)
-          ;; Invited rooms.
-          (mapc (apply-partially #'leman--push-invite-room-events session) invited-rooms)
-          ;; Joined rooms.
-          (mapc (apply-partially #'leman--push-joined-room-events session) joined-rooms))
-      (error (message "Leman: Error processing sync events: %s"
-                      (error-message-string err))))
-    ;; TODO: Process "left" rooms (remove room structs, etc).
-    ;; NOTE: We update the next-batch token before updating any room buffers.  This means
-    ;; that any errors in updating room buffers (like for unexpected event formats that
-    ;; expose a bug) could cause events to not appear in the buffer, but the user could
-    ;; still dismiss the error and start syncing again, and the client could remain
-    ;; usable.  Updating the token after doing everything would be preferable in some
-    ;; ways, but it would mean that an event that exposes a bug would be processed again
-    ;; on every sync, causing the same error each time.  It would seem preferable to
-    ;; maintain at least some usability rather than to keep repeating a broken behavior.
-    (setf (leman-session-next-batch session) next-batch)
-    (condition-case err
-        (progn
-          ;; Run hooks which update buffers, etc.
-          (run-hook-with-args 'leman-sync-callback-hook session)
-          (when leman-e2ee--room-keys-arrived-p
-            ;; Room keys arrived with this sync: events that could not be
-            ;; decrypted before (their placeholders are already in the
-            ;; buffers) may decrypt now.
-            (setf leman-e2ee--room-keys-arrived-p nil)
-            (leman-e2ee--retry-decryption session))
-          ;; Update the mode-line unread indicator.
-          (leman--update-unread-indicator)
-          ;; Show sync message if appropriate, and run after-initial-sync-hook.
-          (when (leman--sync-messages-p session)
-            (message (concat "Leman: Sync done."
-                             (unless (leman-session-has-synced-p session)
-                               (run-hook-with-args 'leman-after-initial-sync-hook session)
-                               ;; Show tip after initial sync.
-                               (setf (leman-session-has-synced-p session) t)
-                               "  Use commands `leman-list-rooms' or `leman-view-room' to view a room.")))))
-      (error (message "Leman: Error after sync: %s"
-                      (error-message-string err))))
-    ;; A hook may have errored before `leman--auto-sync' (in the hook)
-    ;; started the next sync: keep the chain alive.
-    (when (and leman-auto-sync (not (map-elt leman-syncs session)))
-      (leman--sync session :quiet t))))
+  ;; keys can be lost), then perform its outgoing requests.  When the
+  ;; agent could not receive them, the next-batch token is not
+  ;; persisted: the homeserver then redelivers the sync's to-device
+  ;; events (like room keys) with the next sync, instead of losing
+  ;; them.
+  (let ((e2ee-received-p (leman-e2ee--sync-changes session data)))
+    (pcase-let* (((map rooms ('next_batch next-batch) ('account_data (map ('events account-data-events))))
+                  data)
+                 ((map ('join joined-rooms) ('invite invited-rooms) ('leave left-rooms)) rooms)
+                 (num-events (+
+                              ;; HACK: In `leman--push-joined-room-events', we do something
+                              ;; with each event 3 times, so we multiply this by 3.
+                              ;; FIXME: That calculation doesn't seem to be quite right, because
+                              ;; the progress reporter never seems to hit 100% before it's done.
+                              (* 3 (cl-loop for (_id . room) in joined-rooms
+                                            sum (length (map-nested-elt room '(state events)))
+                                            sum (length (map-nested-elt room '(timeline events)))))
+                              (cl-loop for (_id . room) in invited-rooms
+                                       sum (length (map-nested-elt room '(invite_state events)))))))
+      ;; Append account data events.
+      ;; TODO: Since only one event of each type is allowed in account data (the spec
+      ;; doesn't seem to make this clear, but see
+      ;; <https://github.com/matrix-org/matrix-js-sdk/blob/d0b964837f2820940bd93e718a2450b5f528bffc/src/store/memory.ts#L292>),
+      ;; we should store account-data events in a hash table or alist rather than just a
+      ;; list of events.
+      (cl-callf2 append (cl-coerce account-data-events 'list) (leman-session-account-data session))
+      ;; Process invited and joined rooms.  Errors are demoted: the sync
+      ;; callback is the only place the next sync is started, so an
+      ;; error here must cost a message, not stop syncing (a malformed
+      ;; event's room is then skipped: the next-batch token still
+      ;; advances, matching the tradeoff noted below).
+      (condition-case err
+          (leman-with-progress-reporter (:when (leman--sync-messages-p session)
+                                               :reporter ("Leman: Reading events..." 0 num-events))
+                                        ;; Left rooms.
+                                        (mapc (apply-partially #'leman--push-left-room-events session) left-rooms)
+                                        ;; Invited rooms.
+                                        (mapc (apply-partially #'leman--push-invite-room-events session) invited-rooms)
+                                        ;; Joined rooms.
+                                        (mapc (apply-partially #'leman--push-joined-room-events session) joined-rooms))
+        (error (message "Leman: Error processing sync events: %s"
+                        (error-message-string err))))
+      ;; TODO: Process "left" rooms (remove room structs, etc).
+      ;; NOTE: We update the next-batch token before updating any room buffers.  This means
+      ;; that any errors in updating room buffers (like for unexpected event formats that
+      ;; expose a bug) could cause events to not appear in the buffer, but the user could
+      ;; still dismiss the error and start syncing again, and the client could remain
+      ;; usable.  Updating the token after doing everything would be preferable in some
+      ;; ways, but it would mean that an event that exposes a bug would be processed again
+      ;; on every sync, causing the same error each time.  It would seem preferable to
+      ;; maintain at least some usability rather than to keep repeating a broken behavior.
+      (when e2ee-received-p
+        (setf (leman-session-next-batch session) next-batch))
+      (condition-case err
+          (progn
+            ;; Run hooks which update buffers, etc.
+            (run-hook-with-args 'leman-sync-callback-hook session)
+            (when leman-e2ee--room-keys-arrived-p
+              ;; Room keys arrived with this sync: events that could not be
+              ;; decrypted before (their placeholders are already in the
+              ;; buffers) may decrypt now.
+              (setf leman-e2ee--room-keys-arrived-p nil)
+              (leman-e2ee--retry-decryption session))
+            ;; Update the mode-line unread indicator.
+            (leman--update-unread-indicator)
+            ;; Show sync message if appropriate, and run after-initial-sync-hook.
+            (when (leman--sync-messages-p session)
+              (message (concat "Leman: Sync done."
+                               (unless (leman-session-has-synced-p session)
+                                 (run-hook-with-args 'leman-after-initial-sync-hook session)
+                                 ;; Show tip after initial sync.
+                                 (setf (leman-session-has-synced-p session) t)
+                                 "  Use commands `leman-list-rooms' or `leman-view-room' to view a room.")))))
+        (error (message "Leman: Error after sync: %s"
+                        (error-message-string err))))
+      ;; A hook may have errored before `leman--auto-sync' (in the hook)
+      ;; started the next sync: keep the chain alive.
+      (when (and leman-auto-sync (not (map-elt leman-syncs session)))
+        (leman--sync session :quiet t)))))
 
 (defun leman--push-invite-room-events (session invited-room)
   "Push events for INVITED-ROOM into that room in SESSION."
@@ -2618,18 +2707,30 @@ Returns nil if unable to read `leman-sessions-file'."
                         :token token
                         :transaction-id transaction-id
                         :device-id device-id))))
-    (message "Leman: Writing sessions...")
-    (with-temp-file leman-sessions-file
-      (pcase-let* ((print-level nil)
-                   (print-length nil)
-                   ;; Very important to use `print-circle', although it doesn't
-                   ;; solve everything.  Writing/reading Lisp data can be tricky...
-                   (print-circle t)
-                   (sessions-alist-plist (cl-loop for (id . session) in sessions-alist
-                                                  collect (cons id (session-plist session)))))
-        (prin1 sessions-alist-plist (current-buffer))))
-    ;; Ensure permissions are safe.
-    (chmod leman-sessions-file #o600)))
+     (message "Leman: Writing sessions...")
+     ;; Write to a temporary file with safe permissions from the
+     ;; start (writing in place would expose the tokens at umask
+     ;; permissions until the later chmod), then atomically rename it.
+     (let ((temp-file (make-temp-file
+                       (concat (file-name-nondirectory leman-sessions-file)
+                               "-")
+                       nil
+                       ".tmp"
+                       (file-name-directory leman-sessions-file))))
+       (unwind-protect
+           (progn
+             (chmod temp-file #o600)
+             (with-temp-file temp-file
+               (pcase-let* ((print-level nil)
+                            (print-length nil)
+                            ;; Very important to use `print-circle', although it doesn't
+                            ;; solve everything.  Writing/reading Lisp data can be tricky...
+                            (print-circle t)
+                            (sessions-alist-plist (cl-loop for (id . session) in sessions-alist
+                                                           collect (cons id (session-plist session)))))
+                 (prin1 sessions-alist-plist (current-buffer))))
+             (rename-file temp-file leman-sessions-file 'ok-if-already-exists))
+         (ignore-errors (delete-file temp-file))))))
 
 (defun leman--kill-emacs-hook ()
   "Function to be added to `kill-emacs-hook'.
@@ -2702,8 +2803,7 @@ unexpected errors from arresting event processing and syncing."
   (when-let ((handler (alist-get (leman-event-type event) leman-event-handlers nil nil #'equal)))
     ;; We demote any errors that happen while processing events, because it's possible for
     ;; events to be malformed in unexpected ways, and that could cause an error, which
-    ;; would stop processing of other events and prevent further syncing.  See,
-    ;; e.g. <https://github.com/alphapapa/ement.el/pull/61>.
+    ;; would stop processing of other events and prevent further syncing.
     (with-demoted-errors "Leman (leman--process-event): Error processing event: %S"
       (funcall handler event room session))))
 
@@ -3041,8 +3141,6 @@ moved.  Highlights (i.e. mentions) are shown in parentheses."
     (setf leman-unread-indicator-string nil)))
 
 ;;;;; Savehist compatibility
-
-;; See <https://github.com/alphapapa/ement.el/issues/216>.
 
 (defvar savehist-save-hook)
 

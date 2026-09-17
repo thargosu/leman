@@ -283,7 +283,7 @@ If ROOM has no existing buffer, do nothing."
     ;; TODO: Encode HTML entities.
     (when (stringp body)
       ;; If event has no body, it was probably redacted or something, so don't notify.
-      (truncate-string-to-width body 60)
+      (setf body (truncate-string-to-width body 60))
       (notifications-notify :title title :body body
                             :app-name "Léman"
                             :app-icon (or (when avatar

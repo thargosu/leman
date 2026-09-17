@@ -149,6 +149,30 @@ to the agent, newest first."
     (should (equal (alist-get 'value (leman-e2ee-request (car agent) "hello"))
                    42))))
 
+(ert-deftest leman-e2ee-file-protocol-commands ()
+  ;; `leman-e2ee-encrypt-file' and `leman-e2ee-decrypt-file' send the
+  ;; file paths (and key material, for decrypting) as plain params and
+  ;; return the agent's "ok" object.
+  (let* ((file-info (list (cons 'key "key-k")
+                          (cons 'iv "some-iv")
+                          (cons 'sha256 "some-hash")))
+         (agent (leman-e2ee-tests--fake-agent
+                 (list (cons 'encrypt_file file-info)
+                       (cons 'decrypt_file nil))))
+         (sent (cdr agent)))
+    (should (equal (alist-get 'key (leman-e2ee-encrypt-file
+                                    (car agent) "/tmp/plain" "/tmp/enc"))
+                   "key-k"))
+    (leman-e2ee-decrypt-file (car agent) "/tmp/enc" "/tmp/plain"
+                             "key-k" "some-iv" "some-hash")
+    (let ((lines (reverse (cdr sent))))
+      (should (string-match-p "\"cmd\":\"encrypt_file\"" (nth 0 lines)))
+      (should (string-match-p "\"input\":\"/tmp/plain\"" (nth 0 lines)))
+      (should (string-match-p "\"output\":\"/tmp/enc\"" (nth 0 lines)))
+      (should (string-match-p "\"cmd\":\"decrypt_file\"" (nth 1 lines)))
+      (should (string-match-p "\"key\":\"key-k\"" (nth 1 lines)))
+      (should (string-match-p "\"sha256\":\"some-hash\"" (nth 1 lines))))))
+
 (ert-deftest leman-e2ee-request-signals-error ()
   (let ((agent (car (leman-e2ee-tests--fake-agent
                      (list (cons 'hello '(err "crypto" "boom")))))))
@@ -622,6 +646,37 @@ on the way (its first pump always uploads device keys)."
       (should (string-match-p "opaque" (cdr request)))
       (should-not (string-match-p "\"body\"" (cdr request))))))
 
+(ert-deftest leman-room-edit-message-encrypts-in-encrypted-rooms ()
+  ;; Editing a message in an encrypted room sends the edit as
+  ;; m.room.encrypted (otherwise the edit text and its relation
+  ;; metadata leak as plaintext).
+  (let* ((encrypted-content (list (cons 'algorithm "m.megolm.v1.aes-sha2")
+                                  (cons 'ciphertext "opaque-edit")))
+         (fake (leman-e2ee-tests--fake-agent
+                (list (cons 'encrypt_room_event
+                            (list (cons 'status "ok")
+                                  (cons 'event (list (cons 'type "m.room.encrypted")
+                                                     (cons 'content encrypted-content))))))))
+         (session (make-leman-session :transaction-id (leman--initial-transaction-id)))
+         (room (make-leman-room :id "!room:x.org"
+                                :members (make-hash-table :test #'equal)))
+         (event (make-leman-event :id "$msg" :type "m.room.message"
+                                  :sender "@me:x.org"
+                                  :content '((body . "old"))))
+         (requests nil))
+    (setf (leman-session-e2ee session) (car fake))
+    (setf (leman-room-state room)
+          (list (make-leman-event :id "$enc-state" :type "m.room.encryption"
+                                  :content '((algorithm . "m.megolm.v1.aes-sha2")))))
+    (cl-letf (((symbol-function #'leman-api)
+               (lambda (_session endpoint &rest args)
+                 (push (cons endpoint (plist-get args :data)) requests))))
+      (let ((leman-encrypt-send-content-function #'leman-e2ee--encrypt-content))
+        (leman-room-edit-message event room session "new body")))
+    (let ((request (car requests)))
+      (should (string-match-p "/send/m.room.encrypted/" (car request)))
+      (should (string-match-p "opaque-edit" (cdr request)))
+      (should-not (string-match-p "new body" (cdr request))))))
 
 (ert-deftest leman-encrypt-content-fails-closed-without-agent ()
   ;; An encrypted room never receives plaintext, even when no agent is

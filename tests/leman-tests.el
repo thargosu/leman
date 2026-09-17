@@ -221,6 +221,24 @@ URL differ from the previous one."
            (pos (string-search "joined" raw)))
       (should (eq 'bold (get-text-property pos 'face raw))))))
 
+(ert-deftest leman-room--format-single-unrecognized-membership ()
+  ;; A single membership event with an unrecognized membership (e.g.
+  ;; "knock", rooms v8+) must render instead of crashing: the
+  ;; per-event formatter used `pcase-exhaustive', which signaled.
+  (let ((leman-users (make-hash-table :test #'equal))
+        (room (make-leman-room :id "!room:example.com"))
+        (leman-room (make-leman-room :id "!room:example.com")))
+    ;; "knock" (rooms v8+).
+    (should (equal (substring-no-properties
+                    (leman-room--format-member-event
+                     (leman-tests--member-event 1 "@alice:example.com" nil "knock") room))
+                   "@alice:example.com sent unrecognized membership event for @alice:example.com"))
+    ;; A garbage (nil) membership too.
+    (should (equal (substring-no-properties
+                    (leman-room--format-member-event
+                     (leman-tests--member-event 1 "@alice:example.com" nil nil) room))
+                   "@alice:example.com sent unrecognized membership event for @alice:example.com"))))
+
 (ert-deftest leman-room--initial-footer ()
   "Test initial room buffer footer."
   (let ((plain (make-leman-room :id "!room:example.com"))
@@ -350,10 +368,10 @@ URL differ from the previous one."
 
 (ert-deftest leman-tabulated-room-list--entry-membership-faces ()
   "Test that invited and left rooms are face-modified.
-This checks the 'leave branch, which upstream ement.el malformed
-by passing the arguments to `cons' in reverse, and the
-`leman-room-status' slot, which upstream read from the wrong
-slot, so these branches never applied."
+This checks the 'leave branch, which formerly passed its
+arguments to `cons' in reverse, and the `leman-room-status'
+slot, which was read from the wrong slot, so these branches
+never applied."
   (let* ((session (make-leman-session :user (make-leman-user :id "@me:example.com")))
          (invited-room (make-leman-room :id "!invited:example.com" :status 'invite))
          (left-room (make-leman-room :id "!left:example.com" :status 'leave))
@@ -584,6 +602,37 @@ property for toggling."
                                                                  (event_id . "$not-in-thread")))))
                    room)))))
 
+(ert-deftest leman-room--replace-event-carries-reactions ()
+  ;; Reactions are attached to the original event's local data: the
+  ;; edit event that replaces it in the buffer must carry them over,
+  ;; else reactions to a message are lost the moment it is edited
+  ;; (and new ones never render).
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (printer (lambda (data)
+                    (if (leman-event-p data)
+                        (format "%s " (leman-event-id data))
+                      " ")))
+         (message (make-leman-event :id "$msg" :type "m.room.message"
+                                    :content '((body . "hi"))))
+         (reaction (make-leman-event :id "$react" :type "m.reaction"
+                                     :content '((m.relates_to (event_id . "$msg")))))
+         (edit (make-leman-event :id "$edit" :type "m.room.message"
+                                 :content '((body . "hi*")
+                                            (m.new_content (body . "hi!"))
+                                            (m.relates_to (rel_type . "m.replace")
+                                                          (event_id . "$msg"))))))
+    (setf (map-elt (leman-event-local message) 'reactions) (list reaction))
+    (with-temp-buffer
+      (setf (map-elt (leman-room-local room) 'buffer) (current-buffer)
+            leman-ewoc (ewoc-create printer))
+      (ewoc-enter-last leman-ewoc message)
+      ;; Replacing with the edit event carries the reactions over.
+      (should (leman-room--replace-event edit))
+      (let ((node (ewoc-nth leman-ewoc 0)))
+        (should (eq (ewoc-data node) edit))
+        (should (equal (map-elt (leman-event-local edit) 'reactions)
+                       (list reaction)))))))
+
 (ert-deftest leman-room--invalidate-event-node-by-id ()
   "Event nodes are found by event ID, not struct identity.
 The event struct whose image was downloaded (captured when the
@@ -610,6 +659,56 @@ stores a copy) or when the room buffer was re-created."
       ;; An event with no node in the buffer is ignored without error.
       (leman-room--invalidate-event-node missing room)
       (should (= (length calls) 2)))))
+
+(ert-deftest leman-room--fetch-html-image-dedups-in-flight ()
+  ;; Re-renders while an image fetch is in flight (e.g. caused by
+  ;; receipts or typing notifications) must not queue a duplicate
+  ;; fetch for the same URL: the event is registered as waiting, and
+  ;; all waiting events are re-rendered when the image arrives.
+  (let* ((leman-room--fetching-html-images nil)
+         (rerenders 0)
+         (fetches 0)
+         ;; Queued requests as (THEN . ELSE), most recent first.
+         (closers nil)
+         (event1 (make-leman-event :id "$e1"))
+         (event2 (make-leman-event :id "$e2"))
+         (room (make-leman-room :id "!room:x.org")))
+    (cl-letf (((symbol-function #'url-is-cached) #'ignore)
+              ((symbol-function #'plz-queue)
+               (lambda (_queue &rest args)
+                 (cl-incf fetches)
+                 (push (cons (plist-get args :then) (plist-get args :else)) closers)
+                 nil))
+              ((symbol-function #'plz-run) #'ignore)
+              ((symbol-function #'leman-room--store-image-in-url-cache) #'ignore)
+              ((symbol-function #'leman-room--invalidate-event-node)
+               (lambda (_event _room) (cl-incf rerenders))))
+      ;; Two events with the same image URL: one request, both waiting.
+      (leman-room--fetch-html-image "https://x.org/img.png" event1 room)
+      (leman-room--fetch-html-image "https://x.org/img.png" event2 room)
+      ;; A different URL still fetches.
+      (leman-room--fetch-html-image "https://x.org/other.png" event2 room)
+      (should (= fetches 2))
+      (let ((waiting (cdr (assoc "https://x.org/img.png"
+                                 leman-room--fetching-html-images))))
+        (should (member event1 (mapcar #'car waiting)))
+        (should (member event2 (mapcar #'car waiting))))
+      ;; When the img.png fetch completes, every waiting event is
+      ;; re-rendered and the URL is no longer tracked.
+      (funcall (car (cadr closers)) "binary-data")
+      (should (= rerenders 2))
+      (should-not (assoc "https://x.org/img.png"
+                         leman-room--fetching-html-images))
+      ;; After completion, the same URL may be fetched again (e.g. the
+      ;; cache entry expired).
+      (leman-room--fetch-html-image "https://x.org/img.png" event1 room)
+      (should (= fetches 3))
+      ;; A failed fetch (other.png) stops being tracked without
+      ;; re-rendering anything.
+      (funcall (cdr (cadr closers)) nil)
+      (should (= rerenders 2))
+      (should-not (assoc "https://x.org/other.png"
+                         leman-room--fetching-html-images)))))
 
 (ert-deftest leman-room--m.image-callback-shows-thread-reply-image ()
   "A downloaded image for a thread reply is shown in the thread view.
@@ -747,6 +846,190 @@ Restoring it lets E2EE skip its whoami call."
       (should (equal (leman-session-device-id restored) "ABC"))
       (should (equal (leman-session-token restored) "tok"))
       (should (equal (leman-user-id (leman-session-user restored)) "@vv:x.org")))))
+
+(ert-deftest leman-room-send-file-omits-unknown-mimetype ()
+  ;; A nil mimetype (unknown file extension) must be omitted from the
+  ;; message content: keeping the key would encode a JSON array of the
+  ;; key (AGENTS.md, the nil-overload class).
+  (let* ((file (make-temp-file "leman-send-file-test." nil ".unknownext"))
+         (requests nil))
+    (cl-letf (((symbol-function #'yes-or-no-p) #'always)
+              ((symbol-function #'leman-message) #'ignore)
+              ((symbol-function #'leman-upload)
+               (lambda (_session &rest args)
+                 (funcall (plist-get args :then) '((content_uri . "mxc://x.org/abc")))))
+              ((symbol-function #'leman-api)
+               (lambda (_session _endpoint &rest args)
+                 (push (plist-get args :data) requests))))
+      (leman-room-send-file file "my file" (make-leman-room :id "!room:x.org")
+                            (make-leman-session :transaction-id 1)))
+    (let ((data (car requests)))
+      (should data)
+      (should (string-match-p "mxc://x.org/abc" data))
+      (should-not (string-match-p "mimetype" data))
+      (should (string-match-p "\"size\"" data)))))
+
+(ert-deftest leman-room-send-file-encrypts-in-encrypted-rooms ()
+  ;; In an encrypted room, the file is encrypted before upload (the
+  ;; homeserver must never see the plaintext), and the event carries
+  ;; the ciphertext's URL with the key/IV/hash ("file" replacing
+  ;; "url", spec: "Sending encrypted attachments"), Megolm-encrypted
+  ;; like any other message content.
+  (let* ((original (make-temp-file "leman-plain-"))
+         (uploads nil)
+         (requests nil)
+         (captured-content nil)
+         (fake (leman-e2ee-tests--fake-agent
+                (list (cons 'encrypt_file
+                            (list (cons 'key "k-url-safe")
+                                  (cons 'iv "iv-b64")
+                                  (cons 'sha256 "hash-b64"))))))
+         (session (make-leman-session :transaction-id (leman--initial-transaction-id)))
+         (room (make-leman-room :id "!room:x.org"
+                                :members (make-hash-table :test #'equal))))
+    (setf (leman-session-e2ee session) (car fake))
+    (setf (leman-room-state room)
+          (list (make-leman-event :id "$enc-state" :type "m.room.encryption"
+                                  :content '((algorithm . "m.megolm.v1.aes-sha2")))))
+    (cl-letf (((symbol-function #'yes-or-no-p) #'always)
+              ((symbol-function #'leman-message) #'ignore)
+              ((symbol-function #'leman-upload)
+               (lambda (_session &rest args)
+                 (push (cons (nth 1 (plist-get args :data))
+                             (plist-get args :content-type))
+                       uploads)
+                 (funcall (plist-get args :then) '((content_uri . "mxc://x.org/cipher")))))
+              ((symbol-function #'leman-api)
+               (lambda (_session endpoint &rest args)
+                 (push (cons endpoint (plist-get args :data)) requests))))
+      (let ((leman-encrypt-send-content-function
+             (lambda (_session _room content)
+               (push content captured-content)
+               (cons (list (cons 'ciphertext "opaque")) "m.room.encrypted"))))
+        (leman-room-send-file original "my file" room session)))
+    ;; The ciphertext was uploaded, not the plaintext, as
+    ;; application/octet-stream (a mimetype would leak the type).
+    (let ((upload (car uploads)))
+      (should-not (equal (car upload) original))
+      (should (string-prefix-p (file-name-as-directory temporary-file-directory)
+                               (car upload)))
+      (should (equal (cdr upload) "application/octet-stream")))
+    ;; The message is sent Megolm-encrypted...
+    (let ((request (car requests)))
+      (should (string-match-p "/send/m.room.encrypted/" (car request)))
+      (should (string-match-p "opaque" (cdr request)))
+      ;; ...so the file key is not visible to the homeserver.
+      (should-not (string-match-p "A256CTR" (cdr request))))
+    ;; The content handed to encryption has the "file" object.
+    (let ((content (car captured-content)))
+      (should-not (assoc "url" content))
+      (let ((file (cdr (assoc "file" content))))
+        (should (equal (alist-get "url" file nil nil #'string=)
+                       "mxc://x.org/cipher"))
+        (should (equal (alist-get "v" file nil nil #'string=) "v2"))
+        (should (equal (alist-get "iv" file nil nil #'string=) "iv-b64"))
+        (should (equal (alist-get "sha256"
+                                  (cdr (assoc "hashes" file)) nil nil #'string=)
+                       "hash-b64"))
+        (let ((key (cdr (assoc "key" file))))
+          (should (equal (alist-get "k" key nil nil #'string=) "k-url-safe"))
+          (should (equal (alist-get "alg" key nil nil #'string=) "A256CTR"))
+          (should (eq (alist-get "ext" key nil nil #'string=) t))
+          (should (equal (alist-get "key_ops" key nil nil #'string=)
+                         '("encrypt" "decrypt"))))))))
+
+(ert-deftest leman-room-send-file-fails-closed-without-agent ()
+  ;; An encrypted room never receives a plaintext upload: with no
+  ;; agent, sending a file must signal before anything is uploaded.
+  (let* ((original (make-temp-file "leman-plain-"))
+         (upload-called nil)
+         (room (make-leman-room :id "!room:x.org"
+                                :members (make-hash-table :test #'equal))))
+    (setf (leman-room-state room)
+          (list (make-leman-event :id "$enc" :type "m.room.encryption"
+                                  :content '((algorithm . "m.megolm.v1.aes-sha2")))))
+    (cl-letf (((symbol-function #'yes-or-no-p) #'always)
+              ((symbol-function #'leman-upload)
+               (lambda (&rest _) (setf upload-called t))))
+      (let ((leman-encrypt-send-content-function #'leman-e2ee--encrypt-content))
+        (should-error (leman-room-send-file original "my file" room
+                                            (make-leman-session :transaction-id 1))
+                      :type 'leman-e2ee-error)))
+    (should-not upload-called)))
+
+(ert-deftest leman-room-download-file-decrypts-encrypted-attachments ()
+  ;; An encrypted attachment's blob is ciphertext: it is downloaded,
+  ;; hash-verified, and decrypted with the agent before being written
+  ;; to the destination.
+  (let* ((leman-session (make-leman-session
+                         :server (make-leman-server :name "x.org" :uri-prefix "https://x.org")))
+         (room (make-leman-room :id "!room:x.org"))
+         (dir (make-temp-file "leman-download-test-" t))
+         (destination (expand-file-name "file.bin" dir))
+         (downloaded nil)
+         (decrypt-calls nil)
+         (fake (leman-e2ee-tests--fake-agent
+                (list (cons 'decrypt_file nil)))))
+    (setf (leman-session-e2ee leman-session) (car fake))
+    (let ((event (make-leman-event :id "$f" :type "m.room.message"
+                                   :content (list 'msgtype "m.file"
+                                                  'body "file.bin"
+                                                  'file (list '(url . "mxc://x.org/enc")
+                                                              '(v . "v2")
+                                                              '(key . ((k . "k") (alg . "A256CTR")
+                                                                       (kty . "oct") (ext . t)
+                                                                       (key_ops . ("encrypt" "decrypt"))))
+                                                              '(iv . "iv")
+                                                              '(hashes . ((sha256 . "hash"))))))))
+      (cl-letf (((symbol-function #'leman--media-request)
+                 (lambda (_url _session &rest args)
+                   (setf downloaded (nth 1 (plist-get args :as)))
+                   ;; The "download" writes the ciphertext blob.
+                   (write-region "" nil (nth 1 (plist-get args :as)))
+                   (funcall (plist-get args :then))))
+                ((symbol-function #'leman-e2ee-decrypt-file)
+                 (lambda (_agent input output key iv sha256)
+                   (push (list input output key iv sha256) decrypt-calls)
+                   (setf downloaded nil)
+                   ;; The "decryption" writes the plaintext.
+                   (write-region "" nil output))))
+        (leman-room-download-file event destination)))
+    ;; The ciphertext went to a temp file, which was decrypted to the
+    ;; destination and removed.
+    (let ((call (car decrypt-calls)))
+      (should (string-prefix-p (file-name-as-directory temporary-file-directory)
+                               (nth 0 call)))
+      (should (equal (nth 1 call) destination))
+      (should (equal (nth 2 call) "k"))
+      (should (equal (nth 3 call) "iv"))
+      (should (equal (nth 4 call) "hash"))
+      (should-not (file-exists-p (nth 0 call))))
+    (should-not downloaded)))
+
+(ert-deftest leman-room-download-file-sanitizes-remote-filename ()
+  ;; Remote senders control the attachment filename: a crafted name
+  ;; must not escape the download directory.
+  (let* ((leman-session (make-leman-session
+                         :server (make-leman-server :name "x.org" :uri-prefix "https://x.org")))
+         (room (make-leman-room :id "!room:x.org"))
+         (dir (make-temp-file "leman-download-test-" t))
+         (downloaded nil))
+    (cl-letf (((symbol-function #'leman--media-request)
+               (lambda (_url _session &rest args)
+                 (setf downloaded (nth 1 (plist-get args :as))))))
+      (dolist (name '("../../.bashrc" "sub/../../evil.txt" ".." "."))
+        (let ((event (make-leman-event :id "$f" :type "m.room.message"
+                                       :content (list 'msgtype "m.file"
+                                                      'url "mxc://x.org/abc"
+                                                      'filename name
+                                                      'body "whatever"))))
+          (setf downloaded nil)
+          (leman-room-download-file event dir)
+          (should downloaded)
+          (should (equal (file-name-directory
+                          (directory-file-name downloaded))
+                         (file-name-as-directory
+                          (directory-file-name dir)))))))))
 
 (ert-deftest leman-ignore-user-sends-empty-object-values ()
   ;; The spec requires each ignored user's value to be an empty

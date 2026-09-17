@@ -98,7 +98,11 @@ can read the user's files can extract the key material."
   ;; content built with `leman-alist'), which `json-serialize'
   ;; rejects.  Absent sync fields then encode as null rather than an
   ;; empty object; the agent treats both the same.  Arrays may be
-  ;; lists or vectors; both encode as JSON arrays.
+  ;; lists or vectors; both encode as JSON arrays.  The same applies
+  ;; in the response direction: decoded homeserver responses
+  ;; (e.g. mark_request_as_sent's "response") lose their empty
+  ;; objects to nil here and re-encode as null; the agent normalizes
+  ;; that back (param_not_null / null_members_to_maps in lib.rs).
   (json-encode (append (list (cons 'id id)
                              (cons 'cmd command))
                        (when params
@@ -199,28 +203,32 @@ or does not respond within TIMEOUT seconds
          (deadline (+ (float-time) (or timeout leman-e2ee-request-timeout)))
          result)
     (leman-e2ee--send agent (leman-e2ee--encode id command params))
-    (while (and (not result)
-                (< (float-time) deadline))
-      (setq result (gethash id (leman-e2ee-pending agent)))
-      (unless result
-        (let ((process (leman-e2ee-process agent)))
-          (cond
-           ((and process (not (process-live-p process)))
-            (signal 'leman-e2ee-error
-                    (list "exit" (or (leman-e2ee-exit agent)
-                                     "agent is not running"))))
-           ;; NOTE: JUST-THIS-PROCESS: only the agent's output is
-           ;; processed while waiting.  Without it, other processes'
-           ;; filters (e.g. the sync's, and the outgoing requests'
-           ;; mark-as-sent responses) fire right here and run their
-           ;; own agent requests, nesting arbitrarily deep: with busy
-           ;; syncs this froze Emacs after confirming the emoji (the
-           ;; verification's MAC never got pumped).  Homeserver
-           ;; responses are processed at the next top-level wait
-           ;; instead (e.g. the dance's `sleep-for'); the agent's
-           ;; sequential protocol makes interleaved responses safe.
-           (t (accept-process-output process 0 100 t))))))
-    (remhash id (leman-e2ee-pending agent))
+    ;; The pending entry is always removed, even when the wait is
+    ;; aborted by a signal (e.g. the agent's death): an accumulating
+    ;; table would leak memory across the agent's lifetime.
+    (unwind-protect
+        (while (and (not result)
+                    (< (float-time) deadline))
+          (setq result (gethash id (leman-e2ee-pending agent)))
+          (unless result
+            (let ((process (leman-e2ee-process agent)))
+              (cond
+               ((and process (not (process-live-p process)))
+                (signal 'leman-e2ee-error
+                        (list "exit" (or (leman-e2ee-exit agent)
+                                         "agent is not running"))))
+               ;; NOTE: JUST-THIS-PROCESS: only the agent's output is
+               ;; processed while waiting.  Without it, other processes'
+               ;; filters (e.g. the sync's, and the outgoing requests'
+               ;; mark-as-sent responses) fire right here and run their
+               ;; own agent requests, nesting arbitrarily deep: with busy
+               ;; syncs this froze Emacs after confirming the emoji (the
+               ;; verification's MAC never got pumped).  Homeserver
+               ;; responses are processed at the next top-level wait
+               ;; instead (e.g. the dance's `sleep-for'); the agent's
+               ;; sequential protocol makes interleaved responses safe.
+               (t (accept-process-output process 0 100 t))))))
+      (remhash id (leman-e2ee-pending agent)))
     (cond
      (result
       (pcase result
@@ -288,13 +296,18 @@ E.g. \"/_matrix/client/v3/keys/upload\" -> (\"v3\" \"keys/upload\")."
   "Return non-nil when the agent PROGRAM is older than its source.
 LOAD-DIR is the Leman installation directory (for tests)."
   (let* ((load-dir (or load-dir (leman-e2ee--load-dir)))
-         (source (expand-file-name "e2ee/agent/src/lib.rs" load-dir)))
-    (and (file-exists-p source)
-         (file-exists-p program)
-         (time-less-p (file-attribute-modification-time
-                       (file-attributes program))
-                      (file-attribute-modification-time
-                       (file-attributes source))))))
+         (program-time (and (file-exists-p program)
+                            (file-attribute-modification-time
+                             (file-attributes program)))))
+    (and program-time
+         (seq-some (lambda (file)
+                     (and-let* ((source (expand-file-name
+                                         (concat "e2ee/agent/src/" file) load-dir))
+                                ((file-exists-p source)))
+                       (time-less-p program-time
+                                    (file-attribute-modification-time
+                                     (file-attributes source)))))
+                   '("lib.rs" "main.rs")))))
 
 (defun leman-e2ee-build-agent ()
   "Build the E2EE agent program with cargo.
@@ -475,6 +488,30 @@ requests, then retry).  Signal `leman-e2ee-error' on failure."
                             (cons 'event_type event-type)
                             (cons 'content content)
                             (cons 'users (vconcat users)))))
+
+(defun leman-e2ee-encrypt-file (agent input output)
+  "Encrypt the file at INPUT for an encrypted attachment with AGENT.
+The ciphertext is written to OUTPUT, which the caller uploads
+instead of INPUT.  Return an alist of ~key~ (URL-safe unpadded
+base64), ~iv~, and ~sha256~ (both standard unpadded base64), for
+building the event's \"file\" object.  Signal `leman-e2ee-error'
+on failure."
+  (leman-e2ee-request agent "encrypt_file"
+                      (list (cons 'input input)
+                            (cons 'output output))))
+
+(defun leman-e2ee-decrypt-file (agent input output key iv sha256)
+  "Verify and decrypt downloaded ciphertext at INPUT with AGENT.
+The plaintext is written to OUTPUT.  KEY, IV, and SHA256 are in
+the format returned by `leman-e2ee-encrypt-file' (the hash is of
+the ciphertext, as included in the event).  Signal
+`leman-e2ee-error' on failure, including hash mismatch."
+  (leman-e2ee-request agent "decrypt_file"
+                      (list (cons 'input input)
+                            (cons 'output output)
+                            (cons 'key key)
+                            (cons 'iv iv)
+                            (cons 'sha256 sha256))))
 
 ;;;; Verification (E3)
 

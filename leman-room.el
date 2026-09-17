@@ -122,6 +122,8 @@ Used to, e.g. call `leman-room-compose-org'.")
 (declare-function leman-notify-switch-to-notifications-buffer "leman-notify")
 (declare-function leman--update-unread-indicator "leman")
 (declare-function leman--make-event "leman")
+(declare-function leman-e2ee-encrypt-file "leman-e2ee")
+(declare-function leman-e2ee-decrypt-file "leman-e2ee")
 (declare-function leman-e2ee--decrypt-event-struct "leman")
 (declare-function leman-e2ee--retry-decryption "leman")
 
@@ -320,6 +322,14 @@ Does not include filenames, emotes, etc.")
 (defvar leman-room-images)
 (defvar leman-thread-root-id)
 
+;; In-flight HTML image fetches: see `leman-room--fetch-html-image'.
+(defvar leman-room--fetching-html-images nil
+  "Alist of HTML image fetches already queued.
+Each element is (URL . (EVENT . ROOM)...): the fetches currently
+in flight, and the events to re-render when their image arrives.
+Re-renders while a fetch is in flight register the event as
+waiting instead of queueing a duplicate fetch for the same URL.")
+
 ;; Defined in Emacs 28.1: silence byte-compilation warning in earlier versions.
 (defvar browse-url-handlers)
 
@@ -494,8 +504,7 @@ rendered event may be limited."
                  (const :tag "An unlimited number of events"
                         ;; NOTE: As this docstring says, in most cases it should be fine,
                         ;; but since in those rare cases the problem can be unusually bad
-                        ;; (e.g. taking 15 minutes to render a room's events in
-                        ;; <https://github.com/alphapapa/ement.el/issues/247>), we default
+                        ;; (e.g. taking 15 minutes to render a room's events), we default
                         ;; to a safer choice.
                         :doc "Note that this choice may cause performance problems in rooms with very large numbers of consecutive membership events, but in most cases it should be fine."
                         t)
@@ -1802,8 +1811,27 @@ otherwise use current room."
       :then (lambda (_data)
               (message "Topic set (%s): %s" display-name topic)))))
 
+(defun leman-room--encrypted-file-object (file-info content-uri)
+  "Return the spec's EncryptedFile object for FILE-INFO and CONTENT-URI.
+FILE-INFO is `leman-e2ee-encrypt-file''s response; CONTENT-URI is
+the mxc:// URI of the uploaded ciphertext."
+  (pcase-let* (((map ('key key) ('iv iv) ('sha256 sha256)) file-info))
+    (leman-alist "url" content-uri
+                 "v" "v2"
+                 "key" (leman-alist "kty" "oct"
+                                    "alg" "A256CTR"
+                                    "k" key
+                                    "ext" t
+                                    "key_ops" (list "encrypt" "decrypt"))
+                 "iv" iv
+                 "hashes" (leman-alist "sha256" sha256))))
+
 (cl-defun leman-room-send-file (file body room session &key (msgtype "m.file"))
   "Send FILE to ROOM on SESSION, using message BODY and MSGTYPE.
+In an encrypted room, FILE is encrypted before upload (spec:
+\"Sending encrypted attachments\"): the ciphertext is uploaded and
+the event references it with a \"file\" object carrying the key,
+IV, and hash, Megolm-encrypted like any other message content.
 Interactively, with prefix, prompt for room and session,
 otherwise use current room."
   ;; TODO: Support URLs to remote files.
@@ -1823,23 +1851,62 @@ otherwise use current room."
     (pcase-let* ((filename (file-name-nondirectory file))
                  (extension (or (file-name-extension file) ""))
                  (mime-type (mailcap-extension-to-mime extension))
-                 (data `(file ,file))
-                 (size (file-attribute-size (file-attributes file))))
-      (leman-upload session :data data :filename filename :content-type mime-type
+                 (size (file-attribute-size (file-attributes file)))
+                 ;; E2EE: the file must be encrypted BEFORE upload
+                 ;; (the homeserver must never see the plaintext), so
+                 ;; the agent is required up front: failing here means
+                 ;; nothing plaintext was uploaded.
+                 (agent (and (leman-room--encrypted-p room)
+                             leman-encrypt-send-content-function
+                             (leman-session-e2ee session)))
+                 (encrypted-file-info
+                  (when (leman-room--encrypted-p room)
+                    (unless agent
+                      (signal 'leman-e2ee-error
+                              (list "encrypt"
+                                    (format "room %s is encrypted but no E2EE agent is running; see M-x leman-e2ee-status"
+                                            (leman-room-id room)))))
+                    (let ((encrypted (make-temp-file "leman-encrypt-")))
+                      (prog1 (leman-e2ee-encrypt-file agent file encrypted)
+                        ;; The temp file is deleted after the upload
+                        ;; completes; if the upload fails it leaks
+                        ;; into `temporary-file-directory', cleaned
+                        ;; up by the system.
+                        (setf file encrypted)))))
+                 (data `(file ,file)))
+      (leman-upload session :data data :filename filename
+        :content-type (if encrypted-file-info "application/octet-stream" mime-type)
         :then (lambda (data)
                 (message "Uploaded file %S.  Sending message..." file)
                 (pcase-let* (((map ('content_uri content-uri)) data)
                              ((cl-struct leman-room (id room-id)) room)
-                             (endpoint (format "rooms/%s/send/%s/%s" (url-hexify-string room-id)
-                                               "m.room.message" (leman--update-transaction-id session)))
-                             ;; TODO: Image height/width (maybe not easy to get in Emacs).
-                             (content (leman-alist "msgtype" msgtype
-                                                   "url" content-uri
-                                                   "body" body
-                                                   "filename" filename
-                                                   "info" (leman-alist "mimetype" mime-type
-                                                                       "size" size))))
-                  (leman-api session endpoint :method 'put :data (json-encode content)
+                             ;; Per spec: "file" (an EncryptedFile)
+                             ;; replaces "url" for encrypted
+                             ;; attachments.
+                             (media-entry (if encrypted-file-info
+                                              (cons "file" (leman-room--encrypted-file-object
+                                                            encrypted-file-info content-uri))
+                                            (cons "url" content-uri)))
+                             (content (cons media-entry
+                                            (leman-alist "msgtype" msgtype
+                                                         "body" body
+                                                         "filename" filename
+                                                         "info" (rassq-delete-all
+                                                                 nil (leman-alist "mimetype" mime-type
+                                                                                  "size" size)))))
+                             (event-type "m.room.message"))
+                  ;; E2EE: Megolm-encrypt the message content like any
+                  ;; other message (the file key must not be visible
+                  ;; to the homeserver).
+                  (when leman-encrypt-send-content-function
+                    (pcase-let ((`(,encrypted-content . ,encrypted-type)
+                                 (funcall leman-encrypt-send-content-function session room content)))
+                      (setf content encrypted-content
+                            event-type encrypted-type)))
+                  (leman-api session (format "rooms/%s/send/%s/%s"
+                                             (url-hexify-string room-id) event-type
+                                             (leman--update-transaction-id session))
+                    :method 'put :data (json-encode content)
                     :then (apply-partially #'leman-room-send-event-callback
                                            :room room :session session :content content :data))))))))
 
@@ -2299,6 +2366,8 @@ mentioning the ROOM and CONTENT."
 (defun leman-room-edit-message-prepare ()
   "Bindings for `leman-room-edit-message' and `leman-room-compose-edit'."
   (cl-assert leman-ewoc) (cl-assert leman-session)
+  (unless (leman-event-p (ewoc-data (ewoc-locate leman-ewoc)))
+    (user-error "No event at point"))
   ;; Bindings for... `event' (from ewoc).
   (pcase-let* ((event (ewoc-data (ewoc-locate leman-ewoc)))
                ;; `user' (from leman-session).
@@ -2328,9 +2397,7 @@ itself an edit of another event, the original event is edited."
                          (user-error "To delete a message, use command `leman-room-delete-message'"))
                        (when (yes-or-no-p (format "Edit message to: %S? " body))
                          (list leman-room-editing-event leman-room leman-session body)))))))
-  (let* ((endpoint (format "rooms/%s/send/%s/%s" (url-hexify-string (leman-room-id room))
-                           "m.room.message" (leman--update-transaction-id session)))
-         (new-content (leman-alist "body" body
+  (let* ((new-content (leman-alist "body" body
                                    "msgtype" "m.text"))
          (_ (when leman-room-send-message-filter
               (setf new-content (funcall leman-room-send-message-filter new-content room))))
@@ -2340,11 +2407,18 @@ itself an edit of another event, the original event is edited."
                                "m.new_content" new-content
                                "m.relates_to" (leman-alist
                                                "rel_type" "m.replace"
-                                               "event_id" (leman-event-id original-event)))))
-    ;; Prepend the asterisk after the filter may have modified the content.  Note that the
-    ;; "m.new_content" body does not get the leading asterisk, only the "content" body,
-    ;; which is intended as a fallback.
-    (setf body (concat "* " body))
+                                               "event_id" (leman-event-id original-event))))
+         ;; E2EE: like `leman-send-message', encrypt the edit when the
+         ;; room requires it (the function also determines the event
+         ;; type to send).
+         (event-type "m.room.message")
+         (_ (when leman-encrypt-send-content-function
+              (pcase-let ((`(,encrypted-content . ,encrypted-type)
+                           (funcall leman-encrypt-send-content-function session room content)))
+                (setf content encrypted-content
+                      event-type encrypted-type))))
+         (endpoint (format "rooms/%s/send/%s/%s" (url-hexify-string (leman-room-id room))
+                           event-type (leman--update-transaction-id session))))
     (leman-api session endpoint :method 'put :data (json-encode content)
       :then (apply-partially #'leman-room-send-event-callback :room room :session session
                              :content content :data))))
@@ -2352,6 +2426,8 @@ itself an edit of another event, the original event is edited."
 (defun leman-room-delete-message (event room session &optional reason)
   "Delete EVENT in ROOM on SESSION, optionally with REASON."
   (interactive (leman-room-with-highlighted-event-at (point)
+                 (unless (leman-event-p (ewoc-data (ewoc-locate leman-ewoc)))
+                   (user-error "No event at point"))
                  (if (yes-or-no-p "Delete this event? ")
                      (list (ewoc-data (ewoc-locate leman-ewoc))
                            leman-room leman-session (read-string "Reason (optional): " nil nil nil 'inherit-input-method))
@@ -2619,15 +2695,20 @@ If SET-PREV-BATCH and END, set ROOM's prev-batch slot to END."
       ;; NOTE: See note in `leman--update-room-buffers'.
       (when-let ((buffer-window (get-buffer-window buffer)))
         (select-window buffer-window))
-      ;; FIXME: Use retro-loading in event handlers, or in --handle-events, anyway.
-      (leman-room--process-events chunk)
-      ;; Don't set the slot if the response doesn't include an "end" token (that
-      ;; would cause subsequent retro requests to fetch events from the end of the
-      ;; timeline, as if we had just joined).
-      (when (and set-prev-batch end)
-        ;; This feels a little hacky, but maybe not too bad.
-        (setf (leman-room-prev-batch room) end))
-      (setf leman-room-retro-loading nil))))
+      ;; Always reset the flag, even if processing an event signals:
+      ;; a stuck flag would block all future retro loading for the
+      ;; room's buffer.
+      (unwind-protect
+          (progn
+            ;; FIXME: Use retro-loading in event handlers, or in --handle-events, anyway.
+            (leman-room--process-events chunk)
+            ;; Don't set the slot if the response doesn't include an "end" token (that
+            ;; would cause subsequent retro requests to fetch events from the end of the
+            ;; timeline, as if we had just joined).
+            (when (and set-prev-batch end)
+              ;; This feels a little hacky, but maybe not too bad.
+              (setf (leman-room-prev-batch room) end)))
+        (setf leman-room-retro-loading nil)))))
 
 (cl-defun leman-room-retro-callback (room session data
                                            &key (set-prev-batch t))
@@ -3163,7 +3244,10 @@ buffer."
            for handler = (when event
                            (alist-get (leman-event-type event) leman-room-event-fns nil nil #'equal))
            when handler
-           do (funcall handler event)
+           ;; A malformed event must not abort processing of the
+           ;; remaining events in the batch.
+           do (with-demoted-errors "Leman: Error processing event: %S"
+                (funcall handler event))
            do (leman-progress-update))
   (leman-room--insert-ts-headers))
 
@@ -3178,8 +3262,7 @@ buffer should be a room's buffer."
                         (alist-get (leman-event-type event) leman-room-event-fns nil nil #'equal))))
     ;; We demote any errors that happen while processing events, because it's possible for
     ;; events to be malformed in unexpected ways, and that could cause an error, which
-    ;; would stop processing of other events and prevent further syncing.  See,
-    ;; e.g. <https://github.com/alphapapa/ement.el/pull/61>.
+    ;; would stop processing of other events and prevent further syncing.
     (with-demoted-errors "Leman (leman-room--process-event): Error processing event: %S"
       (funcall handler event))))
 
@@ -3214,10 +3297,16 @@ function to `leman-room-event-fns', which see."
              ;; Every time a room buffer is made, these reaction events are processed again, so we use pushnew to
              ;; avoid duplicates.  (In the future, as event-processing is refactored, this may not be necessary.)
              (cl-pushnew event (map-elt (leman-event-local related-event) 'reactions))
+             ;; The node may hold the related event itself or an
+             ;; edit of it (edits replace the original in the
+             ;; buffer), so match either.
              (when-let ((nodes (leman-room--ewoc-last-matching leman-ewoc
                                  (lambda (data)
                                    (and (leman-event-p data)
-                                        (equal related-id (leman-event-id data)))))))
+                                        (or (equal related-id (leman-event-id data))
+                                            (equal related-id
+                                                   (map-nested-elt (leman-event-content data)
+                                                                   '(m.relates_to event_id)))))))))
                (ewoc-invalidate leman-ewoc nodes))))
          ;; No known related event in the timeline: maybe it's a thread
          ;; reply (thread replies are not shown in the timeline).
@@ -4002,7 +4091,16 @@ If replaced event is not found, return nil, otherwise non-nil."
     (when old-event-node
       ;; TODO: Record old events in new event's local data, and make it accessible when inspecting the new event.
       (let ((node-before (ewoc-prev ewoc old-event-node))
-            (inhibit-read-only t))
+            (inhibit-read-only t)
+            (old-event (ewoc-data old-event-node)))
+        ;; The original event's client-side data (e.g. reactions) and
+        ;; read receipts are attached to it: carry them over so they
+        ;; aren't lost when the edit replaces it in the buffer.
+        (when-let ((old-local (leman-event-local old-event)))
+          (setf (leman-event-local new-event)
+                (append (leman-event-local new-event) old-local)))
+        (when-let ((old-receipts (leman-event-receipts old-event)))
+          (setf (leman-event-receipts new-event) old-receipts))
         (ewoc-delete ewoc old-event-node)
         (if node-before
             (ewoc-enter-after ewoc node-before new-event)
@@ -4771,21 +4869,43 @@ thread root), the thread view is re-rendered too."
   "Fetch image URL for EVENT in ROOM, asynchronously.
 TOKEN is the bearer token, for authenticated media URLs.  When
 the data arrives, it is stored in the URL cache -- where the
-renderer picks it up -- and EVENT's node is invalidated,
-re-rendering the message with the image displayed."
+renderer picks it up -- and every event waiting for the URL (at
+least EVENT) is invalidated, re-rendering its message with the
+image displayed.
+
+While a fetch for URL is already in flight, EVENT is registered
+as waiting and no new request is made: re-renders (e.g. caused by
+receipts or typing notifications) must not amplify the fetch into
+a duplicate request each time."
   (declare (indent defun))
   (unless (url-is-cached url)
-    (plz-run
-     (plz-queue leman-images-queue
-       'get url :as 'binary :noquery t
-       :headers (when token
-                  (list (cons "Authorization" (concat "Bearer " token))))
-       :then (lambda (data)
-               (leman-room--store-image-in-url-cache url data)
-               ;; Re-render the event so the image is displayed.
-               (leman-room--invalidate-event-node event room))
-       :else (lambda (plz-error)
-               (leman-debug "HTML image fetch failed:" url plz-error))))))
+    (if-let ((fetching (assoc url leman-room--fetching-html-images)))
+        ;; Already fetching: register EVENT to be re-rendered when
+        ;; the image arrives.
+        (cl-pushnew (cons event room) (cdr fetching) :test #'equal)
+      (cl-pushnew (list url (cons event room)) leman-room--fetching-html-images
+                  :test #'equal)
+      (plz-run
+       (plz-queue leman-images-queue
+         'get url :as 'binary :noquery t
+         :headers (when token
+                    (list (cons "Authorization" (concat "Bearer " token))))
+         :then (lambda (data)
+                 (leman-room--store-image-in-url-cache url data)
+                 ;; Re-render every event waiting for this URL, and
+                 ;; stop tracking the fetch.
+                 (when-let ((entry (assoc url leman-room--fetching-html-images)))
+                   (setf leman-room--fetching-html-images
+                         (delq entry leman-room--fetching-html-images))
+                   (pcase-dolist (`(,waiting-event . ,waiting-room) (cdr entry))
+                     (leman-room--invalidate-event-node waiting-event waiting-room))))
+         :else (lambda (plz-error)
+                 ;; Stop tracking the failed fetch: waiting events
+                 ;; keep their current rendering (as before).
+                 (setf leman-room--fetching-html-images
+                       (delq (assoc url leman-room--fetching-html-images)
+                             leman-room--fetching-html-images))
+                 (leman-debug "HTML image fetch failed:" url plz-error)))))))
 
 (defun leman-room--shr-image-data (url)
   "Return image spec for URL from the URL cache, if present.
@@ -5791,7 +5911,11 @@ See `leman-room-compose-history-isearch-push-state'."
                     ;; The event's previous displayname, or the state key.
                     `(propertize (or prev-displayname state-key)
                                  'help-echo state-key)))
-      (pcase-exhaustive new-membership
+      ;; Not `pcase-exhaustive': valid rooms may have "knock" and
+      ;; "knock_restricted" memberships (rooms v8+), and a malformed
+      ;; event could have a nil or garbage membership; render those
+      ;; instead of crashing the buffer's rendering.
+      (pcase new-membership
         ("invite"
          (pcase prev-membership
            ((or "leave" '())
@@ -5866,7 +5990,13 @@ See `leman-room-compose-history-isearch-push-state'."
                     reason-suffix))
            (_ (format "%s sent unrecognized ban event for %s"
                       (sender-name-id-string)
-                      (prev-displayname-state-key-string)))))))))
+                      (prev-displayname-state-key-string)))))
+        (_
+         ;; "knock" and "knock_restricted" (rooms v8+), or garbage:
+         ;; render, don't crash.
+         (format "%s sent unrecognized membership event for %s"
+                 (sender-name-id-string)
+                 (new-displayname-sender-name-state-key-string)))))))
 ;; NOTE: Widgets are only currently used for single membership events, not grouped ones.
 
 (defun leman-room--pair-events (events others)
@@ -6087,7 +6217,6 @@ options `leman-room-image-thumbnail-height' and
                (use-window-body-size (not (and (numberp max-height)
                                                (= window-height max-height))))
                ;; Image scaling commands set :max-height and friends to nil.
-               ;; See <https://github.com/alphapapa/ement.el/issues/39>.
                (new-height (if use-window-body-size
                                window-height
                              (max leman-room-image-thumbnail-height-min
@@ -6747,15 +6876,26 @@ otherwise, download to the filename.  Interactively, download to
                             (string eww-download-directory)
                             (function (funcall eww-download-directory))))))))
   (pcase-let* (((cl-struct leman-event
-                           (content (map ('filename event-filename) ('url mxc-url)
-                                         body)))
+                           (content (map ('filename event-filename) ('url plain-url)
+                                         ('file encrypted-file) body)))
                 event)
+               ;; For encrypted attachments, the mxc:// URI of the
+               ;; ciphertext lives inside the "file" object.
+               (mxc-url (or plain-url (map-elt encrypted-file 'url)))
                (started-at (current-time))
                (filename (if (not event-filename)
                              body
                            (if (equal body event-filename)
                                body
-                             event-filename))))
+                             event-filename)))
+               ;; The remote sender controls the attachment's filename:
+               ;; keep only its base name so a crafted name can't write
+               ;; outside DESTINATION (blank, ".", or ".." becomes
+               ;; "download").
+               (filename (cond ((member filename '("" "." "..")) "download")
+                               (filename (directory-file-name
+                                          (file-name-nondirectory filename)))
+                               (t filename))))
     (when (file-directory-p destination)
       (unless (file-exists-p destination)
         (make-directory destination 'parents))
@@ -6769,18 +6909,44 @@ otherwise, download to the filename.  Interactively, download to
     ;; TODO: For bonus points, provide a way to cancel a download (otherwise the user
     ;; would have to use `list-processes' and find the right one to delete), and to see
     ;; progress (perhaps borrowing some of the relevant code in hyperdrive.el).
-    (leman--media-request mxc-url leman-session :authenticatedp t
-      :as `(file ,destination)
-      :then (lambda (&rest _)
-              (let* ((file-size (file-attribute-size
-                                 (file-attributes destination)))
-                     (duration (float-time (time-subtract (current-time) started-at)))
-                     (speed (file-size-human-readable (/ file-size duration))))
-                (message "File downloaded: %S (%s in %s at %s/sec) "
-                         destination (file-size-human-readable file-size)
-                         (format-seconds "%h:%m:%s%z seconds" duration)
-                         speed))))
-    (message "Downloading to %S..." destination)))
+    (let ((download-file (if encrypted-file
+                             (make-temp-file "leman-download-")
+                           destination)))
+      (leman--media-request mxc-url leman-session :authenticatedp t
+        :as `(file ,download-file)
+        :then (lambda (&rest _)
+                (when encrypted-file
+                  ;; Verify and decrypt the downloaded ciphertext
+                  ;; (hash first), then remove it.
+                  (unwind-protect
+                      (leman-room--decrypt-download-file
+                       encrypted-file download-file destination)
+                    (ignore-errors (delete-file download-file))))
+                (let* ((file-size (file-attribute-size
+                                   (file-attributes destination)))
+                       (duration (float-time (time-subtract (current-time) started-at)))
+                       (speed (file-size-human-readable (/ file-size duration))))
+                  (message "File downloaded: %S (%s in %s at %s/sec) "
+                           destination (file-size-human-readable file-size)
+                           (format-seconds "%h:%m:%s%z seconds" duration)
+                           speed)))
+        :else (lambda (plz-error)
+                (ignore-errors (delete-file download-file))
+                (leman-api-error plz-error)))
+      (message "Downloading to %S..." destination))))
+
+(defun leman-room--decrypt-download-file (encrypted-file input output)
+  "Decrypt the downloaded ciphertext at INPUT to OUTPUT.
+ENCRYPTED-FILE is the event content's \"file\" object.  The
+ciphertext's hash is verified with the agent before decrypting
+(the hash is of the ciphertext, as included in the event)."
+  (let ((agent (leman-session-e2ee leman-session)))
+    (unless agent
+      (user-error "No E2EE agent running to decrypt the downloaded file; see M-x leman-e2ee-status"))
+    (leman-e2ee-decrypt-file agent input output
+                             (map-nested-elt encrypted-file '(key k))
+                             (map-elt encrypted-file 'iv)
+                             (map-nested-elt encrypted-file '(hashes sha256)))))
 
 ;;;; Footer
 

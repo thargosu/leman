@@ -65,8 +65,7 @@ Used for caching section visibility."
   ;; the taxy hierarchy that would allow the path to be saved into each taxy.
   (pcase-exhaustive (oref section value)
     ;; FIXME(emacs-28): Use `(cl-type taxy-magit-section)' and `(cl-type leman-room)', et
-    ;; al. when requiring Emacs 28.  See
-    ;; <https://github.com/alphapapa/ement.el/issues/272>.
+    ;; al. when requiring Emacs 28.
     ((and (pred taxy-magit-section-p) it)
      (taxy-name it))
     (`[,(and (pred leman-room-p) room)
@@ -313,7 +312,7 @@ from recent to non-recent for rooms updated in the past hour."
                (or name (format "Newer than %s seconds" newer-than))))
             (older-than
              (when (>= age older-than)
-               (or name (format "Older than %s seconds" newer-than))))
+               (or name (format "Older than %s seconds" older-than))))
             (t
              ;; Default to rooms with traffic in the last day.
              (if (<= age 86400)

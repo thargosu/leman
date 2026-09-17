@@ -184,13 +184,21 @@ reporter's min-value to its max-value."
                                        `(make-progress-reporter ,@reporter-args))))
        ;; We use `cl-letf' rather than `cl-labels', because labels expand to lambdas and funcalls,
        ;; so other functions that call `leman-progress-update' wouldn't call this definition.
+       ;; Note that a nil reporter value implies :when evaluated to nil, so the reporter's
+       ;; state needn't be evaluated twice.
        (cl-letf (((symbol-function 'leman-progress-update)
                   ,(if when-form
-                       `(if ,when-form
+                       `(if ,progress-reporter-sym
                             ,update-fn
                           #'ignore)
                      update-fn)))
          ,@body
+         ,(if when-form
+              ;; Finalize the reporter (e.g. remove the mode-line
+              ;; spinner), even when BODY made fewer (or no) updates
+              ;; than the reporter's max-value.
+              `(when ,progress-reporter-sym
+                 (progress-reporter-done ,progress-reporter-sym)))
          (leman-debug (format "Leman: Progress reporter done (took %.2f seconds)"
                               (float-time (time-subtract (current-time) ,start-time-sym))))))))
 
@@ -232,8 +240,7 @@ BODY may begin with property list arguments, including:
   "Like `propertize', but auto-set `font-lock-face' property.
 If the `face' property is set, also set the `font-lock-face' property to
 the same value."
-  ;; This is a workaround for a change in `magit-section'; see
-  ;; <https://github.com/alphapapa/ement.el/issues/331>.  By setting both face properties,
+  ;; This is a workaround for a change in `magit-section'.  By setting both face properties,
   ;; we should preserve backward compatibility.  Someday this can be removed and we'll
   ;; just call `propertize' again.
   (declare (indent defun))

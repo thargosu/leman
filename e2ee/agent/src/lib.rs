@@ -639,6 +639,23 @@ impl Agent {
             // the event could never be decrypted by other members.
             return Err(AgentError::Crypto(anyhow!("empty users")));
         }
+        let mut has_recipient_device = false;
+        for user in &users {
+            if machine
+                .get_user_devices(user, None)
+                .await
+                .map_err(crypto_error)?
+                .devices()
+                .next()
+                .is_some()
+            {
+                has_recipient_device = true;
+                break;
+            }
+        }
+        if !has_recipient_device {
+            return Err(AgentError::Crypto(anyhow!("no recipient devices")));
+        }
 
         // Claim one-time keys for devices we have no Olm session with.
         if let Some((txn_id, claim_request)) = machine
@@ -665,6 +682,16 @@ impl Agent {
             return Ok(json!({"status": "claims_pending"}));
         }
 
+        // An existing session yields no requests after its key has
+        // already been shared.  A new session with no requests would
+        // black-hole the event instead.
+        let had_room_key = machine
+            .store()
+            .get_outbound_group_session(&room_id)
+            .await
+            .map_err(crypto_error)?
+            .is_some();
+
         // Share the room key with the members' devices.  The share
         // requests are stashed as outgoing requests; other clients
         // cannot decrypt until the client has performed them.
@@ -676,15 +703,7 @@ impl Agent {
             )
             .await
             .map_err(crypto_error)?;
-        // Fail closed like the empty-users check: when the key was
-        // shared with nobody (e.g. members' devices undiscovered),
-        // the messages could never be decrypted by anyone, and the
-        // sender must see the failure instead of believing success.
-        let share_count: usize = share_requests
-            .iter()
-            .map(|send| send.messages.values().map(|devices| devices.len()).sum::<usize>())
-            .sum();
-        if share_count == 0 {
+        if share_requests.is_empty() && !had_room_key {
             return Err(AgentError::Crypto(anyhow!(
                 "room key shared with nobody; refusing to encrypt"
             )));
@@ -1449,6 +1468,15 @@ impl Agent {
             .context("decoding iv")?;
         let sha256 = base64_decode_relaxed(param_str(&params, "sha256")?)
             .context("decoding sha256")?;
+        if key.len() != 32 {
+            return Err(AgentError::Crypto(anyhow!("invalid key length")));
+        }
+        if iv.len() != 8 {
+            return Err(AgentError::Crypto(anyhow!("invalid IV length")));
+        }
+        if sha256.len() != 32 {
+            return Err(AgentError::Crypto(anyhow!("invalid SHA-256 length")));
+        }
         decrypt_file_to(&input, &output, &key, &iv, &sha256)
             .await
             .map_err(crypto_error)?;
@@ -1474,10 +1502,13 @@ pub(crate) mod file_crypto {
 
     /// The 16-byte initial counter block: the 8-byte IV followed by
     /// 8 zero bytes.
-    fn counter_block(iv: &[u8]) -> [u8; 16] {
+    fn counter_block(iv: &[u8]) -> anyhow::Result<[u8; 16]> {
+        if iv.len() != 8 {
+            anyhow::bail!("invalid IV length: expected 8 bytes");
+        }
         let mut block = [0u8; 16];
         block[..iv.len()].copy_from_slice(iv);
-        block
+        Ok(block)
     }
 
     const CHUNK_SIZE: usize = 64 * 1024;
@@ -1490,7 +1521,7 @@ pub(crate) mod file_crypto {
         key: &[u8],
         iv: &[u8],
     ) -> anyhow::Result<[u8; 32]> {
-        let mut cipher = Aes256Ctr::new_from_slices(key, &counter_block(iv))
+        let mut cipher = Aes256Ctr::new_from_slices(key, &counter_block(iv)?)
             .context("building cipher")?;
         let mut reader = tokio::fs::File::open(input)
             .await
@@ -1541,7 +1572,7 @@ pub(crate) mod file_crypto {
         if hash.as_slice() != expected_sha256 {
             anyhow::bail!("ciphertext hash mismatch (file was likely altered by the homeserver)");
         }
-        let mut cipher = Aes256Ctr::new_from_slices(key, &counter_block(iv))
+        let mut cipher = Aes256Ctr::new_from_slices(key, &counter_block(iv)?)
             .context("building cipher")?;
         let mut reader = tokio::fs::File::open(input)
             .await
@@ -1634,6 +1665,17 @@ mod file_crypto_tests {
         altered[0] ^= 0xff;
         std::fs::write(&input, &altered).unwrap();
         let result = decrypt_file_to(&input, &output, &key, &iv, &sha256).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_iv_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("plain");
+        let output = dir.path().join("cipher");
+        std::fs::write(&input, KAT_PLAINTEXT).unwrap();
+        let key = hex::decode(KAT_KEY_HEX).unwrap();
+        let result = encrypt_file_to(&input, &output, &key, &[0; 17]).await;
         assert!(result.is_err());
     }
 }

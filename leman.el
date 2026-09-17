@@ -2712,11 +2712,10 @@ Returns nil if unable to read `leman-sessions-file'."
      ;; start (writing in place would expose the tokens at umask
      ;; permissions until the later chmod), then atomically rename it.
      (let ((temp-file (make-temp-file
-                       (concat (file-name-nondirectory leman-sessions-file)
-                               "-")
-                       nil
-                       ".tmp"
-                       (file-name-directory leman-sessions-file))))
+                       (expand-file-name
+                        (concat (file-name-nondirectory leman-sessions-file) "-")
+                        (file-name-directory leman-sessions-file))
+                       nil ".tmp")))
        (unwind-protect
            (progn
              (chmod temp-file #o600)

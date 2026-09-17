@@ -1866,49 +1866,67 @@ otherwise use current room."
                               (list "encrypt"
                                     (format "room %s is encrypted but no E2EE agent is running; see M-x leman-e2ee-status"
                                             (leman-room-id room)))))
-                    (let ((encrypted (make-temp-file "leman-encrypt-")))
-                      (prog1 (leman-e2ee-encrypt-file agent file encrypted)
-                        ;; The temp file is deleted after the upload
-                        ;; completes; if the upload fails it leaks
-                        ;; into `temporary-file-directory', cleaned
-                        ;; up by the system.
-                        (setf file encrypted)))))
+                    (let ((encrypted (make-temp-file "leman-encrypt-"))
+                          encrypted-info)
+                      (unwind-protect
+                          (progn
+                            (setf encrypted-info
+                                  (leman-e2ee-encrypt-file agent file encrypted)
+                                  file encrypted)
+                            encrypted-info)
+                        ;; Once encryption succeeded this file is owned
+                        ;; by the upload callbacks below.  On failure,
+                        ;; remove the empty or partial ciphertext now.
+                        (unless encrypted-info
+                          (ignore-errors (delete-file encrypted)))))))
                  (data `(file ,file)))
-      (leman-upload session :data data :filename filename
+      (leman-upload session :data data
+        ;; The event's filename is Megolm-encrypted, but this upload
+        ;; parameter is not.  Do not disclose it to the homeserver.
+        :filename (unless encrypted-file-info filename)
         :content-type (if encrypted-file-info "application/octet-stream" mime-type)
         :then (lambda (data)
-                (message "Uploaded file %S.  Sending message..." file)
-                (pcase-let* (((map ('content_uri content-uri)) data)
-                             ((cl-struct leman-room (id room-id)) room)
-                             ;; Per spec: "file" (an EncryptedFile)
-                             ;; replaces "url" for encrypted
-                             ;; attachments.
-                             (media-entry (if encrypted-file-info
-                                              (cons "file" (leman-room--encrypted-file-object
-                                                            encrypted-file-info content-uri))
-                                            (cons "url" content-uri)))
-                             (content (cons media-entry
-                                            (leman-alist "msgtype" msgtype
-                                                         "body" body
-                                                         "filename" filename
-                                                         "info" (rassq-delete-all
-                                                                 nil (leman-alist "mimetype" mime-type
-                                                                                  "size" size)))))
-                             (event-type "m.room.message"))
-                  ;; E2EE: Megolm-encrypt the message content like any
-                  ;; other message (the file key must not be visible
-                  ;; to the homeserver).
-                  (when leman-encrypt-send-content-function
-                    (pcase-let ((`(,encrypted-content . ,encrypted-type)
-                                 (funcall leman-encrypt-send-content-function session room content)))
-                      (setf content encrypted-content
-                            event-type encrypted-type)))
-                  (leman-api session (format "rooms/%s/send/%s/%s"
-                                             (url-hexify-string room-id) event-type
-                                             (leman--update-transaction-id session))
-                    :method 'put :data (json-encode content)
-                    :then (apply-partially #'leman-room-send-event-callback
-                                           :room room :session session :content content :data))))))))
+                (unwind-protect
+                    (progn
+                      (message "Uploaded file %S.  Sending message..." filename)
+                      (pcase-let* (((map ('content_uri content-uri)) data)
+                                   ((cl-struct leman-room (id room-id)) room)
+                                   ;; Per spec: "file" (an EncryptedFile)
+                                   ;; replaces "url" for encrypted
+                                   ;; attachments.
+                                   (media-entry (if encrypted-file-info
+                                                    (cons "file" (leman-room--encrypted-file-object
+                                                                  encrypted-file-info content-uri))
+                                                  (cons "url" content-uri)))
+                                   (content (cons media-entry
+                                                  (leman-alist "msgtype" msgtype
+                                                               "body" body
+                                                               "filename" filename
+                                                               "info" (rassq-delete-all
+                                                                       nil (leman-alist "mimetype" mime-type
+                                                                                        "size" size)))))
+                                   (event-type "m.room.message"))
+                        ;; E2EE: Megolm-encrypt the message content like any
+                        ;; other message (the file key must not be visible
+                        ;; to the homeserver).
+                        (when leman-encrypt-send-content-function
+                          (pcase-let ((`(,encrypted-content . ,encrypted-type)
+                                       (funcall leman-encrypt-send-content-function session room content)))
+                            (setf content encrypted-content
+                                  event-type encrypted-type)))
+                        (leman-api session (format "rooms/%s/send/%s/%s"
+                                                   (url-hexify-string room-id) event-type
+                                                   (leman--update-transaction-id session))
+                          :method 'put :data (json-encode content)
+                          :then (apply-partially #'leman-room-send-event-callback
+                                                 :room room :session session :content content :data))))
+                  (when encrypted-file-info
+                    (ignore-errors (delete-file file)))))
+        :else (lambda (error)
+                (unwind-protect
+                    (leman-api-error error)
+                  (when encrypted-file-info
+                    (ignore-errors (delete-file file)))))))))
 
 (defun leman-room-send-image (file body room session)
   "Send image FILE to ROOM on SESSION, using message BODY.

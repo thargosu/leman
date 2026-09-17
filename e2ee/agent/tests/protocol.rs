@@ -472,6 +472,15 @@ async fn test_agent_encrypts_event() {
         .await
         .unwrap();
 
+    // Sharing an already-shared room key is a no-op.  It must not
+    // prevent subsequent messages from using that session.
+    let second = agent.request("encrypt_room_event", encrypt_params.clone());
+    assert_eq!(
+        second["ok"]["event"]["type"],
+        json!("m.room.encrypted"),
+        "second message should reuse the shared room key: {second}"
+    );
+
     // Alice decrypts the event the agent produced.
     let decrypted = alice
         .decrypt_room_event(

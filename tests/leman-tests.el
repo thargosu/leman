@@ -847,6 +847,29 @@ Restoring it lets E2EE skip its whoami call."
       (should (equal (leman-session-token restored) "tok"))
       (should (equal (leman-user-id (leman-session-user restored)) "@vv:x.org")))))
 
+(ert-deftest leman--write-sessions-uses-session-directory-for-temp-file ()
+  "The temporary file must share the destination filesystem for rename."
+  (let* ((directory (make-temp-file "leman-sessions-dir-" 'dir))
+         (leman-sessions-file (expand-file-name "sessions" directory))
+         (session (make-leman-session
+                   :user (make-leman-user :id "@vv:x.org" :username "vv")
+                   :server (make-leman-server :name "x.org" :uri-prefix "https://x.org")
+                   :token "tok"))
+         (arguments nil)
+         (real-make-temp-file (symbol-function #'make-temp-file)))
+    (unwind-protect
+        (cl-letf (((symbol-function #'make-temp-file)
+                   (lambda (&rest args)
+                     (setf arguments args)
+                     (apply real-make-temp-file args))))
+          (leman--write-sessions (list (cons "@vv:x.org" session))))
+      (delete-directory directory 'recursive))
+    (should (equal (file-name-directory (car arguments))
+                   (file-name-as-directory directory)))
+    (should (equal (nth 1 arguments) nil))
+    (should (equal (nth 2 arguments) ".tmp"))
+    (should-not (nth 3 arguments))))
+
 (ert-deftest leman-room-send-file-omits-unknown-mimetype ()
   ;; A nil mimetype (unknown file extension) must be omitted from the
   ;; message content: keeping the key would encode a JSON array of the
@@ -895,8 +918,9 @@ Restoring it lets E2EE skip its whoami call."
               ((symbol-function #'leman-message) #'ignore)
               ((symbol-function #'leman-upload)
                (lambda (_session &rest args)
-                 (push (cons (nth 1 (plist-get args :data))
-                             (plist-get args :content-type))
+                 (push (list (nth 1 (plist-get args :data))
+                             (plist-get args :content-type)
+                             (plist-get args :filename))
                        uploads)
                  (funcall (plist-get args :then) '((content_uri . "mxc://x.org/cipher")))))
               ((symbol-function #'leman-api)
@@ -913,7 +937,12 @@ Restoring it lets E2EE skip its whoami call."
       (should-not (equal (car upload) original))
       (should (string-prefix-p (file-name-as-directory temporary-file-directory)
                                (car upload)))
-      (should (equal (cdr upload) "application/octet-stream")))
+      (should (equal (nth 1 upload) "application/octet-stream"))
+      ;; The original filename must stay inside the encrypted event,
+      ;; not in the media-upload query parameter.
+      (should-not (nth 2 upload))
+      ;; The ciphertext temp file is removed after the upload callback.
+      (should-not (file-exists-p (car upload))))
     ;; The message is sent Megolm-encrypted...
     (let ((request (car requests)))
       (should (string-match-p "/send/m.room.encrypted/" (car request)))

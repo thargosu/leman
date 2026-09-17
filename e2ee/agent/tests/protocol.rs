@@ -595,6 +595,130 @@ async fn test_receive_sync_changes_accepts_empty_objects() {
     );
 }
 
+/// Elisp re-encodes decoded homeserver responses into
+/// mark_request_as_sent params (see leman-e2ee--encode): empty map
+/// values (per-user entries, "failures") arrive as null.  The agent
+/// must accept that shape: if every mark failed, the machine would
+/// never learn any device keys and encryption would be wedged.
+#[tokio::test]
+async fn test_mark_request_as_sent_accepts_null_maps() {
+    let mut agent = TestAgent::spawn();
+    let store = TempDir::new().unwrap();
+    let initialize = agent.request("initialize", initialize_params(&store));
+    assert!(initialize["ok"].is_object());
+
+    // A keys/query for another user arrives after tracking them.
+    agent.request(
+        "update_tracked_users",
+        json!({"users": ["@alice:example.org"]}),
+    );
+    let mut query = None;
+    for _ in 0..5 {
+        let outgoing = agent.request("outgoing_requests", json!({}));
+        let requests = outgoing["ok"]["requests"].as_array().unwrap();
+        if let Some(found) = requests
+            .iter()
+            .find(|request| request["path"] == json!("/_matrix/client/v3/keys/query"))
+        {
+            query = Some(found.clone());
+            break;
+        }
+        for request in requests {
+            // Answer the keys/upload the machine queues first.
+            let body: Value =
+                serde_json::from_str(request["body"].as_str().unwrap()).unwrap();
+            let otk_count = body["one_time_keys"].as_object().map(|k| k.len()).unwrap_or(0);
+            agent.request(
+                "mark_request_as_sent",
+                json!({"request_id": request["id"],
+                       "response": {"one_time_key_counts": {"signed_curve25519": otk_count}}}),
+            );
+        }
+    }
+    let query = query.expect("tracked user should produce a keys/query");
+
+    // This is exactly what elisp sends for a decoded, spec-conformant
+    // {"device_keys": {"@alice:example.org": {}}, "failures": {}}:
+    // json-read turns both empty maps into nil cdrs, json-encode into
+    // null.  The mark must succeed...
+    let marked = agent.request(
+        "mark_request_as_sent",
+        json!({
+            "request_id": query["id"],
+            "response": {"device_keys": {"@alice:example.org": null}, "failures": null},
+        }),
+    );
+    assert!(marked["ok"].is_object(), "null maps must be accepted: {marked}");
+
+    // ...and the marked request must be consumed: re-issuing it with
+    // a fresh transaction id on every pump is how a wedged pump
+    // generates unbounded HTTP requests.
+    let outgoing = agent.request("outgoing_requests", json!({}));
+    let repeat = outgoing["ok"]["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|request| request["id"] == query["id"]);
+    assert!(!repeat, "marked request must not be re-issued: {outgoing}");
+}
+
+/// When the members' devices are undiscovered (empty /keys/query
+/// answer), the room key would be shared with nobody: encryption must
+/// fail closed instead of reporting success for messages no recipient
+/// could ever decrypt ("black-holed" messages).
+#[tokio::test]
+async fn test_encrypt_room_event_fails_closed_on_zero_shares() {
+    let mut agent = TestAgent::spawn();
+    let store = TempDir::new().unwrap();
+    let initialize = agent.request("initialize", initialize_params(&store));
+    assert!(initialize["ok"].is_object());
+
+    // Track Alice, then pump: answer keys/upload normally and drain,
+    // answering the keys/query with an EMPTY device list.
+    agent.request(
+        "update_tracked_users",
+        json!({"users": ["@alice:example.org"]}),
+    );
+    for _ in 0..5 {
+        let outgoing = agent.request("outgoing_requests", json!({}));
+        let requests = outgoing["ok"]["requests"].as_array().unwrap().clone();
+        if requests.is_empty() {
+            break;
+        }
+        for request in requests {
+            let path = request["path"].as_str().unwrap().to_owned();
+            let response = if path.contains("/keys/upload") {
+                let body: Value =
+                    serde_json::from_str(request["body"].as_str().unwrap()).unwrap();
+                let otk_count = body["one_time_keys"].as_object().map(|k| k.len()).unwrap_or(0);
+                json!({"one_time_key_counts": {"signed_curve25519": otk_count}})
+            } else if path.contains("/keys/query") {
+                json!({"device_keys": {"@alice:example.org": {}}, "failures": {}})
+            } else {
+                panic!("unexpected outgoing request path: {path}")
+            };
+            agent.request(
+                "mark_request_as_sent",
+                json!({"request_id": request["id"], "response": response}),
+            );
+        }
+    }
+
+    let response = agent.request(
+        "encrypt_room_event",
+        json!({
+            "room_id": "!room:example.org",
+            "event_type": "m.room.message",
+            "content": {"msgtype": "m.text", "body": "black hole"},
+            "users": ["@alice:example.org"],
+        }),
+    );
+    assert!(
+        response["err"].is_object(),
+        "zero shares must fail closed: {response}"
+    );
+}
+
 /// The flagship round trip: Alice shares a room key with Bob (the
 /// agent), then sends an encrypted event which the agent decrypts.
 /// The test harness acts as the virtual homeserver.
@@ -1510,4 +1634,99 @@ async fn test_verification_sas_round_trip() {
         .find(|d| d["device_id"] == json!("ALICEDEVICE"))
         .expect("the agent should list alice's device");
     assert_eq!(listed["verified"], json!(true));
+}
+
+/// The protocol-level encrypted-attachment test: encrypt_file writes
+/// ciphertext to the output path and returns the key/IV/hash for the
+/// event's "file" object; decrypt_file verifies the hash and restores
+/// the plaintext.  The crypto primitives themselves are pinned by the
+/// known-answer tests in src/lib.rs (they match an independent
+/// OpenSSL implementation byte-for-byte).
+#[tokio::test]
+async fn test_file_encryption_round_trip() {
+    use base64::Engine as _;
+    let mut agent = TestAgent::spawn();
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("plain");
+    let output = dir.path().join("cipher");
+    let restored = dir.path().join("restored");
+    // 39 bytes: not a multiple of the cipher's block size.
+    let plaintext: Vec<u8> = (0..39).map(|i| (i * 7 + 11) as u8).collect();
+    std::fs::write(&input, &plaintext).unwrap();
+
+    let encrypted = agent.request(
+        "encrypt_file",
+        json!({
+            "input": input.to_str().unwrap(),
+            "output": output.to_str().unwrap(),
+        }),
+    );
+    let ok = &encrypted["ok"];
+    // The key: 32 bytes, URL-safe unpadded base64 (43 chars).
+    let key = ok["key"].as_str().unwrap();
+    assert_eq!(key.len(), 43);
+    assert!(!key.contains('+') && !key.contains('/'));
+    let key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(key)
+        .unwrap();
+    assert_eq!(key_bytes.len(), 32);
+    // The IV: 8 bytes, standard unpadded base64 (11 chars).
+    let iv = ok["iv"].as_str().unwrap();
+    assert_eq!(iv.len(), 11);
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(iv)
+            .unwrap()
+            .len(),
+        8
+    );
+    // The hash: 32 bytes, standard unpadded base64.
+    let sha256 = ok["sha256"].as_str().unwrap();
+    assert_eq!(sha256.len(), 43);
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(sha256)
+            .unwrap()
+            .len(),
+        32
+    );
+    // The ciphertext has the same length as the plaintext (CTR is a
+    // stream) and differs from it.
+    let ciphertext = std::fs::read(&output).unwrap();
+    assert_eq!(ciphertext.len(), plaintext.len());
+    assert_ne!(ciphertext, plaintext);
+
+    let decrypted = agent.request(
+        "decrypt_file",
+        json!({
+            "input": output.to_str().unwrap(),
+            "output": restored.to_str().unwrap(),
+            "key": key,
+            "iv": iv,
+            "sha256": sha256,
+        }),
+    );
+    assert!(decrypted["ok"].is_object());
+    assert_eq!(std::fs::read(&restored).unwrap(), plaintext);
+
+    // An altered ciphertext (wrong hash) must fail.
+    let altered = dir.path().join("altered");
+    let mut bad = ciphertext.clone();
+    bad[3] ^= 0xff;
+    std::fs::write(&altered, &bad).unwrap();
+    let rejected = agent.request(
+        "decrypt_file",
+        json!({
+            "input": altered.to_str().unwrap(),
+            "output": restored.to_str().unwrap(),
+            "key": key,
+            "iv": iv,
+            "sha256": sha256,
+        }),
+    );
+    assert!(rejected["err"].is_object());
+    assert!(rejected["err"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("hash mismatch"));
 }

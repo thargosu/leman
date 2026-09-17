@@ -687,6 +687,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
 
 [[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
 name = "hkdf"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -965,8 +971,11 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 name = "leman-agent"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "anyhow",
  "base64",
+ "ctr",
+ "hex",
  "matrix-sdk-common",
  "matrix-sdk-crypto",
  "matrix-sdk-sqlite",
@@ -974,6 +983,7 @@ dependencies = [
  "ruma",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
 ]

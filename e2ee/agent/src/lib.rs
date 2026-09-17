@@ -27,6 +27,8 @@ use ruma::{
 };
 use serde_json::{json, Value};
 
+use crate::file_crypto::{decrypt_file_to, encrypt_file_to};
+
 /// What the main loop should do after handling a line.
 pub enum Flow {
     /// Send this (possibly empty) response and keep running.
@@ -160,6 +162,8 @@ impl Agent {
             "mark_request_as_sent" => self.mark_request_as_sent(params).await,
             "receive_sync_changes" => self.receive_sync_changes(params).await,
             "decrypt_room_event" => self.decrypt_room_event(params).await,
+            "encrypt_file" => self.encrypt_file(params).await,
+            "decrypt_file" => self.decrypt_file(params).await,
             "update_tracked_users" => self.update_tracked_users(params).await,
             "encrypt_room_event" => self.encrypt_room_event(params).await,
             "devices" => self.devices(params).await,
@@ -397,7 +401,10 @@ impl Agent {
     async fn mark_request_as_sent(&mut self, params: Value) -> CommandResult {
         let machine = self.machine()?;
         let request_id = param_str(&params, "request_id")?.to_owned();
-        let response = params.get("response").cloned().unwrap_or(json!({}));
+        // The response is elisp's re-encoding of a decoded homeserver
+        // response: absent and null are the same, and map values that
+        // were empty objects arrive as null.
+        let response = param_not_null(&params, "response").cloned().unwrap_or(json!({}));
         let txn_id = OwnedTransactionId::from(request_id.clone());
         let kind = *self
             .pending
@@ -423,24 +430,25 @@ impl Agent {
             }
             PendingKind::KeysQuery => {
                 let mut typed = client_api::keys::get_keys::v3::Response::new();
-                if let Some(device_keys) = response.get("device_keys") {
-                    typed.device_keys = serde_json::from_value(device_keys.clone())
+                if let Some(device_keys) = param_not_null(&response, "device_keys") {
+                    typed.device_keys = serde_json::from_value(null_members_to_maps(device_keys))
                         .context("deserializing device_keys")
                         .map_err(crypto_error)?;
                 }
-                if let Some(failures) = response.get("failures") {
-                    typed.failures = serde_json::from_value(failures.clone())
+                if let Some(failures) = param_not_null(&response, "failures") {
+                    typed.failures = serde_json::from_value(null_members_to_maps(failures))
                         .context("deserializing failures")
                         .map_err(crypto_error)?;
                 }
                 machine.mark_request_as_sent(&txn_id, &typed).await
             }
             PendingKind::KeysClaim => {
-                let one_time_keys = serde_json::from_value(
-                    response.get("one_time_keys").cloned().unwrap_or(json!({})),
-                )
-                .context("deserializing one_time_keys")
-                .map_err(crypto_error)?;
+                let one_time_keys = match param_not_null(&response, "one_time_keys") {
+                    Some(keys) => serde_json::from_value(null_members_to_maps(keys))
+                        .context("deserializing one_time_keys")
+                        .map_err(crypto_error)?,
+                    None => Default::default(),
+                };
                 let typed = client_api::keys::claim_keys::v3::Response::new(one_time_keys);
                 machine.mark_request_as_sent(&txn_id, &typed).await
             }
@@ -668,6 +676,19 @@ impl Agent {
             )
             .await
             .map_err(crypto_error)?;
+        // Fail closed like the empty-users check: when the key was
+        // shared with nobody (e.g. members' devices undiscovered),
+        // the messages could never be decrypted by anyone, and the
+        // sender must see the failure instead of believing success.
+        let share_count: usize = share_requests
+            .iter()
+            .map(|send| send.messages.values().map(|devices| devices.len()).sum::<usize>())
+            .sum();
+        if share_count == 0 {
+            return Err(AgentError::Crypto(anyhow!(
+                "room key shared with nobody; refusing to encrypt"
+            )));
+        }
         let mut stashed = Vec::new();
         for send in share_requests {
             let request_id = send.txn_id.as_str().to_owned();
@@ -1320,6 +1341,35 @@ fn param_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, AgentError> {
         .ok_or_else(|| AgentError::Crypto(anyhow!("missing or invalid param {key:?}")))
 }
 
+/// The param's value, with null treated as absent: elisp cannot
+/// distinguish absent, null, and {} at the JSON boundary (see
+/// `leman-e2ee--encode`), so re-encoded payloads arrive with null
+/// where a map or array would be.
+fn param_not_null<'a>(params: &'a Value, key: &str) -> Option<&'a Value> {
+    match params.get(key) {
+        None | Some(Value::Null) => None,
+        value => value,
+    }
+}
+
+/// Replace null members of a JSON object with empty objects: entries
+/// of homeserver response maps (per-user, per-device) whose map value
+/// is empty decode to nil in elisp and re-encode as null.
+fn null_members_to_maps(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    if value.is_null() { json!({}) } else { value.clone() },
+                )
+            })
+            .collect(),
+        other => other.clone(),
+    }
+}
+
 fn raw_from_value<T>(value: &Value) -> Result<Raw<T>, anyhow::Error>
 where
     T: serde::de::DeserializeOwned,
@@ -1348,4 +1398,242 @@ fn base64_decode(data: &str) -> Result<Vec<u8>, anyhow::Error> {
             .with_decode_padding_mode(DecodePaddingMode::Indifferent),
     );
     Ok(engine.decode(data)?)
+}
+
+// ===== Encrypted attachments (spec: "Sending encrypted attachments") =====
+
+/// Base64 with the URL-safe alphabet, unpadded: the spec's JWK "k"
+/// field uses it (the IV and hash use the standard alphabet).
+fn base64_url_encode(data: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
+}
+
+/// Decode base64 in either alphabet (standard or URL-safe), with or
+/// without padding: senders encode the key URL-safe and the IV and
+/// hash standard, all unpadded.
+fn base64_decode_relaxed(data: &str) -> Result<Vec<u8>, anyhow::Error> {
+    base64_decode(&data.replace('-', "+").replace('_', "/"))
+}
+
+impl Agent {
+    /// Encrypt the file at INPUT with a fresh single-use AES-256-CTR
+    /// key, writing the ciphertext to OUTPUT.  Return the key (URL-safe
+    /// unpadded base64), the IV (standard unpadded base64), and the
+    /// SHA-256 hash of the ciphertext, for the event's "file" object.
+    async fn encrypt_file(&self, params: Value) -> CommandResult {
+        let input = std::path::PathBuf::from(param_str(&params, "input")?);
+        let output = std::path::PathBuf::from(param_str(&params, "output")?);
+        let key = random_bytes(32);
+        let iv = random_bytes(8);
+        let sha256 = encrypt_file_to(&input, &output, &key, &iv)
+            .await
+            .map_err(crypto_error)?;
+        Ok(json!({
+            "key": base64_url_encode(&key),
+            "iv": base64_encode(&iv),
+            "sha256": base64_encode(&sha256),
+        }))
+    }
+
+    /// Verify the SHA-256 hash of the ciphertext at INPUT, then
+    /// decrypt it with KEY and IV, writing the plaintext to OUTPUT.
+    /// The hash (of the ciphertext, as sent in the event) must match:
+    /// the homeserver could have altered the blob.
+    async fn decrypt_file(&self, params: Value) -> CommandResult {
+        let input = std::path::PathBuf::from(param_str(&params, "input")?);
+        let output = std::path::PathBuf::from(param_str(&params, "output")?);
+        let key = base64_decode_relaxed(param_str(&params, "key")?)
+            .context("decoding key")?;
+        let iv = base64_decode_relaxed(param_str(&params, "iv")?)
+            .context("decoding iv")?;
+        let sha256 = base64_decode_relaxed(param_str(&params, "sha256")?)
+            .context("decoding sha256")?;
+        decrypt_file_to(&input, &output, &key, &iv, &sha256)
+            .await
+            .map_err(crypto_error)?;
+        Ok(json!({}))
+    }
+}
+
+/// The file-crypto primitives behind the `encrypt_file` and
+/// `decrypt_file` protocol commands.
+pub(crate) mod file_crypto {
+    use aes::Aes256;
+    use anyhow::Context;
+    use ctr::cipher::{KeyIvInit, StreamCipher};
+    use ctr::Ctr128BE;
+    use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// AES-256-CTR with a 128-bit counter block incrementing
+    /// big-endian.  With the Matrix counter block (8 random bytes
+    /// followed by 8 zero bytes), only the low 64 bits ever count, so
+    /// this matches the counter subtleties of the spec's scheme.
+    type Aes256Ctr = Ctr128BE<Aes256>;
+
+    /// The 16-byte initial counter block: the 8-byte IV followed by
+    /// 8 zero bytes.
+    fn counter_block(iv: &[u8]) -> [u8; 16] {
+        let mut block = [0u8; 16];
+        block[..iv.len()].copy_from_slice(iv);
+        block
+    }
+
+    const CHUNK_SIZE: usize = 64 * 1024;
+
+    /// Encrypt INPUT to OUTPUT with KEY (32 bytes) and IV (8 bytes),
+    /// returning the SHA-256 hash of the ciphertext.
+    pub(crate) async fn encrypt_file_to(
+        input: &std::path::Path,
+        output: &std::path::Path,
+        key: &[u8],
+        iv: &[u8],
+    ) -> anyhow::Result<[u8; 32]> {
+        let mut cipher = Aes256Ctr::new_from_slices(key, &counter_block(iv))
+            .context("building cipher")?;
+        let mut reader = tokio::fs::File::open(input)
+            .await
+            .with_context(|| format!("opening {}", input.display()))?;
+        let mut writer = tokio::fs::File::create(output)
+            .await
+            .with_context(|| format!("creating {}", output.display()))?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; CHUNK_SIZE];
+        loop {
+            let n = reader.read(&mut buffer).await?;
+            if n == 0 {
+                break;
+            }
+            let chunk = &mut buffer[..n];
+            cipher.apply_keystream(chunk);
+            hasher.update(&*chunk);
+            writer.write_all(chunk).await?;
+        }
+        writer.flush().await?;
+        Ok(hasher.finalize().into())
+    }
+
+    /// Decrypt INPUT to OUTPUT with KEY (32 bytes) and IV (8 bytes),
+    /// first verifying the ciphertext's SHA-256 hash against
+    /// EXPECTED-SHA256.
+    pub(crate) async fn decrypt_file_to(
+        input: &std::path::Path,
+        output: &std::path::Path,
+        key: &[u8],
+        iv: &[u8],
+        expected_sha256: &[u8],
+    ) -> anyhow::Result<()> {
+        // Hash the downloaded ciphertext before using it.
+        let mut hasher = Sha256::new();
+        let mut reader = tokio::fs::File::open(input)
+            .await
+            .with_context(|| format!("opening {}", input.display()))?;
+        let mut buffer = vec![0u8; CHUNK_SIZE];
+        loop {
+            let n = reader.read(&mut buffer).await?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buffer[..n]);
+        }
+        let hash: [u8; 32] = hasher.finalize().into();
+        if hash.as_slice() != expected_sha256 {
+            anyhow::bail!("ciphertext hash mismatch (file was likely altered by the homeserver)");
+        }
+        let mut cipher = Aes256Ctr::new_from_slices(key, &counter_block(iv))
+            .context("building cipher")?;
+        let mut reader = tokio::fs::File::open(input)
+            .await
+            .with_context(|| format!("reopening {}", input.display()))?;
+        let mut writer = tokio::fs::File::create(output)
+            .await
+            .with_context(|| format!("creating {}", output.display()))?;
+        loop {
+            let n = reader.read(&mut buffer).await?;
+            if n == 0 {
+                break;
+            }
+            let chunk = &mut buffer[..n];
+            cipher.apply_keystream(chunk);
+            writer.write_all(chunk).await?;
+        }
+        writer.flush().await?;
+        Ok(())
+    }
+}
+
+/// Fill a buffer of LEN bytes from a cryptographically secure random
+/// source.
+fn random_bytes(len: usize) -> Vec<u8> {
+    use rand::Rng;
+    let mut buffer = vec![0u8; len];
+    rand::rng().fill_bytes(&mut buffer);
+    buffer
+}
+
+#[cfg(test)]
+mod file_crypto_tests {
+    use super::file_crypto::{decrypt_file_to, encrypt_file_to};
+
+    /// Known-answer vector for the AES-256-CTR file encryption,
+    /// produced independently with OpenSSL:
+    /// key = 32 x 0x01, IV = 8 x 0x02 (counter block 8 x 0x02 || 8
+    /// zeros), plaintext of 39 bytes (exercises the partial last
+    /// block).
+    const KAT_KEY_HEX: &str =
+        "0101010101010101010101010101010101010101010101010101010101010101";
+    const KAT_IV_HEX: &str = "0202020202020202";
+    const KAT_PLAINTEXT: &[u8] = b"hello leman, encrypted attachments test";
+    const KAT_CIPHERTEXT_HEX: &str =
+        "fbfe74de36b2c22081eb3762584523dc0ecbd0d28d26e0da58c8fe8d38eafff3c4b7b3f5e52a20";
+
+    #[tokio::test]
+    async fn encrypt_matches_openssl_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("plain");
+        let output = dir.path().join("cipher");
+        std::fs::write(&input, KAT_PLAINTEXT).unwrap();
+        let key = hex::decode(KAT_KEY_HEX).unwrap();
+        let iv = hex::decode(KAT_IV_HEX).unwrap();
+        let sha256 = encrypt_file_to(&input, &output, &key, &iv).await.unwrap();
+        let ciphertext = std::fs::read(&output).unwrap();
+        assert_eq!(ciphertext, hex::decode(KAT_CIPHERTEXT_HEX).unwrap());
+        assert_eq!(
+            sha256.as_slice(),
+            {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(&ciphertext);
+                hasher.finalize()
+            }
+            .as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn decrypt_round_trip_with_hash_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("cipher");
+        let output = dir.path().join("plain");
+        let ciphertext = hex::decode(KAT_CIPHERTEXT_HEX).unwrap();
+        std::fs::write(&input, &ciphertext).unwrap();
+        let key = hex::decode(KAT_KEY_HEX).unwrap();
+        let iv = hex::decode(KAT_IV_HEX).unwrap();
+        let sha256 = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&ciphertext);
+            hasher.finalize()
+        };
+        decrypt_file_to(&input, &output, &key, &iv, &sha256).await.unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), KAT_PLAINTEXT);
+        // A wrong hash (altered ciphertext) must fail without writing
+        // the output.
+        let mut altered = ciphertext.clone();
+        altered[0] ^= 0xff;
+        std::fs::write(&input, &altered).unwrap();
+        let result = decrypt_file_to(&input, &output, &key, &iv, &sha256).await;
+        assert!(result.is_err());
+    }
 }

@@ -147,6 +147,41 @@ Failure (~session_not_found~ et al.) comes back as ~{"err": ...}~;
 the client should keep the encrypted event and retry when keys arrive
 (e.g. after ~receive_sync_changes~).
 
+** ~encrypt_file~
+
+Encrypts a local file for an encrypted attachment (spec: "Sending
+encrypted attachments"): generates a single-use 256-bit AES key and
+an 8-byte IV, encrypts INPUT to OUTPUT with AES-256-CTR (counter
+block: IV followed by 8 zero bytes), and hashes the ciphertext with
+SHA-256.  The key uses URL-safe unpadded base64 (JWK ~k~), the IV
+and hash standard unpadded base64.  The client uploads OUTPUT (not
+INPUT) and builds the event's ~file~ object from the response.
+
+#+begin_src json
+{"id": 10, "cmd": "encrypt_file", "params": {
+  "input": "/tmp/leman/original.jpg", "output": "/tmp/leman/enc.jpg"}}
+{"id": 10, "ok": {"key": "aWF6-32KGYaC3A_FEUCk1Bt0JA37zP0wrStgmdCaW-0",
+                  "iv": "w+sE15fzSc0AAAAAAAAAAA",
+                  "sha256": "fdSLu/YkRx3Wyh3KQabP3rd6+SFiKg5lsJZQHtkSAYA"}}
+#+end_src
+
+** ~decrypt_file~
+
+Verifies the SHA-256 hash of downloaded ciphertext at INPUT against
+~sha256~ (the homeserver could have altered the blob), then decrypts
+it to OUTPUT with KEY and IV (both in the response format of
+~encrypt_file~; either base64 alphabet is accepted).  Errs on hash
+mismatch.
+
+#+begin_src json
+{"id": 11, "cmd": "decrypt_file", "params": {
+  "input": "/tmp/leman/downloaded.enc", "output": "/tmp/leman/file.jpg",
+  "key": "aWF6-32KGYaC3A_FEUCk1Bt0JA37zP0wrStgmdCaW-0",
+  "iv": "w+sE15fzSc0AAAAAAAAAAA",
+  "sha256": "fdSLu/YkRx3Wyh3KQabP3rd6+SFiKg5lsJZQHtkSAYA"}}
+{"id": 11, "ok": {}}
+#+end_src
+
 ** ~update_tracked_users~
 
 Marks users as tracked (their device lists will be followed; needed

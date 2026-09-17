@@ -65,7 +65,7 @@ jobs:
             (add-to-list (quote package-archives) (quote ("melpa" . "https://melpa.org/packages/")) t)
             (package-initialize)
             (package-refresh-contents)
-            (dolist (pkg (quote (map persist plz taxy taxy-magit-section svg-lib transient compat dash llama cond-let)))
+            (dolist (pkg (quote (map persist plz taxy taxy-magit-section svg-lib transient)))
               (package-install pkg)))'
 
       # Build the agent so the e2ee-real tests can run against it.

@@ -140,5 +140,4 @@ See ~ROADMAP.org~ for plans (E2EE phases, UI rework) and
 
 * License
 
-GPLv3+.  Leman is a fork of ement.el by Adam Porter; all
-contributions welcome.
+GPLv3+

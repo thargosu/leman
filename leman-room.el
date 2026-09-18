@@ -4445,6 +4445,22 @@ Formats according to `leman-room-message-format-spec', which see."
    (propertize " "
                'display leman-room-event-separator-display-property)))
 
+(defun leman-room--reaction-shortcode (key room)
+  "Return the shortcode for reaction KEY in ROOM.
+For custom emoji, look up KEY's mxc URI in the room's emoji pack.
+For Unicode emoji, derive a readable shortcode from its Unicode name."
+  (or (when (string-prefix-p "mxc://" key)
+        (cl-loop for event in (leman-room-state room)
+                 when (equal (leman-event-type event) "im.ponies.room_emotes")
+                 thereis (cl-loop for (name . image) in
+                                  (alist-get 'images (leman-event-content event))
+                                  when (equal key (alist-get 'url image))
+                                  return (format ":%s:" name))))
+      (when-let ((name (and (not (string-prefix-p "mxc://" key))
+                            (get-char-code-property (string-to-char key) 'name))))
+        (format ":%s:" (replace-regexp-in-string " " "_" (downcase name))))
+      key))
+
 (defun leman-room--format-reactions (event room)
   "Return formatted reactions to EVENT in ROOM."
   ;; TODO: Like other events, pop to a buffer showing the raw reaction events when a key is pressed.
@@ -4492,15 +4508,12 @@ Formats according to `leman-room-message-format-spec', which see."
                                     'action #'leman-room-reaction-button-action
                                     'follow-link t
                                     'help-echo (lambda (_window buffer _pos)
-                                                 ;; NOTE: If the reaction key string is a Unicode character composed
-                                                 ;; with, e.g. "VARIATION SELECTOR-16", `string-to-char' ignores the
-                                                 ;; composed modifier/variation-selector and just returns the first
-                                                 ;; character of the string.  This should be fine, since it's just
-                                                 ;; for the tooltip.
-                                                 (concat
-                                                  (unless key-image
-                                                    (concat (get-char-code-property (string-to-char raw-key) 'name) ": "))
-                                                  (senders-names senders (buffer-local-value 'leman-room buffer))))))
+                                                 (concat (leman-room--reaction-shortcode
+                                                          raw-key (buffer-local-value 'leman-room buffer))
+                                                         ": "
+                                                         (senders-names
+                                                          senders
+                                                          (buffer-local-value 'leman-room buffer))))))
                       (local-user-p (cl-member (leman-user-id (leman-session-user leman-session)) senders
                                                :key #'leman-user-id :test #'equal)))
            (when local-user-p

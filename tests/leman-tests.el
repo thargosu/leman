@@ -527,6 +527,30 @@ Names are available in the reaction's tooltip instead."
       (should (functionp (get-text-property (string-match "👍" string)
                                             'help-echo string))))))
 
+(ert-deftest leman-room--format-reactions-tooltip-shows-shortcode ()
+  "Reaction tooltips show Unicode and custom-emoji shortcodes."
+  (let ((leman-session (make-leman-session
+                        :user (make-leman-user :id "@me:example.com")))
+        (leman-room-images nil))
+    (dolist (data `(("👍" . ":thumbs_up_sign:")
+                    ("mxc://example.com/party" . ":party_parrot:")))
+      (let* ((key (car data))
+             (shortcode (cdr data))
+             (room (make-leman-room
+                    :id "!room:example.com"
+                    :state (when (string-prefix-p "mxc://" key)
+                             (list (make-leman-event
+                                    :type "im.ponies.room_emotes"
+                                    :content '((images . ((party_parrot . ((url . "mxc://example.com/party")))))))))))
+             (string (leman-room--format-reactions (leman-tests--reacted-event key) room))
+             (pos (or (string-match (regexp-quote key) string)
+                      (next-single-property-change 0 'leman-reaction-key string)))
+             (tooltip (get-text-property pos 'help-echo string)))
+        (with-temp-buffer
+          (setq-local leman-room room)
+          (should (equal (funcall tooltip nil (current-buffer) pos)
+                         (concat shortcode ": @other:example.com"))))))))
+
 (ert-deftest leman-room--format-reactions-custom-emoji ()
   "Test that custom-emoji reaction keys (mxc URIs) are handled.
 When the emoji's image is available (from the URL cache), it is

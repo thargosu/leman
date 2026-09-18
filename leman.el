@@ -632,9 +632,16 @@ and quitting (\\[keyboard-quit]) defers it to `leman-e2ee-verify'."
              ;; The dance may have finished while the prompt waited
              ;; (e.g. cancelled elsewhere): then there is nothing to
              ;; answer.
-             (when (eq leman-e2ee--active-verification active)
-               (condition-case err
-                   (if (funcall leman-e2ee-verify-confirm-function device-id emoji)
+              (when (eq leman-e2ee--active-verification active)
+                (condition-case err
+                    ;; The prompt runs from a timer and thus inherits
+                    ;; the last input event: with `use-dialog-box' (the
+                    ;; default) a preceding mouse click pops a GUI
+                    ;; dialog instead of asking in the message line.
+                    ;; Drop the binding if `y-or-n-p' ever stops
+                    ;; choosing its UI from the input context.
+                    (if (let ((use-dialog-box nil))
+                          (funcall leman-e2ee-verify-confirm-function device-id emoji))
                        (progn (leman-e2ee-confirm-sas
                                (leman-session-e2ee session)
                                (plist-get active :user-id)

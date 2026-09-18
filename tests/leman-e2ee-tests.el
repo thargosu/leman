@@ -974,6 +974,32 @@ must still clear it afterwards (e.g. with `unwind-protect')."
                            "cancel_verification")))
         (setf leman-e2ee--active-verification nil)))))
 
+(ert-deftest leman-e2ee--prompt-sas-asks-in-the-message-line ()
+  ;; The prompt runs from a timer, which inherits the last input
+  ;; event: the confirm function must be called with `use-dialog-box'
+  ;; off, or a preceding mouse click pops a GUI dialog instead of the
+  ;; message-line prompt.
+  (let* ((fake (leman-e2ee-tests--fake-agent nil))
+         (session (make-leman-session :e2ee (car fake)))
+         (timer-fn nil)
+         (pumps 0)
+         (dialog-box t)
+         (leman-e2ee-verify-confirm-function
+          (lambda (&rest _) (setf dialog-box use-dialog-box) t)))
+    (cl-letf (((symbol-function #'run-at-time)
+               (lambda (_seconds _repeat function &rest _args)
+                 (setf timer-fn function)
+                 'fake-timer))
+              ((symbol-function #'leman-e2ee--process-outgoing-requests)
+               (lambda (&rest _) (cl-incf pumps))))
+      (unwind-protect
+          (progn
+            (leman-e2ee-tests--start-verification session "@vv:x.org" "flow1" "ABC")
+            (leman-e2ee--prompt-sas session "ABC" (vector))
+            (funcall timer-fn)
+            (should (null dialog-box)))
+        (setf leman-e2ee--active-verification nil)))))
+
 (ert-deftest leman-e2ee--prompt-sas-defers-on-quit ()
   ;; C-g during the prompt defers it: the dance stays active and
   ;; `leman-e2ee-verify' can re-prompt.

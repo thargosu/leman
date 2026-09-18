@@ -88,6 +88,11 @@ to sort events and update other slots."
 (defvar-local leman-session nil
   "Leman session for current buffer.")
 
+(defvar-local leman-room--svg-enabled-p nil
+  "Whether this room buffer is currently rendered with SVG images.
+This is set when the buffer is displayed, because image support is a
+property of that frame, not of Emacs as a whole.")
+
 ;; TODO: Convert some of these buffer-local variables into keys in one buffer-local map variable.
 
 (defvar-local leman-room-retro-loading nil
@@ -2672,6 +2677,16 @@ Uses action `leman-view-room-display-buffer-action', which see."
     ;; `leman-view-room-display-buffer-action' is set to `display-buffer-no-window'; I
     ;; guess because `pop-to-buffer' selects a window.
     (pop-to-buffer buffer leman-view-room-display-buffer-action)
+    ;; `display-images-p' is frame-specific.  The room was initially
+    ;; formatted before it had a window, so refresh it now that its
+    ;; actual display is known.  This also switches back to text when
+    ;; viewing the room in a terminal frame.
+    (with-current-buffer buffer
+      (let ((svg-enabled-p (and (display-images-p (selected-frame))
+                                (image-type-available-p 'svg))))
+        (unless (eq svg-enabled-p leman-room--svg-enabled-p)
+          (setq-local leman-room--svg-enabled-p svg-enabled-p)
+          (ewoc-refresh leman-ewoc))))
     (run-hook-with-args 'leman-room-view-hook room session)))
 (defalias 'leman-view-room #'leman-room-view)
 
@@ -3483,13 +3498,21 @@ function to `leman-room-event-fns', which see."
       (leman-debug node)
       (ewoc-invalidate leman-ewoc node))))
 
-(defun leman-room--typing-footer (names)
+(defun leman-room--svg-rendering-p (room)
+  "Return non-nil when ROOM is currently rendered with SVG images."
+  (when-let* ((buffer (map-elt (leman-room-local room) 'buffer))
+              ((buffer-live-p buffer)))
+    (buffer-local-value 'leman-room--svg-enabled-p buffer)))
+
+(defun leman-room--typing-footer (names room)
   "Return the EWOC footer string showing NAMES typing."
   (if (null names)
       ""
     (concat
-     (if (and (display-images-p) (image-type-available-p 'svg))
-         (svg-lib-tag "typing" nil :face 'leman-room-reactions)
+     (if (leman-room--svg-rendering-p room)
+         (propertize " " 'display
+                     (svg-lib-tag "typing" (svg-lib-style-compute-default
+                                             'leman-room-reactions)))
        (propertize "Typing:" 'face 'leman-room-reactions))
      " "
      (propertize (string-join names ", ") 'face 'leman-room-reactions))))
@@ -3508,7 +3531,7 @@ function to `leman-room-event-fns', which see."
                            collect (leman--user-displayname-in leman-room user)
                            else collect id)))
     (with-silent-modifications
-      (ewoc-set-hf leman-ewoc "" (leman-room--typing-footer names)))))
+      (ewoc-set-hf leman-ewoc "" (leman-room--typing-footer names leman-room)))))
 
 (leman-room-defevent "m.room.avatar"
   (leman-room--insert-event event))
@@ -4346,14 +4369,14 @@ Solid \"verified\", \"red\", and \"grey\" shields, and an outlined
   (or (alist-get 'shield (leman-event-local event))
       (equal (leman-event-type event) "m.room.message")))
 
-(defun leman-room--format-shield (event)
-  "Return the authenticity marker for EVENT.
+(defun leman-room--format-shield (event room)
+  "Return the authenticity marker for EVENT in ROOM.
 Encrypted messages get a solid shield when the sending device is
 verified, a red or grey shield otherwise, with the reason in the
 tooltip (the sdk's shield state, stashed by the decrypt path).
 Plaintext messages get an outlined shield.  On non-graphical
 displays, emojis are used instead, and plaintext gets no marker."
-  (if (and (display-images-p) (image-type-available-p 'svg))
+  (if (leman-room--svg-rendering-p room)
       (pcase (alist-get 'shield (leman-event-local event))
         (`(none) (leman-room--shield "verified"
                                      "Encrypted message (the sending device is verified)"))
@@ -4379,7 +4402,7 @@ displays, emojis are used instead, and plaintext gets no marker."
 Formats according to `leman-room-message-format-spec', which see."
   (concat
    ;; The shield leads the line, before the sender.
-   (leman-room--format-shield event)
+   (leman-room--format-shield event room)
    (pcase (leman-event-type event)
      ;; TODO: Define these with a macro, like the defevent and format-spec ones.
      ("m.room.message" (leman-room--format-message event room session))
@@ -4610,8 +4633,10 @@ string."
                            (or (map-elt (leman-event-content latest-event) 'body) "")
                            40 nil nil "…")))
                (label (if (= count 1) "1 reply" (format "%d replies" count)))
-               (chip (if (and (display-images-p) (image-type-available-p 'svg))
-                         (svg-lib-tag label nil :face 'leman-room-reactions)
+               (chip (if (leman-room--svg-rendering-p room)
+                         (propertize " " 'display
+                                     (svg-lib-tag label (svg-lib-style-compute-default
+                                                         'leman-room-reactions)))
                        (propertize label 'face 'leman-room-reactions))))
           (concat
            (leman--button-buttonize

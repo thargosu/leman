@@ -818,6 +818,28 @@ re-created); each re-render must not start another download."
     ;; body extracted) without signaling an error.
     (should (text-property-not-all 0 (length chip) 'display nil chip))))
 
+(ert-deftest leman-room--format-thread-chip-svg ()
+  "Test that SVG thread chips remain strings which can be buttonized."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (root (make-leman-event :id "$root"))
+         (image '(image :type svg :data "mock-svg")))
+    (leman-room--add-thread-event
+     (leman-tests--thread-reply-event "$reply" "$root") room)
+    (cl-letf (((symbol-function 'leman-room--svg-rendering-p) (lambda (_) t))
+              ((symbol-function 'svg-lib-tag) (lambda (&rest _) image)))
+      (let ((chip (leman-room--format-thread-chip root room)))
+        (should (stringp chip))
+        (should (equal (get-text-property 0 'display chip) image))))))
+
+(ert-deftest leman-room--typing-footer-svg ()
+  "Test that SVG typing tags are inserted through a display property."
+  (let ((image '(image :type svg :data "mock-svg")))
+    (cl-letf (((symbol-function 'leman-room--svg-rendering-p) (lambda (_) t))
+              ((symbol-function 'svg-lib-tag) (lambda (&rest _) image)))
+      (let ((footer (leman-room--typing-footer '("Ada") nil)))
+        (should (stringp footer))
+        (should (equal (get-text-property 0 'display footer) image))))))
+
 (ert-deftest leman-room--format-event-undecryptable ()
   "Undecryptable encrypted events show a placeholder, not raw content."
   (let* ((room (make-leman-room :id "!room:example.com"))
@@ -834,21 +856,22 @@ re-created); each re-render must not start another download."
   "Authenticity markers distinguish verified, unverified, and plaintext.
 On non-graphical displays (as in these batch tests), emojis are
 used, and plaintext messages get no marker."
-  (pcase-dolist (`(,shield ,expected ,face)
-                 '(((none) "🛡" nil)
-                   ((red "UnverifiedIdentity" "reason") "⚠️" error)
-                   ((grey "UnverifiedIdentity" "reason") "⚠️" shadow)
-                   (nil "" nil)))
-    (let* ((event (make-leman-event :id "$msg"
-                                    :type "m.room.message"
-                                    :local (when shield
-                                             (list (cons 'shield shield)))
-                                    :content '((msgtype . "m.text")
-                                               (body . "hello"))))
-           (marker (leman-room--format-shield event)))
-      (should (string-match-p (regexp-quote expected) marker))
-      (when face
-        (should (memq face (ensure-list (get-text-property 0 'face marker)))))))
+  (let ((room (make-leman-room :id "!room:example.com")))
+    (pcase-dolist (`(,shield ,expected ,face)
+                   '(((none) "🛡" nil)
+                     ((red "UnverifiedIdentity" "reason") "⚠️" error)
+                     ((grey "UnverifiedIdentity" "reason") "⚠️" shadow)
+                     (nil "" nil)))
+      (let* ((event (make-leman-event :id "$msg"
+                                      :type "m.room.message"
+                                      :local (when shield
+                                               (list (cons 'shield shield)))
+                                      :content '((msgtype . "m.text")
+                                                 (body . "hello"))))
+             (marker (leman-room--format-shield event room)))
+        (should (string-match-p (regexp-quote expected) marker))
+        (when face
+          (should (memq face (ensure-list (get-text-property 0 'face marker))))))))
   ;; Encrypted messages carry a marker whatever their decrypted type.
   (should (leman-room--shield-p
            (make-leman-event :id "$enc" :type "m.room.encrypted"
@@ -902,10 +925,26 @@ used, and plaintext messages get no marker."
 
 (ert-deftest leman-room--typing-footer ()
   "The typing footer lists the typing users, or is empty."
-  (should (string-empty-p (leman-room--typing-footer nil)))
-  (should (string-match-p "Alice" (leman-room--typing-footer '("Alice"))))
+  (let ((room (make-leman-room :id "!room:example.com")))
+    (should (string-empty-p (leman-room--typing-footer nil room)))
+    (should (string-match-p "Alice" (leman-room--typing-footer '("Alice") room)))
   (should (string-match-p "Alice, Bob" (leman-room--typing-footer
-                                        '("Alice" "Bob")))))
+                                        '("Alice" "Bob") room)))))
+
+(ert-deftest leman-room--svg-rendering-p ()
+  "SVG rendering follows the room buffer's display, not the selected frame."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (buffer (generate-new-buffer " *leman-svg-test*")))
+    (unwind-protect
+        (progn
+          (setf (map-elt (leman-room-local room) 'buffer) buffer)
+          (with-current-buffer buffer
+            (setq-local leman-room--svg-enabled-p t))
+          (should (leman-room--svg-rendering-p room))
+          (with-current-buffer buffer
+            (setq-local leman-room--svg-enabled-p nil))
+          (should-not (leman-room--svg-rendering-p room)))
+      (kill-buffer buffer))))
 
 (ert-deftest leman--sessions-round-trip-device-id ()
   "The device ID round-trips through the saved sessions file.

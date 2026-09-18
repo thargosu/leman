@@ -42,6 +42,7 @@
 (require 'mailcap)
 (require 'shr)
 (require 'subr-x)
+(require 'svg-lib)
 (require 'mwheel)
 (require 'dnd)
 (require 'url-cache)
@@ -547,9 +548,14 @@ See function `format-time-string'."
 
 (defcustom leman-room-left-margin-width 0
   "Width of left margin in room buffers.
-When using a non-graphical display, this should be set slightly
-wider than when using a graphical display, to prevent sender
-display names from colliding with event text."
+When senders are shown in the left margin, the margin is
+auto-sized to fit senders' complete display names, never below
+this width and never above `leman-room-left-margin-max-width'."
+  :type 'integer)
+
+(defcustom leman-room-left-margin-max-width 24
+  "Maximum auto-sized left margin width.
+Raise it to show longer sender display names in full."
   :type 'integer)
 
 (defcustom leman-room-right-margin-width (length leman-room-timestamp-format)
@@ -855,6 +861,22 @@ those are not available, one can use `insert-char'."
   "Whether sender is shown in left margin.
 Set by `leman-room-message-format-spec-setter'.")
 
+(defun leman-room--sender-margin-width (room)
+  "Return the left margin width fitting ROOM's senders completely.
+Bounded below by `leman-room-left-margin-width' and above by
+`leman-room-left-margin-max-width', and accounting for the shield
+marker."
+  (if (not leman-room-sender-in-left-margin)
+      leman-room-left-margin-width
+    (let ((widest 0))
+      (maphash (lambda (_id user)
+                 (setf widest (max widest
+                                   (string-width (leman--user-displayname-in room user)))))
+               (leman-room-members room))
+      ;; Shield marker plus one separating space.
+      (min (max (+ widest 2) leman-room-left-margin-width)
+           leman-room-left-margin-max-width))))
+
 (defun leman-room-message-format-spec-setter (option value &optional local)
   "Set relevant options for `leman-room-message-format-spec', which see.
 To be used as that option's setter.  OPTION and VALUE are
@@ -945,8 +967,11 @@ It may contain these specifiers:
       `leman-room-timestamp-format'
   %T  Thread summary (a chip linking to the thread view)
 
-Note that margin sizes must be set manually with
-`leman-room-left-margin-width' and
+Note that when senders are shown in the left margin, the margin
+is auto-sized to fit senders' display names
+(`leman-room-left-margin-width' is the floor,
+`leman-room-left-margin-max-width' the cap), and margin sizes may
+otherwise be set manually with `leman-room-left-margin-width' and
 `leman-room-right-margin-width'."
   :type '(choice (const :tag "IRC-style using margins" "%S%L%B%r%T%R%t")
                  (const :tag "IRC-style without margins" "[%t] %S> %B%r%T")
@@ -1395,18 +1420,21 @@ spec) without requiring all events to use the same margin width."
     ;; format the event).
     (with-current-buffer (or buffer (current-buffer))
       (when leman-room-sender-in-left-margin
-        ;; Sender in left margin: truncate/pad appropriately.
-        (setf sender
-              (if (< (string-width sender) leman-room-left-margin-width)
-                  ;; Using :align-to or :width space display properties doesn't
-                  ;; seem to have any effect in the margin, so we make a string.
-                  (concat (make-string (- leman-room-left-margin-width (string-width sender))
-                                       ? )
-                          sender)
-                ;; String wider than margin: truncate it.
-                (leman-room--concat-property
-                  (truncate-string-to-width sender leman-room-left-margin-width nil nil "…")
-                  'help-echo (concat sender " "))))))
+        ;; Sender in left margin, after the shield marker: pad or
+        ;; truncate so the whole margin content fits exactly.
+        (let ((margin-width (- leman-room-left-margin-width
+                               (if (leman-room--shield-p event) 1 0))))
+          (setf sender
+                (if (< (string-width sender) margin-width)
+                    ;; Using :align-to or :width space display properties doesn't
+                    ;; seem to have any effect in the margin, so we make a string.
+                    (concat (make-string (- margin-width (string-width sender))
+                                         ? )
+                            sender)
+                  ;; String wider than margin: truncate it.
+                  (leman-room--concat-property
+                    (truncate-string-to-width sender margin-width nil nil "…")
+                    'help-echo (concat sender " ")))))))
     ;; NOTE: I'd like to add a help-echo function to display the sender ID, but the Emacs
     ;; manual says that there is currently no way to make text in the margins mouse-sensitive.
     ;; So `leman--format-user' returns a string propertized with `help-echo' as a string.
@@ -3019,6 +3047,13 @@ data slot."
       (let ((new-buffer (generate-new-buffer name)))
         (with-current-buffer new-buffer
           (leman-room-mode)
+          ;; Auto-size the left margin to fit senders' display names
+          ;; (member state events have been processed, so the data is
+          ;; known).
+          (when leman-room-sender-in-left-margin
+            (setq-local leman-room-left-margin-width
+                        (leman-room--sender-margin-width room)
+                        left-margin-width leman-room-left-margin-width))
           (setf header-line-format (when leman-room-header-line-format
                                      'leman-room-header-line-format)
                 leman-session session
@@ -3448,24 +3483,32 @@ function to `leman-room-event-fns', which see."
       (leman-debug node)
       (ewoc-invalidate leman-ewoc node))))
 
+(defun leman-room--typing-footer (names)
+  "Return the EWOC footer string showing NAMES typing."
+  (if (null names)
+      ""
+    (concat
+     (if (and (display-images-p) (image-type-available-p 'svg))
+         (svg-lib-tag "typing" nil :face 'leman-room-reactions)
+       (propertize "Typing:" 'face 'leman-room-reactions))
+     " "
+     (propertize (string-join names ", ") 'face 'leman-room-reactions))))
+
 (leman-room-defevent "m.typing"
   (pcase-let* (((cl-struct leman-session user) leman-session)
                ((cl-struct leman-user (id local-user-id)) user)
                ((cl-struct leman-event content) event)
                ((map ('user_ids user-ids)) content)
-               (usernames) (footer))
+               (names))
     (setf user-ids (delete local-user-id user-ids))
-    (if (zerop (length user-ids))
-        (setf footer "")
-      (setf usernames (cl-loop for id across user-ids
-                               for user = (gethash id leman-users)
-                               if user
-                               collect (leman--user-displayname-in leman-room user)
-                               else collect id)
-            footer (propertize (concat "Typing: " (string-join usernames ", "))
-                               'face 'font-lock-comment-face)))
+    (unless (zerop (length user-ids))
+      (setf names (cl-loop for id across user-ids
+                           for user = (gethash id leman-users)
+                           if user
+                           collect (leman--user-displayname-in leman-room user)
+                           else collect id)))
     (with-silent-modifications
-      (ewoc-set-hf leman-ewoc "" footer))))
+      (ewoc-set-hf leman-ewoc "" (leman-room--typing-footer names)))))
 
 (leman-room-defevent "m.room.avatar"
   (leman-room--insert-event event))
@@ -3477,7 +3520,21 @@ function to `leman-room-event-fns', which see."
 
 (leman-room-defevent "m.room.member"
   (with-silent-modifications
-    (leman-room--insert-event event)))
+    (leman-room--insert-event event)
+    ;; A member's display name may be wider than the left margin:
+    ;; grow the margin so names still show in full.  Existing lines
+    ;; re-flow, as their margin fillers re-evaluate `left-margin' on
+    ;; redisplay.
+    (when-let* ((leman-room-sender-in-left-margin)
+                (user (gethash (leman-event-state-key event) leman-users))
+                ((> (+ (string-width (leman--user-displayname-in leman-room user)) 2)
+                    leman-room-left-margin-width))
+                (width (leman-room--sender-margin-width leman-room))
+                ((> width leman-room-left-margin-width)))
+      (setf leman-room-left-margin-width width
+            left-margin-width width)
+      (when-let ((window (get-buffer-window)))
+        (set-window-margins window width right-margin-width)))))
 
 (leman-room-defevent "m.room.encrypted"
   (leman-room--insert-event event))
@@ -4247,64 +4304,119 @@ seconds."
 ;;                      :button-face 'leman-room-membership
 ;;                         :value (list (alist-get 'membership content))))))))
 
+(defconst leman-room--shield-points
+  '((12 . 1) (3 . 5) (3 . 11) (5.5 . 15.5) (12 . 23) (18.5 . 15.5) (21 . 11) (21 . 5))
+  "Shield outline points (24x24 units).")
+
+(defvar leman-room--shield-images (make-hash-table :test #'equal)
+  "Cache of shield images, keyed by kind.")
+
+(defun leman-room--shield-color (face fallback)
+  "Return FACE's foreground color, or FALLBACK if unspecified."
+  (let ((color (face-foreground face nil 'default)))
+    (if (and (stringp color) (string-match-p "unspecified" color))
+        fallback
+      color)))
+
+(defun leman-room--shield-image (kind)
+  "Return the shield image for KIND, cached in `leman-room--shield-images'.
+Solid \"verified\", \"red\", and \"grey\" shields, and an outlined
+\"open\" shield."
+  (or (gethash kind leman-room--shield-images)
+      (let* ((svg (svg-create 24 24))
+             (color (pcase kind
+                      ("open" (leman-room--shield-color 'shadow "gray"))
+                      ("verified" (leman-room--shield-color 'success "green"))
+                      ("red" (leman-room--shield-color 'error "red"))
+                      (_ (leman-room--shield-color 'shadow "gray")))))
+        (if (equal kind "open")
+            (svg-polygon svg leman-room--shield-points
+                         :fill "none" :stroke color :stroke-width 2)
+          (svg-polygon svg leman-room--shield-points :fill color))
+        (puthash kind (svg-image svg :ascent 'center
+                                 :max-height (round (* 0.9 (window-font-height))))
+                 leman-room--shield-images))))
+
+(defun leman-room--shield (kind help)
+  "Return the shield marker string of KIND, with HELP in tooltip."
+  (propertize " " 'display (leman-room--shield-image kind) 'help-echo help))
+
+(defun leman-room--shield-p (event)
+  "Return non-nil when EVENT gets an authenticity marker."
+  (or (alist-get 'shield (leman-event-local event))
+      (equal (leman-event-type event) "m.room.message")))
+
 (defun leman-room--format-shield (event)
   "Return the authenticity marker for EVENT.
-Decrypted (encrypted) messages get a lock when the sending device
-is verified, a warning shield otherwise, with the reason in the
+Encrypted messages get a solid shield when the sending device is
+verified, a red or grey shield otherwise, with the reason in the
 tooltip (the sdk's shield state, stashed by the decrypt path).
-Plaintext messages get an open lock."
-  (pcase (alist-get 'shield (leman-event-local event))
-    (`(none)
-     (propertize " 🔒" 'help-echo "Encrypted message (the sending device is verified)"))
-    (`(red ,_code ,message)
-     (propertize " ⚠️" 'help-echo (format "Encrypted message: %s" message) 'face 'error))
-    (`(grey ,_code ,message)
-     (propertize " ⚠️" 'help-echo (format "Encrypted message: %s" message) 'face 'shadow))
-    (_ (when (equal (leman-event-type event) "m.room.message")
-         (propertize " 🔓" 'help-echo "Not encrypted")))))
+Plaintext messages get an outlined shield.  On non-graphical
+displays, emojis are used instead, and plaintext gets no marker."
+  (if (and (display-images-p) (image-type-available-p 'svg))
+      (pcase (alist-get 'shield (leman-event-local event))
+        (`(none) (leman-room--shield "verified"
+                                     "Encrypted message (the sending device is verified)"))
+        (`(red ,_code ,message)
+         (leman-room--shield "red" (format "Encrypted message: %s" message)))
+        (`(grey ,_code ,message)
+         (leman-room--shield "grey" (format "Encrypted message: %s" message)))
+        (_ (when (equal (leman-event-type event) "m.room.message")
+             (leman-room--shield "open" "Not encrypted"))))
+    (pcase (alist-get 'shield (leman-event-local event))
+      (`(none) (propertize "🛡" 'help-echo
+                           "Encrypted message (the sending device is verified)"))
+      (`(red ,_code ,message)
+       (propertize "⚠️" 'face 'error
+                   'help-echo (format "Encrypted message: %s" message)))
+      (`(grey ,_code ,message)
+       (propertize "⚠️" 'face 'shadow
+                   'help-echo (format "Encrypted message: %s" message)))
+      (_ ""))))
 
 (defun leman-room--format-event (event room session)
   "Return EVENT in ROOM on SESSION formatted.
 Formats according to `leman-room-message-format-spec', which see."
-  (concat (pcase (leman-event-type event)
-            ;; TODO: Define these with a macro, like the defevent and format-spec ones.
-            ("m.room.message" (leman-room--format-message event room session))
-            ("m.room.member"
-             (widget-create 'leman-room-membership
-                            :button-face 'leman-room-membership
-                            :value event)
-             "")
-            ("m.reaction"
-             ;; Handled by defevent-based handler.
-             "")
-            ("m.room.avatar"
-             (leman-room-wrap-prefix
-               (format "%s changed the room's avatar."
-                       (propertize (leman--user-displayname-in room (leman-event-sender event))
-                                   'help-echo (leman-user-id (leman-event-sender event))))
-               'face 'leman-room-membership))
-            ("m.room.power_levels"
-             (leman-room--format-power-levels-event event room session))
-            ("m.room.canonical_alias"
-             (leman-room--format-canonical-alias-event event room session))
-            ;; NOTE: Only undecryptable events have this type in the
-            ;; buffer: successfully decrypted ones are made into
-            ;; events of their decrypted type before rendering.
-            ("m.room.encrypted"
-             (leman-room-wrap-prefix
-               (format "%s sent an encrypted message (unable to decrypt)."
-                       (propertize (leman--user-displayname-in room (leman-event-sender event))
-                                   'help-echo (leman-user-id (leman-event-sender event))))
-               'face 'leman-room-membership))
-             (_ (leman-room-wrap-prefix
-                  (format "[sender:%s type:%s]"
-                          (leman-user-id (leman-event-sender event))
-                          (leman-event-type event))
-                  'help-echo (format "%S" (leman-event-content event)))))
-           ;; Encrypted messages carry their authenticity marker.
-           (leman-room--format-shield event)
-           (propertize " "
-                       'display leman-room-event-separator-display-property)))
+  (concat
+   ;; The shield leads the line, before the sender.
+   (leman-room--format-shield event)
+   (pcase (leman-event-type event)
+     ;; TODO: Define these with a macro, like the defevent and format-spec ones.
+     ("m.room.message" (leman-room--format-message event room session))
+     ("m.room.member"
+      (widget-create 'leman-room-membership
+                     :button-face 'leman-room-membership
+                     :value event)
+      "")
+     ("m.reaction"
+      ;; Handled by defevent-based handler.
+      "")
+     ("m.room.avatar"
+      (leman-room-wrap-prefix
+        (format "%s changed the room's avatar."
+                (propertize (leman--user-displayname-in room (leman-event-sender event))
+                            'help-echo (leman-user-id (leman-event-sender event))))
+        'face 'leman-room-membership))
+     ("m.room.power_levels"
+      (leman-room--format-power-levels-event event room session))
+     ("m.room.canonical_alias"
+      (leman-room--format-canonical-alias-event event room session))
+     ;; NOTE: Only undecryptable events have this type in the
+     ;; buffer: successfully decrypted ones are made into
+     ;; events of their decrypted type before rendering.
+     ("m.room.encrypted"
+      (leman-room-wrap-prefix
+        (format "%s sent an encrypted message (unable to decrypt)."
+                (propertize (leman--user-displayname-in room (leman-event-sender event))
+                            'help-echo (leman-user-id (leman-event-sender event))))
+        'face 'leman-room-membership))
+     (_ (leman-room-wrap-prefix
+          (format "[sender:%s type:%s]"
+                  (leman-user-id (leman-event-sender event))
+                  (leman-event-type event))
+          'help-echo (format "%S" (leman-event-content event)))))
+   (propertize " "
+               'display leman-room-event-separator-display-property)))
 
 (defun leman-room--format-reactions (event room)
   "Return formatted reactions to EVENT in ROOM."
@@ -4497,10 +4609,13 @@ string."
                           (truncate-string-to-width
                            (or (map-elt (leman-event-content latest-event) 'body) "")
                            40 nil nil "…")))
-               (label (format "\U0001f9f5 %d" count)))
+               (label (if (= count 1) "1 reply" (format "%d replies" count)))
+               (chip (if (and (display-images-p) (image-type-available-p 'svg))
+                         (svg-lib-tag label nil :face 'leman-room-reactions)
+                       (propertize label 'face 'leman-room-reactions))))
           (concat
            (leman--button-buttonize
-            (propertize label 'face 'leman-room-reactions)
+            chip
             (lambda (_button) (leman-room-view-thread)))
            (when snippet
              (propertize " " 'display (propertize snippet 'face 'leman-room-reactions)))))

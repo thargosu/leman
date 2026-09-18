@@ -18,15 +18,19 @@ inherited from upstream.)
 | E2EE, phase 2 (encrypt-send)  | done   | Messages and emotes, fail-closed; Element/FluffyChat interop |
 | E2EE, phase 3 (verify)        | done   | Emoji SAS, cross-signing import, shields; QR is a follow-up |
 | E2EE, phase 4 (key backup)    | done   | Megolm backup v1 + SSSS; gossiping; old-version restore |
-| UI rework                     | vision | See plan below                                     |
+| E2EE, closure                  | next   | Encrypt reactions; decrypt fetched encrypted thread events |
+| UI rework                     | next   | Quick wins first, then speed; see plan below       |
 
 * Threads, phase 2 (polish)
 
 + Room-level thread list (~GET /v1/rooms/{id}/threads~), e.g. ~s T~.
 + Mark threads read when viewed (threaded read receipts).
 + Org/HTML composition for thread replies (currently single-line minibuffer).
-+ Clean up redacted thread replies (currently stale).
-+ Live-update open thread views (partially done: done for new replies via sync).
++ Make fetched thread replies use the normal E2EE decryption and retry
+  path.  Encrypted replies currently have no visible relation until
+  decrypted, so a thread fetch must not bypass that path.
++ Clean up redacted thread replies and live-update open views for edits
+  and redactions (new replies via sync already update them).
 
 * E2EE
 
@@ -49,7 +53,7 @@ ecosystem as of 2026-09:
 + *Spec v1.19* (2026-07): proper history sharing when joining
   encrypted rooms; QR/emoji verification via MSC4108 in vodozemac.
 
-Design decision needed first:
+Design decision (made):
 
 1. *Subprocess agent around matrix-sdk-crypto* (preferred): a small
    Rust binary speaking line-delimited JSON over stdio, holding the
@@ -57,12 +61,10 @@ Design decision needed first:
    to-device events and m.room.encrypted events, receives decrypted
    events and outbound requests, and performs the requests via
    ~leman-api~.  Mirrors how the official wasm/Node bindings work;
-   no Emacs module compilation issues; crash-isolated; needs the Rust
-   toolchain to build (not currently installed).
-2. *Dynamic module (C FFI)*: thin C shim over matrix-sdk-crypto or
-   vodozemac, loaded via the Emacs module API.  In-process and fast,
-   but requires maintaining C glue + module lifecycle discipline, and
-   bindings for the full state machine are not trivial.
+   no Emacs module compilation issues; crash-isolated; requires the Rust
+   toolchain to build.
+   Chosen and implemented.  The dynamic-module alternative was rejected:
+   its C glue and lifecycle burden buy little for this state machine.
 
 Phasing:
 
@@ -76,8 +78,8 @@ Phasing:
      identity/OTK key uploads, room key receipt, cross-client
      interoperability (Element, FluffyChat) verified on a real
      homeserver.
-   + Deferred: retrying undecryptable events when keys arrive later
-     (needs key backup, E4, to be useful).
+   + Late decryption retries are implemented: undecryptable events keep
+     their raw form and are retried when room keys arrive or are restored.
    + Lessons learned, worth keeping:
      - Elisp cannot represent empty JSON objects: ~json-serialize~
        encodes nil as ~{}~ while ~json-encode~ encodes it as ~null~.
@@ -102,8 +104,12 @@ Phasing:
      rooms), warning when a room has encrypted traffic but encryption
      is inactive.  Verified against Element and FluffyChat on a real
      homeserver.
-   + Follow-up: encrypt reactions (m.reaction) and other non-message
-     event types in encrypted rooms.
+   + Closure required: reactions are currently sent as plaintext
+     ~m.reaction~ events, exposing their key and target event ID to the
+     homeserver.  Generalize the encrypted-send helper to take the inner
+     event type, encrypt reactions fail-closed, and test that no raw
+     reaction reaches an encrypted room.  Do the same for any future
+     message-like event type.
 3. *Verification* ("E3"): emoji SAS verification of devices.
    DONE 2026-09-15.
    + Working: the full SAS dance over to-device events —
@@ -154,15 +160,15 @@ TDD workflow (tests before code; monorepo, agent in ~e2ee/~):
 3. *Elisp tests* (ERT) against a fake in-memory transport: request
    id correlation, timeouts, error mapping, sync hook (to-device
    events processed before persisting ~next_batch~).
-4. *Contract fixtures*: shared JSON fixtures (vendored from
-   matrix-sdk-crypto test data) run through both implementations
-   must agree.
+4. *Boundary regressions*: ERT tests pin that reactions never bypass
+   encryption, fetched encrypted thread events decrypt/retry correctly,
+   and thread edits/redactions refresh an open thread view.
 
 * UI rework plan
 
-Goal: /Element's information architecture + Magit's interaction model +
-Org's folding + Transient's menus + svg-lib's visual polish + Emacs's
-text and navigation semantics./
+Goal: a fast, text-native Matrix UI with a useful persistent room switcher
+and discoverable point-based actions.  Element, Magit, Org, and svg-lib are
+inspirations, not frameworks to reproduce.
 
 Inspirations to draw from (not to copy): Magit (contextual operations,
 point-driven menus), Treemacs (sidebar behavior), Elfeed/notmuch/mu4e
@@ -178,35 +184,66 @@ Design constraints:
 
 Phases:
 
-** Phase 1: Sidebar
+** Phase 1: Quick wins
+Small, additive changes with immediate visible value:
++ Authenticity marker (lock/shield) at the START of the message line,
+  before the sender name, not appended at the end.
++ Complete sender display names: stop truncating senders to the fixed
+  left margin; align them with display properties and let long names
+  show in full.
++ Thread pills: render the thread chip as an svg-lib tag (count +
+  snippet) instead of the 🧵 glyph.
++ Typing indicator: an EWOC footer already shows "Typing: ..." (the
+  m.typing handler); verify it in practice, then polish it (svg-lib
+  chip, also visible when the room buffer is not the current one).
+
+** Phase 2: Speed
+Reviewing unread rooms must feel like FluffyChat.  Profile first,
+then fix the hotspots:
++ Opening/switching to an unread room (retro fetch, decryption, EWOC
+  render, image refresh).
++ Defer work not needed to show the newest messages (old history,
+  HTML, images decrypt/render lazily).
+
+** Phase 3: Avatars
+User avatars: the URLs are stored (m.room.member -> leman-user) but
+never fetched or displayed.  Copy the room-avatar precedent (download,
+cache, display property, svg-lib fallback for missing avatars) and
+render the avatar with the sender name; reuse it in the sidebar and
+room lists.
+
+** Phase 4: Sidebar
 Side-window ~*Leman Sidebar*~ on the left: magit-section room list
 (reusing taxy grouping: favorites, low-priority, DMs, spaces), room
 avatars, svg-lib unread badges (distinct mention badge), topic snippet.
 RET/click to view; auto-follow recent activity.  Dedicated window that
 survives ~delete-other-windows~.
 
-** Phase 2: Messages as Magit sections
-Each event a magit-section in room buffers: ~n~/~p~/~M-n~/~M-p~ section
-motion, point-driven context.  Split the room transient into a message
-transient (react, reply, thread, edit, redact, copy link), with
-unavailable actions grayed out per event type.
+** Phase 5: Custom emoji packs and picker
+Fetch the room's emoji packs (im.ponies.room_emotes state, user packs
+from account data) and offer them in the reaction picker alongside
+unicode emoji.  Strictly additive: the reaction and emoji rendering
+path works today and is pinned by tests; never rework it as part of
+this phase.  Bigger reaction images are a defcustom away
+(leman-room-reaction-emoji-max-size); animated emoji remain a
+carry-over.
 
-** Phase 3: Org-style folding
+** Phase 6: Point actions
+Add a message transient at point (react, reply, thread, edit, redact,
+copy link), disabling unavailable actions per event type.  Keep EWOC as
+the sole room-buffer structure; only introduce magit sections if a later
+interaction demonstrably needs their nesting or motion.
+
+** Phase 7: Folding
 Threads foldable inline at the root message (the thread view buffer
 remains for the focused case); date headers and coalesced
 membership-event runs collapsible.
 
-** Phase 4: svg-lib polish
-svg-lib tags/badges/chips for header-line room state (encryption,
-notification mode), typing indicator, connection status, and the
-reaction picker.
-
 * Carry-overs
 
-+ Typing indicator display (sending already works; EWOC header/footer).
 + Left-room cleanup in sync (stale room structs/buffers).
 + Session persistence (~persist~/~multisession~) for display names,
   avatars, read markers.
-+ Sync robustness: auto-resync on failure, filter IDs.
++ Sync filter IDs (automatic re-sync already handles transient failures).
 + Room directory: pagination, avatars.
 + Animated custom-emoji reactions (currently static first frame).

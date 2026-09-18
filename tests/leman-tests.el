@@ -793,7 +793,7 @@ re-created); each re-render must not start another download."
                  (leman-room--add-thread-event (leman-tests--thread-reply-event "$reply1" "$root") room)
                  (leman-room--add-thread-event (leman-tests--thread-reply-event "$reply2" "$root") room)
                  (leman-room--format-thread-chip root room))))
-    (should (string-match-p "🧵 2" chip))
+    (should (string-match-p "2 replies" chip))
     ;; No replies: no chip.
     (should (string-empty-p (leman-room--format-thread-chip
                              (make-leman-event :id "$non-root") room))))
@@ -802,7 +802,7 @@ re-created); each re-render must not start another download."
          (root (make-leman-event :id "$root2"
                                  :unsigned '((m.relations . ((m.thread . ((count . 5))))))))
          (chip (leman-room--format-thread-chip root room)))
-    (should (string-match-p "🧵 5" chip)))
+    (should (string-match-p "5 replies" chip)))
   ;; A summary's "latest_event" is a raw event alist, not an event
   ;; struct; the chip must show its body without signaling an error.
   (let* ((room (make-leman-room :id "!room:example.com"))
@@ -812,7 +812,7 @@ re-created); each re-render must not start another download."
                                  :unsigned `((m.relations . ((m.thread . ((count . 1)
                                                                           (latest_event . ,latest-event))))))))
          (chip (leman-room--format-thread-chip root room)))
-    (should (string-match-p "🧵 1" chip))
+    (should (string-match-p "1 reply" chip))
     ;; The snippet is rendered as a display property; this proves the
     ;; raw "latest_event" was converted to an event struct (and its
     ;; body extracted) without signaling an error.
@@ -829,6 +829,83 @@ re-created); each re-render must not start another download."
     (let ((formatted (leman-room--format-event event room nil)))
       (should (string-match-p "unable to decrypt" formatted))
       (should-not (string-match-p "secret" formatted)))))
+
+(ert-deftest leman-room--format-shield ()
+  "Authenticity markers distinguish verified, unverified, and plaintext.
+On non-graphical displays (as in these batch tests), emojis are
+used, and plaintext messages get no marker."
+  (pcase-dolist (`(,shield ,expected ,face)
+                 '(((none) "🛡" nil)
+                   ((red "UnverifiedIdentity" "reason") "⚠️" error)
+                   ((grey "UnverifiedIdentity" "reason") "⚠️" shadow)
+                   (nil "" nil)))
+    (let* ((event (make-leman-event :id "$msg"
+                                    :type "m.room.message"
+                                    :local (when shield
+                                             (list (cons 'shield shield)))
+                                    :content '((msgtype . "m.text")
+                                               (body . "hello"))))
+           (marker (leman-room--format-shield event)))
+      (should (string-match-p (regexp-quote expected) marker))
+      (when face
+        (should (memq face (ensure-list (get-text-property 0 'face marker)))))))
+  ;; Encrypted messages carry a marker whatever their decrypted type.
+  (should (leman-room--shield-p
+           (make-leman-event :id "$enc" :type "m.room.encrypted"
+                             :local '((shield . (red "Code" "why"))))))
+  ;; Plaintext messages of a message-like type get one; others don't.
+  (should (leman-room--shield-p
+           (make-leman-event :id "$msg" :type "m.room.message")))
+  (should-not (leman-room--shield-p
+               (make-leman-event :id "$img" :type "m.image"
+                                 :content '((body . "photo"))))))
+
+(ert-deftest leman-room--format-event-shield-leads ()
+  "The authenticity marker is rendered at the start of the line."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (session (make-leman-session :user (make-leman-user :id "@other:x.org")))
+         (event (make-leman-event :id "$msg"
+                                  :sender (make-leman-user :id "@vv:x.org"
+                                                           :displayname "Vincent")
+                                  :type "m.room.message"
+                                  :origin-server-ts 1694000000000
+                                  :local '((shield . (none)))
+                                  :content '((msgtype . "m.text")
+                                             (body . "hello world"))))
+         ;; A margin-less format: the shield stays as plain text, so
+         ;; its position can be asserted.
+         (formatted (let ((leman-room-message-format-spec "[%t] %S> %B%r%T"))
+                      (leman-room--format-event event room session))))
+    (should (< (string-match-p "🛡" formatted)
+               (string-match-p "hello world" formatted)))))
+
+(ert-deftest leman-room--sender-margin-width ()
+  "The left margin fits senders' complete display names, capped."
+  (let ((leman-room-sender-in-left-margin t)
+        (leman-room-left-margin-width 12)
+        (leman-room-left-margin-max-width 24)
+        (room (make-leman-room :id "!room:example.com")))
+    ;; No members: fall back to the configured width.
+    (should (= (leman-room--sender-margin-width room) 12))
+    ;; A short name: the configured width is the floor.
+    (puthash "@short:x.org" (make-leman-user :id "@short:x.org"
+                                             :displayname "Al")
+             (leman-room-members room))
+    (should (= (leman-room--sender-margin-width room) 12))
+    ;; A long name: widen to fit it (shield marker plus one space),
+    ;; capped by `leman-room-left-margin-max-width'.
+    (puthash "@long:x.org" (make-leman-user :id "@long:x.org"
+                                            :displayname
+                                            "Christopher Alexander III")
+             (leman-room-members room))
+    (should (= (leman-room--sender-margin-width room) 24))))
+
+(ert-deftest leman-room--typing-footer ()
+  "The typing footer lists the typing users, or is empty."
+  (should (string-empty-p (leman-room--typing-footer nil)))
+  (should (string-match-p "Alice" (leman-room--typing-footer '("Alice"))))
+  (should (string-match-p "Alice, Bob" (leman-room--typing-footer
+                                        '("Alice" "Bob")))))
 
 (ert-deftest leman--sessions-round-trip-device-id ()
   "The device ID round-trips through the saved sessions file.

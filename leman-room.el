@@ -4332,7 +4332,7 @@ seconds."
   "Shield outline points (24x24 units).")
 
 (defvar leman-room--shield-images (make-hash-table :test #'equal)
-  "Cache of shield images, keyed by kind.")
+  "Cache of shield images, keyed by their visual parameters.")
 
 (defun leman-room--shield-color (face fallback)
   "Return FACE's foreground color, or FALLBACK if unspecified."
@@ -4345,20 +4345,24 @@ seconds."
   "Return the shield image for KIND, cached in `leman-room--shield-images'.
 Solid \"verified\", \"red\", and \"grey\" shields, and an outlined
 \"open\" shield."
-  (or (gethash kind leman-room--shield-images)
-      (let* ((svg (svg-create 24 24))
-             (color (pcase kind
-                      ("open" (leman-room--shield-color 'shadow "gray"))
-                      ("verified" (leman-room--shield-color 'success "green"))
-                      ("red" (leman-room--shield-color 'error "red"))
-                      (_ (leman-room--shield-color 'shadow "gray")))))
-        (if (equal kind "open")
-            (svg-polygon svg leman-room--shield-points
-                         :fill "none" :stroke color :stroke-width 2)
-          (svg-polygon svg leman-room--shield-points :fill color))
-        (puthash kind (svg-image svg :ascent 'center
-                                 :max-height (round (* 0.9 (window-font-height))))
-                 leman-room--shield-images))))
+  (let* ((color (pcase kind
+                  ("open" (leman-room--shield-color 'shadow "gray"))
+                  ("verified" (leman-room--shield-color 'success "green"))
+                  ("red" (leman-room--shield-color 'error "red"))
+                  (_ (leman-room--shield-color 'shadow "gray"))))
+         (max-height (round (* 0.9 (window-font-height))))
+         ;; A room is initially formatted before it has a window.  Do
+         ;; not reuse the image built with that window's font height
+         ;; (or the old theme's color) after it is displayed.
+         (key (list kind color max-height)))
+    (or (gethash key leman-room--shield-images)
+        (let ((svg (svg-create 24 24)))
+          (if (equal kind "open")
+              (svg-polygon svg leman-room--shield-points
+                           :fill "none" :stroke color :stroke-width 2)
+            (svg-polygon svg leman-room--shield-points :fill color))
+          (puthash key (svg-image svg :ascent 'center :max-height max-height)
+                   leman-room--shield-images)))))
 
 (defun leman-room--shield (kind help)
   "Return the shield marker string of KIND, with HELP in tooltip."

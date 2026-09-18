@@ -902,6 +902,24 @@ used, and plaintext messages get no marker."
     (should (< (string-match-p "🛡" formatted)
                (string-match-p "hello world" formatted)))))
 
+(ert-deftest leman-room--shield-image-cache-uses-visual-parameters ()
+  "Shield images are not reused across font sizes or theme colors."
+  (let ((leman-room--shield-images (make-hash-table :test #'equal))
+        (height 10)
+        (color "green"))
+    (cl-letf (((symbol-function 'window-font-height) (lambda (&rest _) height))
+              ((symbol-function 'leman-room--shield-color) (lambda (&rest _) color))
+              ((symbol-function 'svg-image) (lambda (&rest args) args)))
+      (let ((small (leman-room--shield-image "verified")))
+        (setq height 20)
+        (let ((large (leman-room--shield-image "verified")))
+          (should-not (eq small large))
+          (should (= (plist-get (cdr small) :max-height) 9))
+          (should (= (plist-get (cdr large) :max-height) 18))
+          (should (eq large (leman-room--shield-image "verified")))
+          (setq color "blue")
+          (should-not (eq large (leman-room--shield-image "verified"))))))))
+
 (ert-deftest leman-room--sender-margin-width ()
   "The left margin fits senders' complete display names, capped."
   (let ((leman-room-sender-in-left-margin t)

@@ -1599,6 +1599,46 @@ must still clear it afterwards (e.g. with `unwind-protect')."
     ;; No source available (e.g. a PATH lookup): not stale.
     (should-not (leman-e2ee--agent-stale-p binary (make-temp-file "leman-none-" 'dir)))))
 
+(ert-deftest leman-e2ee-install-agent-verifies-and-installs-download ()
+  "The managed agent is only replaced after its checksum verifies."
+  (let* ((directory (make-temp-file "leman-agent-download-" 'dir))
+         (asset (leman-e2ee--agent-asset-name))
+         (binary "a prebuilt agent")
+         (checksum (concat (secure-hash 'sha256 binary) "  " asset "\n"))
+         (leman-e2ee-agent-directory directory)
+         (leman-e2ee-agent-release-url "https://example.invalid/agent/"))
+    (cl-letf (((symbol-function #'url-copy-file)
+               (lambda (url destination &rest _)
+                 (write-region
+                  (cond ((string-suffix-p ".sha256" url) checksum)
+                        ((string-suffix-p ".revision" url) "revision\n")
+                        (t binary))
+                  nil destination nil 'silent))))
+      (let ((program (leman-e2ee-install-agent)))
+        (should (equal (file-name-nondirectory program) asset))
+        (should (equal (with-temp-buffer
+                         (insert-file-contents-literally program)
+                         (buffer-string))
+                       binary))
+        (should (equal (with-temp-buffer
+                         (insert-file-contents (concat program ".revision"))
+                         (string-trim (buffer-string)))
+                       "revision"))))))
+
+(ert-deftest leman-e2ee-install-agent-rejects-bad-checksum ()
+  "A bad download never replaces the managed agent."
+  (let* ((directory (make-temp-file "leman-agent-download-" 'dir))
+         (leman-e2ee-agent-directory directory)
+         (leman-e2ee-agent-release-url "https://example.invalid/agent/"))
+    (cl-letf (((symbol-function #'url-copy-file)
+               (lambda (url destination &rest _)
+                 (write-region (if (string-suffix-p ".sha256" url)
+                                   "not-a-digest\n"
+                                 "a prebuilt agent")
+                               nil destination nil 'silent))))
+      (should-error (leman-e2ee-install-agent))
+      (should-not (file-exists-p (leman-e2ee--managed-agent-program))))))
+
 ;;;; Key backup and SSSS
 
 (ert-deftest leman-e2ee-backup-wrappers ()

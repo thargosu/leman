@@ -5,6 +5,10 @@ on:
       - main
   pull_request:
     types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -79,3 +83,68 @@ jobs:
             -l leman-structs.el -l leman-lib.el -l leman-macros.el -l leman-room.el -l leman.el \
             -l leman-e2ee.el -l leman-notify.el -l leman-notifications.el \
             -l tests/leman-tests.el -l tests/leman-e2ee-tests.el -l tests/leman-notify-tests.el -f ert-run-tests-batch
+
+  release-agent:
+    name: Publish prebuilt E2EE agents
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    needs: [build, elisp]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: leman-agent-linux-x86_64
+          - os: macos-13
+            asset: leman-agent-macos-x86_64
+          - os: macos-14
+            asset: leman-agent-macos-aarch64
+          - os: windows-latest
+            asset: leman-agent-windows-x86_64.exe
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Build release agent
+        working-directory: e2ee/agent
+        run: cargo build --release
+
+      - name: Package release asset
+        shell: bash
+        run: |
+          mkdir dist
+          cp "e2ee/agent/target/release/leman-agent${{ runner.os == 'Windows' && '.exe' || '' }}" "dist/${{ matrix.asset }}"
+          shasum -a 256 "dist/${{ matrix.asset }}" > "dist/${{ matrix.asset }}.sha256"
+          printf '%s\\n' "$GITHUB_SHA" > "dist/${{ matrix.asset }}.revision"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/
+          if-no-files-found: error
+
+  publish-agent-release:
+    name: Update prebuilt E2EE agent release
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    needs: release-agent
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: leman-agent-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: leman-agent-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view leman-agent-latest >/dev/null 2>&1; then
+            gh release upload leman-agent-latest dist/* --clobber
+          else
+            gh release create leman-agent-latest dist/* --title 'Leman E2EE agent (latest)' --notes 'Prebuilt E2EE agent binaries for package-vc installations.' --latest
+          fi

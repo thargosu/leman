@@ -38,7 +38,8 @@ Coming soon.
 
 + Emacs 30.1 or later
 + A Matrix homeserver
-+ For E2EE: [[https://rustup.rs][Rust]] (to build the agent once) and ~curl~
++ For E2EE: nothing extra.  The matching prebuilt agent is installed
+  automatically on first connection.
 
 * Installation
 
@@ -62,16 +63,17 @@ Communicating over a line-delimited JSON protocol on stdio, it keeps
 key material out of Emacs and crash-isolates the crypto (see
 ~e2ee/PROTOCOL.org~).
 
-Build it once:
+When Leman is installed with =package-vc=, it downloads the matching
+prebuilt agent from this repository's GitHub release on the first
+connection.  After =package-vc-upgrade= it refreshes that binary for
+the new revision.  Downloads are checked against the release's
+SHA-256 checksum.  ~M-x leman-e2ee-install-agent~ can be used to
+install or retry it manually; ~M-x leman-e2ee-status~ reports the
+running agent and program path.
 
-#+begin_src sh
-  cd e2ee/agent && cargo build --release
-#+end_src
-
-Or from inside Emacs with ~M-x leman-e2ee-build-agent~ (requires
-cargo on the ~exec-path~).  If the agent isn't found at connect
-time, a warning is shown; ~M-x leman-e2ee-status~ reports whether an
-agent is running and where the program was looked up.
+For development, build locally with ~M-x leman-e2ee-build-agent~ (or
+~cd e2ee/agent && cargo build --release~).  A manually configured or
+PATH-discovered agent takes precedence over the managed binary.
 
 Current support:
 
@@ -113,10 +115,10 @@ encrypting reactions in encrypted rooms.
 
 #+begin_src elisp
   M-x package-vc-upgrade RET leman RET
-  M-x leman-e2ee-build-agent   ; the agent binary is not rebuilt by package-vc
+  ;; The prebuilt E2EE agent is refreshed on the next connection.
 #+end_src
 
-Leman warns at agent start when the binary is older than its source.
+Leman warns at agent start when a locally built binary is older than its source.
 Do not patch the installed clone in place: local changes make
 `package-vc-upgrade' refuse to pull.
 

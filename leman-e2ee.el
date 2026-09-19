@@ -38,6 +38,7 @@
 (require 'cl-lib)
 (require 'json)
 (require 'subr-x)
+(require 'url)
 
 ;;;; Variables
 
@@ -48,18 +49,10 @@
 (defcustom leman-e2ee-agent-program nil
   "Path to the `leman-agent' executable.
 If nil, it is looked up on the `exec-path', then relative to the
-Leman installation (e2ee/agent/target/{release,debug}/leman-agent)."
+Leman installation (e2ee/agent/target/{release,debug}/leman-agent),
+then in `leman-e2ee-agent-directory'."
   :type '(choice (const :tag "Auto-discover" nil)
                  (file :tag "Path")))
-
-(defcustom leman-e2ee-request-timeout 30
-  "Seconds to wait for an agent response before signaling an error."
-  :type 'natnum)
-
-(defcustom leman-e2ee-initialize-timeout 60
-  "Seconds to wait for the agent's `initialize' command.
-Initialization may have to ratchet an existing store open."
-  :type 'natnum)
 
 (defcustom leman-e2ee-data-directory
   (expand-file-name "leman/"
@@ -70,6 +63,29 @@ The store contains the account's key material and is kept with
 user-only permissions; it is not itself encrypted, so anyone who
 can read the user's files can extract the key material."
   :type 'directory)
+
+(defcustom leman-e2ee-agent-directory
+  (expand-file-name "agent/" leman-e2ee-data-directory)
+  "Directory in which Leman installs its prebuilt E2EE agent.
+The binary is downloaded from `leman-e2ee-agent-release-url' when
+needed.  It is separate from the crypto store so a package upgrade
+does not modify the package checkout."
+  :type 'directory)
+
+(defcustom leman-e2ee-agent-release-url
+  "https://github.com/thargosu/leman/releases/download/leman-agent-latest/"
+  "Base URL for Leman's prebuilt E2EE agent release assets.
+Each asset has a SHA-256 sidecar which is verified before installation."
+  :type 'string)
+
+(defcustom leman-e2ee-request-timeout 30
+  "Seconds to wait for an agent response before signaling an error."
+  :type 'natnum)
+
+(defcustom leman-e2ee-initialize-timeout 60
+  "Seconds to wait for the agent's `initialize' command.
+Initialization may have to ratchet an existing store open."
+  :type 'natnum)
 
 (define-error 'leman-e2ee-error "Leman E2EE agent error")
 
@@ -283,14 +299,138 @@ E.g. \"/_matrix/client/v3/keys/upload\" -> (\"v3\" \"keys/upload\")."
    (or (locate-library "leman.el" t)
        default-directory)))
 
+(defun leman-e2ee--agent-asset-name ()
+  "Return the release asset name for this Emacs host.
+Signal an error for a platform for which Leman does not publish an
+agent binary."
+  (let ((os (pcase system-type
+              ('gnu/linux "linux")
+              ('darwin "macos")
+              ('windows-nt "windows")
+              (_ (user-error "Leman E2EE: no prebuilt agent is available for %s"
+                             system-type))))
+        (arch (cond ((string-match-p "\\(aarch64\\|arm64\\)" system-configuration)
+                     "aarch64")
+                    ((string-match-p "\\(x86_64\\|amd64\\)" system-configuration)
+                     "x86_64")
+                    (t (user-error "Leman E2EE: no prebuilt agent is available for %s"
+                                   system-configuration)))))
+    (concat "leman-agent-" os "-" arch
+            (if (eq system-type 'windows-nt) ".exe" ""))))
+
+(defun leman-e2ee--managed-agent-program ()
+  "Return the managed prebuilt agent path, whether or not it exists."
+  (expand-file-name (leman-e2ee--agent-asset-name)
+                    leman-e2ee-agent-directory))
+
+(defun leman-e2ee--agent-source-revision (&optional load-dir)
+  "Return the Git revision for LOAD-DIR, or nil when it is not a checkout."
+  (let ((default-directory (or load-dir (leman-e2ee--load-dir))))
+    (when (executable-find "git")
+      (with-temp-buffer
+        (when (zerop (process-file "git" nil t nil "rev-parse" "HEAD"))
+          (string-trim (buffer-string)))))))
+
+(defun leman-e2ee--managed-agent-current-p (program &optional load-dir)
+  "Return non-nil when managed PROGRAM was built for LOAD-DIR's revision.
+If the source is not a Git checkout, leave the installed agent alone."
+  (let ((source-revision (leman-e2ee--agent-source-revision load-dir))
+        (revision-file (concat program ".revision")))
+    (or (not source-revision)
+        (and (file-readable-p revision-file)
+             (string-equal source-revision
+                           (string-trim
+                            (with-temp-buffer
+                              (insert-file-contents revision-file)
+                              (buffer-string))))))))
+
+(defun leman-e2ee--verify-agent-download (program checksum-file)
+  "Verify PROGRAM against the SHA-256 digest in CHECKSUM-FILE."
+  (let ((expected (with-temp-buffer
+                    (insert-file-contents checksum-file)
+                    (car (split-string (buffer-string) "[[:space:]]+" t))))
+        (actual (with-temp-buffer
+                  (insert-file-contents-literally program)
+                  (secure-hash 'sha256 (current-buffer)))))
+    (unless (and expected (string-equal (downcase expected) actual))
+      (error "Leman E2EE: downloaded agent checksum does not match"))))
+
+;;;###autoload
+(defun leman-e2ee-install-agent ()
+  "Download and install the prebuilt E2EE agent for this machine.
+The downloaded binary is SHA-256 verified before it replaces an
+existing managed agent.  This is normally called automatically when
+connecting after `package-vc-install' or `package-vc-upgrade'."
+  (interactive)
+  (let* ((asset (leman-e2ee--agent-asset-name))
+         (directory (file-name-as-directory leman-e2ee-agent-directory))
+         (program (expand-file-name asset directory))
+         (base-url (concat (file-name-as-directory leman-e2ee-agent-release-url)
+                           asset))
+         binary checksum revision)
+    (make-directory directory t)
+    (unwind-protect
+        (progn
+          (setq binary (make-temp-file (expand-file-name ".leman-agent-" directory))
+                checksum (make-temp-file (expand-file-name ".leman-agent-sha256-" directory))
+                revision (make-temp-file (expand-file-name ".leman-agent-revision-" directory)))
+          (url-copy-file base-url binary t)
+          (url-copy-file (concat base-url ".sha256") checksum t)
+          (url-copy-file (concat base-url ".revision") revision t)
+          (leman-e2ee--verify-agent-download binary checksum)
+          (rename-file binary program t)
+          (setq binary nil)
+          ;; `set-file-modes' is not meaningful on Windows, but is harmless
+          ;; there; on Unix it prevents other local users from replacing it.
+          (ignore-errors (set-file-modes program #o700))
+          (rename-file revision (concat program ".revision") t)
+          (setq revision nil)
+          (when (called-interactively-p 'interactive)
+            (message "Leman E2EE agent installed at %s" program))
+          program)
+      (dolist (file (list binary checksum revision))
+        (when (and file (file-exists-p file))
+          (delete-file file))))))
+
 (defun leman-e2ee--agent-program ()
   "Return the path to the `leman-agent' executable."
   (or leman-e2ee-agent-program
       (executable-find "leman-agent")
       (let ((load-dir (leman-e2ee--load-dir)))
         (seq-find #'file-executable-p
-                  (list (expand-file-name "e2ee/agent/target/release/leman-agent" load-dir)
-                        (expand-file-name "e2ee/agent/target/debug/leman-agent" load-dir))))))
+                  (list (expand-file-name
+                         (concat "e2ee/agent/target/release/leman-agent"
+                                 (if (eq system-type 'windows-nt) ".exe" ""))
+                         load-dir)
+                        (expand-file-name
+                         (concat "e2ee/agent/target/debug/leman-agent"
+                                 (if (eq system-type 'windows-nt) ".exe" ""))
+                         load-dir)
+                        (leman-e2ee--managed-agent-program))))))
+
+(defun leman-e2ee--ensure-agent-program ()
+  "Return an agent program, installing or refreshing a managed one if needed."
+  (let* ((program (leman-e2ee--agent-program))
+         (managed (leman-e2ee--managed-agent-program))
+         (needs-install (or (not program)
+                            (and (file-equal-p program managed)
+                                 (not (leman-e2ee--managed-agent-current-p program))))))
+    (if (not needs-install)
+        program
+      (condition-case err
+          (or (leman-e2ee-install-agent) program)
+        (error
+         ;; An existing binary remains usable if GitHub is temporarily
+         ;; unavailable just after a package upgrade.
+         (if program
+             (progn
+               (display-warning 'leman
+                                (format "Leman E2EE: could not update the agent: %s"
+                                        (error-message-string err))
+                                :warning)
+               program)
+           (error "Leman E2EE agent program not found; automatic installation failed: %s"
+                  (error-message-string err))))))))
 
 (defun leman-e2ee--agent-stale-p (program &optional load-dir)
   "Return non-nil when the agent PROGRAM is older than its source.
@@ -367,10 +507,13 @@ The agent subprocess is spawned, version-checked, and
 initialized; the crypto store (STORE-PATH or under
 `leman-e2ee-data-directory') is created or reopened.  Return the
 `leman-e2ee' object."
-  (let* ((program (or (leman-e2ee--agent-program)
+  (let* ((program (or (leman-e2ee--ensure-agent-program)
                       (error "Leman E2EE agent program not found; see `leman-e2ee-agent-program'")))
          (load-dir (leman-e2ee--load-dir)))
-    (when (leman-e2ee--agent-stale-p program load-dir)
+    ;; A managed binary is matched to the checkout by its revision sidecar,
+    ;; not file mtimes (a VCS checkout may preserve older source mtimes).
+    (when (and (not (file-equal-p program (leman-e2ee--managed-agent-program)))
+               (leman-e2ee--agent-stale-p program load-dir))
       ;; The binary is older than its source (e.g. after a package
       ;; upgrade): the agent may lag behind the protocol.
       (display-warning

@@ -944,6 +944,27 @@ used, and plaintext messages get no marker."
           (setq color "blue")
           (should-not (eq large (leman-room--shield-image "verified"))))))))
 
+(ert-deftest leman-room--shield-color-is-hex ()
+  "Shield colors are normalized to `#rrggbb'.
+librsvg does not know the X11 color names theme faces return
+\(e.g. \"Green1\"): such a name silently renders no stroke on the
+outlined shield."
+  (cl-letf (((symbol-function 'face-foreground) (lambda (&rest _) "Green1")))
+    (should (equal (leman-room--shield-color 'success "green") "#00ff00")))
+  (cl-letf (((symbol-function 'face-foreground) (lambda (&rest _) "grey70")))
+    (should (string-match-p "\\`#[0-9a-f]\\{6\\}\\'"
+                            (leman-room--shield-color 'shadow "gray"))))
+  ;; Hex colors stay within the `#rrggbb' shape (exact value depends
+  ;; on the frame's color resolution; in these batch tests it goes
+  ;; through the TTY color table).
+  (cl-letf (((symbol-function 'face-foreground) (lambda (&rest _) "#a08979")))
+    (should (string-match-p "\\`#[0-9a-f]\\{6\\}\\'"
+                            (leman-room--shield-color 'success "green"))))
+  ;; An unresolvable color (no frame to query) is left as is.
+  (cl-letf (((symbol-function 'face-foreground) (lambda (&rest _) "not-a-color"))
+            ((symbol-function 'color-name-to-rgb) (lambda (&rest _) nil)))
+    (should (equal (leman-room--shield-color 'shadow "gray") "not-a-color"))))
+
 (ert-deftest leman-room--sender-margin-width ()
   "The left margin fits senders' complete display names, capped."
   (let ((leman-room-sender-in-left-margin t)

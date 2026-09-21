@@ -4335,10 +4335,17 @@ seconds."
   "Cache of shield images, keyed by their visual parameters.")
 
 (defun leman-room--shield-color (face fallback)
-  "Return FACE's foreground color, or FALLBACK if unspecified."
+  "Return FACE's foreground color, or FALLBACK if unspecified.
+The color is normalized to `#rrggbb': librsvg (used to render the
+SVG shields) does not know X11 color names like \"Green1\" or
+\"grey70\" from theme faces; with such a name the outlined shield
+silently renders without a stroke, and solid ones may render with
+the wrong color."
   (let ((color (face-foreground face nil 'default)))
-    (if (and (stringp color) (string-match-p "unspecified" color))
-        fallback
+    (when (and (stringp color) (string-match-p "unspecified" color))
+      (setq color fallback))
+    (if-let* ((rgb (and (stringp color) (color-name-to-rgb color))))
+        (apply #'color-rgb-to-hex (append rgb '(2)))
       color)))
 
 (defun leman-room--shield-image (kind)

@@ -2895,6 +2895,11 @@ and `session' to the session.  Adds function to
                                    ;; room-specific one that was most recently processed.
                                    :displayname displayname)
                                   leman-users))))
+    ;; Keep the avatar current: fetch it again when it changes.
+    (when (and avatar-url
+               (not (equal (leman-user-avatar-url user) avatar-url)))
+      (setf (leman-user-avatar-url user) avatar-url
+            (leman-user-avatar user) nil))
     (pcase membership
       ("join"
        (puthash state-key user members)

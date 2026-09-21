@@ -1266,6 +1266,117 @@ Restoring it lets E2EE skip its whoami call."
       (should (equal (car requests)
                      "{\"ignored_users\":{\"@bad:x.org\":{}}}")))))
 
+(ert-deftest leman-room--avatar-content-type ()
+  "Avatar media types are detected from the image's magic bytes."
+  (should (equal (leman-room--avatar-content-type "\x89PNG\r\n\x1a\nrest") "image/png"))
+  (should (equal (leman-room--avatar-content-type "\xFF\xD8\xFFjunk") "image/jpeg"))
+  (should (equal (leman-room--avatar-content-type "GIF89ajunk") "image/gif"))
+  (should (equal (leman-room--avatar-content-type
+                  (concat "RIFF1234WEBPjunk")) "image/webp"))
+  (should-not (leman-room--avatar-content-type "not an image")))
+
+(ert-deftest leman-room--crop-avatar ()
+  "Avatars are displayed as circular images holding the data."
+  (let* ((data "\x89PNG\r\n\x1a\npixels")
+         (image (cdr (leman-room--crop-avatar data "image/png" 27)))
+         (svg (plist-get image :data)))
+    (should (string-prefix-p "<svg" svg))
+    (should (string-match-p "clip-path=\"url(#c)\"" svg))
+    (should (string-match-p "preserveAspectRatio=\"xMidYMid slice\"" svg))
+    (should (string-match-p (regexp-quote
+                             (base64-encode-string data :nolinebreak))
+                            svg))))
+
+(ert-deftest leman-room--user-avatar ()
+  "User avatars are fetched once, shown once available, never re-fetched.
+While a fetch is in flight, re-renders must not amplify it into
+duplicate requests (as in `leman-room--fetch-html-image')."
+  (let* ((leman-room-user-avatars t)
+         (leman-room--fetching-user-avatars (make-hash-table :test #'equal))
+         (leman-room--user-avatar-images (make-hash-table :test #'equal))
+         (fetches 0)
+         (callbacks nil)
+         (user (make-leman-user :id "@vv:x.org"
+                                :avatar-url "mxc://x.org/avatar"))
+         (session (make-leman-session
+                   :user (make-leman-user :id "@me:x.org")
+                   :server (make-leman-server :name "x.org"
+                                              :uri-prefix "https://x.org")
+                   :token "secret")))
+    (cl-letf (((symbol-function #'plz-run) #'ignore)
+              ((symbol-function #'plz-queue)
+               (lambda (_queue &rest args)
+                 (cl-incf fetches)
+                 (push (cons (plist-get args :then) (plist-get args :else))
+                       callbacks)
+                 nil))
+              ((symbol-function #'leman-room--redisplay) #'ignore))
+      ;; No data yet: nothing to display, and a fetch is queued.
+      (should (equal (leman-room--user-avatar user session) ""))
+      (should (= fetches 1))
+      ;; Re-rendering while the fetch is in flight does not re-fetch.
+      (should (equal (leman-room--user-avatar user session) ""))
+      (should (= fetches 1))
+      ;; When the data arrives, it is stored on the user and displayed.
+      (funcall (caar callbacks) "\x89PNG\r\n\x1a\npixels")
+      (should (equal (leman-user-avatar user) "\x89PNG\r\n\x1a\npixels"))
+      (let ((avatar (leman-room--user-avatar user session)))
+        (should-not (equal avatar ""))
+        (should (string-match-p "<svg" (plist-get (cdr (get-text-property
+                                                   0 'display avatar))
+                                                  :data))))
+      ;; A failed fetch marks the avatar as unavailable: no more
+      ;; fetches for this user this session.
+      (funcall (cdar callbacks) 'error)
+      (should (equal (leman-user-avatar user) ""))
+      (should (equal (leman-room--user-avatar user session) ""))
+      (should (= fetches 1)))))
+
+(ert-deftest leman-room--user-avatar-disabled ()
+  "When user avatars are disabled, nothing is displayed or fetched."
+  (let ((leman-room-user-avatars nil)
+        (leman-room--fetching-user-avatars (make-hash-table :test #'equal))
+        (fetches 0)
+        (user (make-leman-user :id "@vv:x.org"
+                               :avatar-url "mxc://x.org/avatar")))
+    (cl-letf (((symbol-function #'plz-run) #'ignore)
+              ((symbol-function #'plz-queue)
+               (lambda (_queue &rest _args)
+                 (cl-incf fetches) nil)))
+      (should (equal (leman-room--user-avatar user nil) ""))
+      (should (= fetches 0)))))
+
+(ert-deftest leman-room--member-event-updates-avatar-url ()
+  "Member events keep the user's avatar URL current.
+A changed avatar URL invalidates the cached avatar image so the
+new one is fetched."
+  (let ((leman-users (make-hash-table :test #'equal))
+        (leman-event-handlers nil))
+    (load "leman.el" nil t)
+    (let ((user (make-leman-user :id "@vv:x.org"
+                                 :avatar-url "mxc://x.org/old")))
+      (puthash "@vv:x.org" user leman-users)
+      ;; A member event with a new avatar URL updates the user.
+      (funcall (alist-get "m.room.member" leman-event-handlers
+                          nil nil #'equal)
+               (make-leman-event :id "$m1" :type "m.room.member"
+                                 :state-key "@vv:x.org"
+                                 :content '((avatar_url . "mxc://x.org/new")))
+               (make-leman-room :id "!room:x.org")
+               (make-leman-session :user (make-leman-user :id "@me:x.org")))
+      (should (equal (leman-user-avatar-url user) "mxc://x.org/new"))
+      (should-not (leman-user-avatar user))
+      ;; The same avatar URL again: no invalidation.
+      (setf (leman-user-avatar user) "cached")
+      (funcall (alist-get "m.room.member" leman-event-handlers
+                          nil nil #'equal)
+               (make-leman-event :id "$m2" :type "m.room.member"
+                                 :state-key "@vv:x.org"
+                                 :content '((avatar_url . "mxc://x.org/new")))
+               (make-leman-room :id "!room:x.org")
+               (make-leman-session :user (make-leman-user :id "@me:x.org")))
+      (should (equal (leman-user-avatar user) "cached")))))
+
 (provide 'leman-tests)
 
 ;;; leman-tests.el ends here

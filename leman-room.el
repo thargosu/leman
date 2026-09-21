@@ -953,7 +953,7 @@ non-nil, set the variables buffer-locally (i.e. when called from
         ;; is required to avoid compilation warnings).
         (message "Leman: Kill and reopen room buffers to display in new format")))))
 
-(defcustom leman-room-message-format-spec "%S%L%B%r%T%R%t"
+(defcustom leman-room-message-format-spec "%B%r%T%R%t"
   "Format messages according to this spec.
 It may contain these specifiers:
 
@@ -1643,6 +1643,18 @@ used by clients that respect this proposed override.  See
       (leman-alist "name" name))
     :room room))
 
+(defun leman-room--redisplay ()
+  "Redisplay events in all open room buffers."
+  (dolist (buffer (buffer-list))
+    (when (eq 'leman-room-mode (buffer-local-value 'major-mode buffer))
+      (with-current-buffer buffer
+        (let ((window-start (when (get-buffer-window buffer)
+                              (window-start (get-buffer-window buffer)))))
+          (save-excursion
+            (ewoc-refresh leman-ewoc))
+          (when window-start
+            (setf (window-start (get-buffer-window buffer)) window-start)))))))
+
 (defun leman-room-flush-colors ()
   "Flush generated username/message colors.
 Also, redisplay events in all open buffers.  The colors will be
@@ -1652,15 +1664,7 @@ when switching themes or adjusting `leman-prism' options."
   (cl-loop for user being the hash-values of leman-users
            do (setf (leman-user-color user) nil
                     (leman-user-message-color user) nil))
-  (dolist (buffer (buffer-list))
-    (when (eq 'leman-room-mode (buffer-local-value 'major-mode buffer))
-      (with-current-buffer buffer
-        (let ((window-start (when (get-buffer-window buffer)
-                              (window-start (get-buffer-window buffer)))))
-          (save-excursion
-            (ewoc-refresh leman-ewoc))
-          (when window-start
-            (setf (window-start (get-buffer-window buffer)) window-start))))))
+  (leman-room--redisplay)
   ;; Flush notify-background-color colors.
   (cl-loop for (_id . session) in leman-sessions
            do (cl-loop for room in (leman-session-rooms session)
@@ -4260,7 +4264,8 @@ seconds."
        ;; buffer (see `leman-room--animate-images').
        (leman-room--animate-images beg (point))))
     ((pred leman-user-p)
-     (insert (propertize (leman--format-user thing)
+     (insert (leman-room--user-avatar thing leman-session)
+             (propertize (leman--format-user thing)
                          'display leman-room-username-display-property)))
     (`(ts ,(and (pred numberp) ts)) ;; Insert a date header.
      (let* ((string (format-time-string leman-room-timestamp-header-format ts))
@@ -4541,7 +4546,111 @@ For Unicode emoji, derive a readable shortcode from its Unicode name."
                   do (push sender (alist-get key keys-senders nil nil #'string=))
                   finally do (setf keys-senders (cl-sort keys-senders #'> :key (lambda (pair) (length (cdr pair)))))
                   finally return (concat "\n  " (mapconcat #'format-reaction keys-senders "  ")))
-       "")))
+        "")))
+
+;;;;; User avatars
+
+(defcustom leman-room-user-avatars (and (display-images-p)
+                                        (image-type-available-p 'svg))
+  "Show speakers' avatars next to their names in room buffers.
+Avatars are downloaded from the homeserver in the background the
+first time a speaker is displayed, and shown once they arrive."
+  :type 'boolean)
+
+(defvar leman-room--user-avatar-images (make-hash-table :test #'equal)
+  "Cache of user avatar images, keyed by their visual parameters.")
+
+(defvar leman-room--fetching-user-avatars (make-hash-table :test #'equal)
+  "Hash table of user IDs whose avatar is being fetched.")
+
+(defun leman-room--user-avatar-size ()
+  "Return the side, in pixels, of user avatars in room buffers."
+  (round (* 1.5 (window-font-height))))
+
+(defun leman-room--avatar-content-type (data)
+  "Return the media type of avatar image DATA, or nil if unknown."
+  (cond ((string-prefix-p "\x89PNG" data) "image/png")
+        ((string-prefix-p "\xFF\xD8\xFF" data) "image/jpeg")
+        ((string-prefix-p "GIF8" data) "image/gif")
+        ((and (> (length data) 12)
+              (string-prefix-p "RIFF" data)
+              (equal (substring data 8 12) "WEBP"))
+         "image/webp")))
+
+(defun leman-room--crop-avatar (data content-type size)
+  "Return a circular image spec of avatar image DATA.
+CONTENT-TYPE is the image's media type, and SIZE the side, in
+pixels, of the resulting image (larger avatars are center-cropped
+to fit)."
+  (svg-image
+   (concat
+    (format "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"%d\" height=\"%d\" viewBox=\"0 0 %d %d\">"
+            size size size size)
+    (format "<clipPath id=\"c\"><circle cx=\"%d\" cy=\"%d\" r=\"%d\"/></clipPath>"
+            (/ size 2) (/ size 2) (/ size 2))
+    (format "<image clip-path=\"url(#c)\" x=\"0\" y=\"0\" width=\"%d\" height=\"%d\" preserveAspectRatio=\"xMidYMid slice\" xlink:href=\"data:%s;base64,%s\"/>"
+            size size content-type
+            (base64-encode-string data :nolinebreak))
+    "</svg>")
+   :ascent 'center))
+
+(defun leman-room--user-avatar-image (user)
+  "Return the circular avatar image of USER, if available.
+The image is cached in `leman-room--user-avatar-images', keyed by
+its visual parameters."
+  (when-let* ((data (leman-user-avatar user))
+              ((not (equal data "")))
+              (content-type (leman-room--avatar-content-type data))
+              (size (leman-room--user-avatar-size))
+              (key (list (leman-user-avatar-url user) size)))
+    (or (gethash key leman-room--user-avatar-images)
+        (puthash key (concat (propertize " "
+                                         'display (leman-room--crop-avatar
+                                                   data content-type size))
+                             " ")
+                 leman-room--user-avatar-images))))
+
+(defun leman-room--fetch-user-avatar (user session)
+  "Fetch USER's avatar from its mxc URI on SESSION in the background.
+When the data arrives, it is stored on USER and room buffers are
+redisplayed; on failure, no avatar is shown (and none fetched
+again for USER during this session)."
+  (let ((id (leman-user-id user)))
+    (puthash id t leman-room--fetching-user-avatars)
+    (plz-run
+     (plz-queue leman-images-queue
+       ;; NOTE: Authenticated media endpoint: servers like Conduit
+       ;; reject the unauthenticated download URL.
+       'get (leman--mxc-to-authenticated-url (leman-user-avatar-url user) session)
+       :as 'binary :noquery t
+       :headers (list (cons "Authorization"
+                            (concat "Bearer " (leman-session-token session))))
+       :then (lambda (data)
+               (remhash id leman-room--fetching-user-avatars)
+               (setf (leman-user-avatar user) data)
+               (clrhash leman-room--user-avatar-images)
+               (leman-room--redisplay))
+       :else (lambda (plz-error)
+               (remhash id leman-room--fetching-user-avatars)
+               ;; Mark as unavailable to avoid re-fetching on every
+               ;; redisplay.
+               (setf (leman-user-avatar user) "")
+               (leman-debug "User avatar fetch failed:" plz-error))))))
+
+(defun leman-room--user-avatar (user session)
+  "Return USER's avatar string, or \"\" if there is none (yet).
+The avatar is fetched in the background the first time it is
+needed; it is displayed once the download completes."
+  (or (when leman-room-user-avatars
+        (leman-room--user-avatar-image user))
+      (progn
+        (when (and leman-room-user-avatars
+                   (leman-user-avatar-url user)
+                   (null (leman-user-avatar user))
+                   (not (gethash (leman-user-id user)
+                                 leman-room--fetching-user-avatars)))
+          (leman-room--fetch-user-avatar user session))
+        "")))
 
 ;;;; Threads
 

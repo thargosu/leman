@@ -942,6 +942,27 @@ used, and plaintext messages get no marker."
           (should (eq (get-text-property (string-match-p timestamp header) 'face header)
                       'leman-room-timestamp)))))))
 
+(ert-deftest leman-room--thread-event-uses-sender-header ()
+  "Thread events use the timeline's avatar and timestamp styling."
+  (let* ((sender (make-leman-user :id "@vv:x.org" :displayname "Vincent"))
+         (event (make-leman-event :sender sender
+                                  :origin-server-ts 1694000000000
+                                  :content '((msgtype . "m.text") (body . "hello"))))
+         (leman-room (make-leman-room :id "!room:example.com"))
+         (leman-session (make-leman-session :user (make-leman-user :id "@me:x.org")))
+         (leman-room-timestamp-format "%H:%M:%S"))
+    (cl-letf (((symbol-function 'leman-room--user-avatar)
+               (lambda (_user _session) "avatar ")))
+      (with-temp-buffer
+        (leman-room--insert-thread-event event)
+        (let* ((thread-event (buffer-string))
+               (timestamp (format-time-string leman-room-timestamp-format 1694000000))
+               (timestamp-pos (string-match-p timestamp thread-event)))
+          (should (equal (substring-no-properties thread-event)
+                         (format "\navatar Vincent  %s\nhello\n" timestamp)))
+          (should (eq (get-text-property timestamp-pos 'face thread-event)
+                      'leman-room-timestamp)))))))
+
 (ert-deftest leman-room--shield-image-cache-uses-visual-parameters ()
   "Shield images are not reused across font sizes or theme colors."
   (let ((leman-room--shield-images (make-hash-table :test #'equal))

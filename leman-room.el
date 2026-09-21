@@ -4259,6 +4259,16 @@ Search from FROM (either `first' or `last')."
 
 ;;;;; Formatting
 
+(defun leman-room--format-sender-header (event session)
+  "Return the sender header for EVENT on SESSION."
+  (let ((sender (leman-event-sender event)))
+    (concat (leman-room--user-avatar sender session)
+            (propertize (leman--format-user sender)
+                        'display leman-room-username-display-property)
+            "  "
+            (funcall (alist-get ?t leman-room-event-formatters)
+                     event leman-room session))))
+
 (defun leman-room--pp-thing (thing)
   "Pretty-print THING.
 To be used as the pretty-printer for `ewoc-create'.  THING may be
@@ -4279,14 +4289,8 @@ seconds."
        ;; buffer (see `leman-room--animate-images').
        (leman-room--animate-images beg (point))))
     ((pred leman-room-sender-header-p)
-     (let* ((event (leman-room-sender-header-event thing))
-            (sender (leman-event-sender event)))
-       (insert (leman-room--user-avatar sender leman-session)
-               (propertize (leman--format-user sender)
-                           'display leman-room-username-display-property)
-               "  "
-               (funcall (alist-get ?t leman-room-event-formatters)
-                        event leman-room leman-session))))
+     (insert (leman-room--format-sender-header
+              (leman-room-sender-header-event thing) leman-session)))
     ((pred leman-user-p)
      (insert (leman-room--user-avatar thing leman-session)
              (propertize (leman--format-user thing)
@@ -4882,17 +4886,13 @@ from the server and the buffer re-rendered when it arrives."
 
 (defun leman-room--insert-thread-event (event)
   "Insert EVENT into the current thread buffer."
-  (pcase-let* ((room leman-room)
-               (sender (leman--user-displayname-in room (leman-event-sender event)))
-               (ts (format-time-string leman-room-timestamp-format
-                                       (/ (leman-event-origin-server-ts event) 1000)))
-               (body (or (leman-room--format-message-body event leman-session)
-                         "")))
+  (let ((body (or (leman-room--format-message-body event leman-session)
+                  "")))
     (insert "\n"
-            (propertize (format "%s  %s\n" sender ts)
-                        'face 'leman-room-user)
+            (leman-room--format-sender-header event leman-session)
+            "\n"
             body "\n")
-    (when-let ((reactions (leman-room--format-reactions event room)))
+    (when-let ((reactions (leman-room--format-reactions event leman-room)))
       (unless (string-empty-p reactions)
         (insert reactions)))))
 

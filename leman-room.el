@@ -900,9 +900,9 @@ non-nil, set the variables buffer-locally (i.e. when called from
       (set-default option value))
     (pcase value
       ;; Try to set the margin widths smartly.
-      ("%B%r%T%R%t" ;; "Elemental"
+      ("%B%r%T" ;; "Elemental"
         (set-vars leman-room-left-margin-width 0
-                  leman-room-right-margin-width 8
+                  leman-room-right-margin-width 0
                   leman-room-sender-headers t
                   leman-room-sender-in-headers t
                   leman-room-sender-in-left-margin nil))
@@ -953,7 +953,7 @@ non-nil, set the variables buffer-locally (i.e. when called from
         ;; is required to avoid compilation warnings).
         (message "Leman: Kill and reopen room buffers to display in new format")))))
 
-(defcustom leman-room-message-format-spec "%B%r%T%R%t"
+(defcustom leman-room-message-format-spec "%B%r%T"
   "Format messages according to this spec.
 It may contain these specifiers:
 
@@ -982,7 +982,7 @@ otherwise be set manually with `leman-room-left-margin-width' and
                  (const :tag "IRC-style without margins" "[%t] %S> %B%r%T")
                  (const :tag "IRC-style without margins, with wrap-prefix" "[%t] %S> %W%B%r%T")
                  (const :tag "IRC-style with right margin, with wrap-prefix" "%S> %W%B%r%T%R%t")
-                 (const :tag "Elemental" "%B%r%T%R%t")
+                 (const :tag "Elemental" "%B%r%T")
                  (string :tag "Custom format"))
   :set #'leman-room-message-format-spec-setter
   :set-after '(leman-room-left-margin-width leman-room-right-margin-width

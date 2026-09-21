@@ -1009,6 +1009,22 @@ outlined shield."
           (should-not (leman-room--svg-rendering-p room)))
       (kill-buffer buffer))))
 
+(ert-deftest leman-room--elemental-spec-clears-margins ()
+  "The Elemental format shows no left or right margin."
+  (let ((leman-room-left-margin-width 12)
+        (leman-room-right-margin-width 8)
+        (leman-room-sender-in-left-margin t)
+        (leman-room-sender-headers nil)
+        (leman-room-sender-in-headers nil))
+    (leman-room-message-format-spec-setter 'leman-room-message-format-spec
+                                           "%B%r%T" 'local)
+    (should (equal leman-room-message-format-spec "%B%r%T"))
+    (should (equal leman-room-left-margin-width 0))
+    (should (equal leman-room-right-margin-width 0))
+    (should leman-room-sender-headers)
+    (should leman-room-sender-in-headers)
+    (should-not leman-room-sender-in-left-margin)))
+
 (ert-deftest leman--sessions-round-trip-device-id ()
   "The device ID round-trips through the saved sessions file.
 Restoring it lets E2EE skip its whoami call."

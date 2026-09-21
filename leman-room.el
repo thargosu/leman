@@ -355,12 +355,6 @@ waiting instead of queueing a duplicate fetch for the same URL.")
   "Options for room buffers."
   :group 'leman)
 
-(defcustom leman-room-timestamp-header-align 'right
-  "Where to align timestamp headers."
-  :type '(choice (const :tag "Left" left)
-                 (const :tag "Center" center)
-                 (const :tag "Right" right)))
-
 (defcustom leman-room-view-hook
   '(leman-room-view-hook-room-list-auto-update)
   "Functions called when `leman-room-view' is called.
@@ -463,11 +457,6 @@ Anything wrapped by HTML BLOCKQUOTE tag."
 Note that this does not need to inherit
 `leman-room-message-text', because that face is combined with
 this one automatically."
-  :group 'leman-room-faces)
-
-(defface leman-room-timestamp-header
-  '((t (:inherit header-line :weight bold :height 1.1)))
-  "Timestamp headers."
   :group 'leman-room-faces)
 
 (defface leman-room-mention
@@ -1000,24 +989,6 @@ otherwise be set manually with `leman-room-left-margin-width' and
   "Number of messages to retrieve when loading earlier messages."
   :type 'integer)
 
-(defcustom leman-room-timestamp-header-format " %H:%M "
-  "Format string for timestamp headers where date is unchanged.
-See function `format-time-string'.  If this string ends in a
-newline, its background color will extend to the end of the
-line."
-  :type '(choice (const :tag "Time-only" " %H:%M ")
-                 (const :tag "Always show date" " %Y-%m-%d %H:%M ")
-                 string))
-
-(defcustom leman-room-timestamp-header-with-date-format " %Y-%m-%d (%A)\n"
-  ;; FIXME: In Emacs 27+, maybe use :extend t instead of adding a newline.
-  "Format string for timestamp headers where date changes.
-See function `format-time-string'.  If this string ends in a
-newline, its background color will extend to the end of the
-line."
-  :type '(choice (const " %Y-%m-%d (%A)\n")
-                 string))
-
 (defcustom leman-room-replace-edited-messages t
   "Replace edited messages with their new content.
 When nil, edited messages are displayed as new messages, leaving
@@ -1053,10 +1024,6 @@ newlines.
 
 See Info node `(elisp)Specified Space'."
   :type 'sexp)
-
-(defcustom leman-room-timestamp-header-delta 600
-  "Show timestamp header where events are at least this many seconds apart."
-  :type 'integer)
 
 (defcustom leman-room-send-message-filter nil
   "Function through which to pass message content before sending.
@@ -2826,50 +2793,6 @@ before the earliest-seen message)."
         (leman-room--insert-retro-events room buffer chunk set-prev-batch end)))
     (message "Leman: Loaded %s earlier events." num-events)))
 
-(defun leman-room--insert-events (events &optional retro)
-  "Insert EVENTS into current buffer.
-Calls `leman-room--insert-event' for each event and inserts
-timestamp headers into appropriate places while maintaining
-point's position.  If RETRO is non-nil, assume EVENTS are earlier
-than any existing events, and only insert timestamp headers up to
-the previously oldest event."
-  (let (buffer-window point-node orig-first-node point-max-p)
-    (when (get-buffer-window (current-buffer))
-      ;; HACK: See below.
-      (setf buffer-window (get-buffer-window (current-buffer))
-            point-max-p (= (point) (point-max))))
-    (when (and buffer-window retro)
-      (setf point-node (ewoc-locate leman-ewoc (window-start buffer-window))
-            orig-first-node (ewoc-nth leman-ewoc 0)))
-    (save-window-excursion
-      ;; NOTE: When inserting some events, seemingly only replies, if a different buffer's
-      ;; window is selected, and this buffer's window-point is at the bottom, the formatted
-      ;; events may be inserted into the wrong place in the buffer, even though they are
-      ;; inserted into the EWOC at the right place.  We work around this by selecting the
-      ;; buffer's window while inserting events, if it has one.  (I don't know if this is a bug
-      ;; in EWOC or in this file somewhere.  But this has been particularly nasty to debug.)
-      (when buffer-window
-        (select-window buffer-window))
-      (cl-loop for event being the elements of events
-               do (leman-room--process-event event)
-               do (leman-progress-update)))
-    ;; Since events can be received in any order, we have to check the whole buffer
-    ;; for where to insert new timestamp headers.  (Avoiding that would require
-    ;; getting a list of newly inserted nodes and checking each one instead of every
-    ;; node in the buffer.  Doing that now would probably be premature optimization,
-    ;; though it will likely be necessary if users keep buffers open for busy rooms
-    ;; for a long time, as the time to do this in each buffer will increase with the
-    ;; number of events.  At least we only do it once per batch of events.)
-    (leman-room--insert-ts-headers nil (when retro orig-first-node))
-    (when leman-room-sender-in-headers
-      (leman-room--insert-sender-headers leman-ewoc))
-    (when buffer-window
-      (cond (retro (with-selected-window buffer-window
-                     (set-window-start buffer-window (ewoc-location point-node))
-                     ;; TODO: Experiment with this.
-                     (forward-line -1)))
-            (point-max-p (set-window-point buffer-window (point-max)))))))
-
 (cl-defun leman-room--send-typing (session room &key (typing t))
   "Send a typing notification for ROOM on SESSION."
   (when (leman-session-revoked-p session)
@@ -2924,7 +2847,6 @@ and erases the buffer.
   (setf buffer-read-only t
         left-margin-width leman-room-left-margin-width
         right-margin-width leman-room-right-margin-width
-        imenu-create-index-function #'leman-room--imenu-create-index-function
         ;; TODO: Use EWOC header/footer for, e.g. typing messages.
         leman-ewoc (ewoc-create #'leman-room--pp-thing))
   ;; Prevent line/wrap-prefix formatting properties being included in copied text.
@@ -3098,8 +3020,6 @@ data slot."
                                    (leman-room--initial-footer room))
           ;; Clear new-events, because those only matter when a buffer is already open.
           (setf (alist-get 'new-events (leman-room-local room)) nil)
-          ;; We don't use `leman-room--insert-events' to avoid extra
-          ;; calls to `leman-room--insert-ts-headers'.
           ;; NOTE: We handle the events in chronological order (i.e. the reverse of the
           ;; stored order, which is latest-first), because some logic depends on this
           ;; (e.g. processing a message-edit event before the edited event would mean the
@@ -3108,7 +3028,6 @@ data slot."
                 (leman-room-timeline room) (leman-room--sanitize-events (leman-room-timeline room)))
           (leman-room--process-events (reverse (leman-room-state room)))
           (leman-room--process-events (reverse (leman-room-timeline room)))
-          (leman-room--insert-ts-headers)
           (when leman-room-sender-in-headers
             (leman-room--insert-sender-headers leman-ewoc))
           (leman-room-move-read-markers room
@@ -3146,24 +3065,6 @@ not be copied into other buffers."
     (remove-list-of-text-properties
      0 (length string) '(line-prefix wrap-prefix) string)
     string))
-
-;;;;; Imenu
-
-(defconst leman-room-timestamp-header-imenu-format "%Y-%m-%d (%A) %H:%M"
-  "Format string for timestamps in Imenu indexes.")
-
-(defun leman-room--imenu-create-index-function ()
-  "Return Imenu index for the current buffer.
-For use as `imenu-create-index-function'."
-  (let ((timestamp-nodes (leman-room--ewoc-collect-nodes
-                          leman-ewoc (lambda (node)
-                                       (pcase (ewoc-data node)
-                                         (`(ts . ,_) t))))))
-    (cl-loop for node in timestamp-nodes
-             collect (pcase-let*
-                         ((`(ts ,timestamp) (ewoc-data node))
-                          (formatted (format-time-string leman-room-timestamp-header-imenu-format timestamp)))
-                       (cons formatted (ewoc-location node))))))
 
 ;;;;; Occur
 
@@ -3230,9 +3131,7 @@ arguments."
             (leman-room-timeline room) (leman-room--sanitize-events (leman-room-timeline room)))
       (leman-room--process-events (reverse (leman-room-state room)))
       (leman-room--process-events (reverse (leman-room-timeline room)))
-      (ewoc-filter leman-ewoc pred)
-      ;; TODO: Insert date header before first event.
-      (leman-room--insert-ts-headers))
+      (ewoc-filter leman-ewoc pred))
     (pop-to-buffer occur-buffer)))
 
 (defun leman-room-occur-find-event (event)
@@ -3303,13 +3202,9 @@ iterable by many functions which expect structs (e.g.
 
 (defun leman-room--process-events (events)
   "Process EVENTS in current buffer.
-Calls `leman-progress-update' for each event.  Calls
-`leman-room--insert-ts-headers' when done.  Uses handlers defined
-in `leman-room-event-fns'.  The current buffer should be a room's
-buffer."
-  ;; FIXME: Calling `leman-room--insert-ts-headers' is convenient, but it
-  ;; may also be called in functions that call this function, which may
-  ;; result in it being called multiple times for a single set of events.
+Calls `leman-progress-update' for each event.  Uses handlers
+defined in `leman-room-event-fns'.  The current buffer should be
+a room's buffer."
   (cl-loop for entry being the elements of events ;; EVENTS may be a list or array.
            ;; NOTE: Raw events may be present (e.g. from unconverted sync
            ;; responses or, for already-seen events, nils, e.g. from
@@ -3326,23 +3221,7 @@ buffer."
            ;; remaining events in the batch.
            do (with-demoted-errors "Leman: Error processing event: %S"
                 (funcall handler event))
-           do (leman-progress-update))
-  (leman-room--insert-ts-headers))
-
-(defun leman-room--process-event (event)
-  "Process EVENT in current buffer.
-Uses handlers defined in `leman-room-event-fns'.  The current
-buffer should be a room's buffer."
-  (when (and event (not (leman-event-p event)))
-    ;; Raw event: convert it (see `leman-room--process-events').
-    (setf event (leman--make-event event)))
-  (when-let ((handler (when event
-                        (alist-get (leman-event-type event) leman-room-event-fns nil nil #'equal))))
-    ;; We demote any errors that happen while processing events, because it's possible for
-    ;; events to be malformed in unexpected ways, and that could cause an error, which
-    ;; would stop processing of other events and prevent further syncing.
-    (with-demoted-errors "Leman (leman-room--process-event): Error processing event: %S"
-      (funcall handler event))))
+           do (leman-progress-update)))
 
 ;;;;;; Event handlers
 
@@ -3947,74 +3826,6 @@ last node."
            return node
            do (setf node (ewoc-prev ewoc node))))
 
-(defun leman-room--ewoc-collect-nodes (ewoc predicate)
-  "Collect all nodes in EWOC matching PREDICATE.
-PREDICATE is called with the full node."
-  ;; Intended to be like `ewoc-collect', but working with the full node instead of just the node's data.
-  (cl-loop with node = (ewoc-nth ewoc 0)
-           do (setf node (ewoc-next ewoc node))
-           while node
-           when (funcall predicate node)
-           collect node))
-
-(defun leman-room--insert-ts-headers (&optional start-node end-node)
-  "Insert timestamp headers into current buffer's `leman-ewoc'.
-Inserts headers between START-NODE and END-NODE, which default to
-the first and last nodes in the buffer, respectively."
-  (let* ((type-predicate (lambda (node-data)
-                           (and (leman-event-p node-data)
-                                (not (equal "m.room.member" (leman-event-type node-data))))))
-         (ewoc leman-ewoc)
-         (end-node (or end-node
-                       (ewoc-nth ewoc -1)))
-         (end-pos (if end-node
-                      (ewoc-location end-node)
-                    ;; HACK: Trying to work around a bug in case the
-                    ;; room doesn't seem to have any events yet.
-                    (point-max)))
-         (node-b (or start-node (ewoc-nth ewoc 0)))
-         node-a)
-    ;; On the first loop iteration, node-a is set to the first matching
-    ;; node after node-b; then it's set to the first node after node-a.
-    (while (and (setf node-a (leman-room--ewoc-next-matching ewoc (or node-a node-b) type-predicate)
-                      node-b (when node-a
-                               (leman-room--ewoc-next-matching ewoc node-a type-predicate)))
-                (not (or (> (ewoc-location node-a) end-pos)
-                         (when node-b
-                           (> (ewoc-location node-b) end-pos)))))
-      (cl-labels ((format-event (event)
-                    (format "TS:%S (%s)  Sender:%s  Message:%S"
-                            (/ (leman-event-origin-server-ts (ewoc-data event)) 1000)
-                            (format-time-string "%Y-%m-%d %H:%M:%S"
-                                                (/ (leman-event-origin-server-ts (ewoc-data event)) 1000))
-                            (leman-user-id (leman-event-sender (ewoc-data event)))
-                            (when (alist-get 'body (leman-event-content (ewoc-data event)))
-                              (substring-no-properties
-                               (truncate-string-to-width (alist-get 'body (leman-event-content (ewoc-data event))) 20))))))
-        (leman-debug "Comparing event timestamps:"
-                     (list 'A (format-event node-a))
-                     (list 'B (format-event node-b))))
-      ;; NOTE: Matrix timestamps are in milliseconds.
-      (let* ((a-ts (/ (leman-event-origin-server-ts (ewoc-data node-a)) 1000))
-             (b-ts (/ (leman-event-origin-server-ts (ewoc-data node-b)) 1000))
-             (diff-seconds (- b-ts a-ts))
-             (leman-room-timestamp-header-format leman-room-timestamp-header-format))
-        (when (and (>= diff-seconds leman-room-timestamp-header-delta)
-                   (not (when-let ((node-after-a (ewoc-next ewoc node-a)))
-                          (pcase (ewoc-data node-after-a)
-                            (`(ts . ,_) t)
-                            ((or 'leman-room-read-receipt-marker 'leman-room-fully-read-marker) t)))))
-          (unless (equal (time-to-days a-ts) (time-to-days b-ts))
-            ;; Different date: bind format to print date.
-            (let ((leman-room-timestamp-header-format leman-room-timestamp-header-with-date-format))
-              ;; Insert the date-only header.
-              (setf node-a (ewoc-enter-after ewoc node-a (list 'ts b-ts)))))
-          (with-silent-modifications
-            ;; Avoid marking a buffer as modified just because we inserted a ts
-            ;; header (this function may be called after other events which shouldn't
-            ;; cause it to be marked modified, like moving the read markers).
-            (ewoc-enter-after ewoc node-a (list 'ts b-ts))))))))
-
 (cl-defun leman-room--insert-sender-headers
     (ewoc &optional (start-node (ewoc-nth ewoc 0)) (end-node (ewoc-nth ewoc -1)))
   ;; TODO: Use this in appropriate places.
@@ -4100,8 +3911,7 @@ Return absorbing node if coalesced."
   "Return non-nil if ewoc node datum DATA has a timestamp."
   (pcase data
     ((pred leman-event-p) t)
-    ((pred leman-room-membership-events-p) t)
-    (`(ts . ,_) t)))
+    ((pred leman-room-membership-events-p) t)))
 
 (defun leman-room--read-marker-node-p (data)
   "Return non-nil if ewoc node datum DATA is a read marker."
@@ -4114,10 +3924,7 @@ Return absorbing node if coalesced."
     ((pred leman-event-p) (leman-event-origin-server-ts data))
     ((pred leman-room-membership-events-p)
      ;; Not sure whether to use earliest or latest ts; let's try this for now.
-     (leman-room-membership-events-earliest-ts data))
-    (`(ts ,ts)
-     ;; Matrix server timestamps are in ms, so we must convert back.
-     (* 1000 ts))))
+     (leman-room-membership-events-earliest-ts data))))
 
 (defun leman-room--node-ts< (a b)
   "Return non-nil if ewoc node datum A's timestamp is before B's."
@@ -4272,9 +4079,8 @@ Search from FROM (either `first' or `last')."
 (defun leman-room--pp-thing (thing)
   "Pretty-print THING.
 To be used as the pretty-printer for `ewoc-create'.  THING may be
-an `leman-event', `leman-user', or `leman-room-sender-header' struct, or a list like `(ts
-TIMESTAMP)', where TIMESTAMP is a Unix timestamp number of
-seconds."
+an `leman-event', `leman-user', or `leman-room-sender-header'
+struct."
   ;; TODO: Use handlers to insert so e.g. membership events can be inserted silently.
 
   ;; TODO: Use `cl-defmethod' and define methods for each of these THING types.  (I've
@@ -4295,26 +4101,6 @@ seconds."
      (insert (leman-room--user-avatar thing leman-session)
              (propertize (leman--format-user thing)
                          'display leman-room-username-display-property)))
-    (`(ts ,(and (pred numberp) ts)) ;; Insert a date header.
-     (let* ((string (format-time-string leman-room-timestamp-header-format ts))
-            (width (string-width string))
-            (maybe-newline (if (equal leman-room-timestamp-header-format leman-room-timestamp-header-with-date-format)
-                               ;; HACK: Rather than using another variable, compare the format strings to
-                               ;; determine whether the date is changing: if so, add a newline before the header.
-                               (progn
-                                 (cl-incf width 3)
-                                 "\n")
-                             ""))
-            (alignment-space (pcase leman-room-timestamp-header-align
-                               ('right (propertize " "
-                                                   'display `(space :align-to (- text ,(1+ width)))))
-                               ('center (propertize " "
-                                                    'display `(space :align-to (- center ,(/ (1+ width) 2)))))
-                               (_ " "))))
-       (insert maybe-newline
-               alignment-space
-               (propertize string
-                           'face 'leman-room-timestamp-header))))
     ((or 'leman-room-read-receipt-marker 'leman-room-fully-read-marker)
      (insert (propertize " "
                          'display '(space :width text :height (1))

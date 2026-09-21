@@ -141,8 +141,6 @@ to `leman-api', which see."
       (cl-loop for notification across notifications
                do (run-hook-with-args 'leman-notifications-hook
                                       session (leman-notifications--make notification)))
-      ;; TODO: Pass start/end nodes to `leman-room--insert-ts-headers' if possible.
-      (leman-room--insert-ts-headers)
       (switch-to-buffer (current-buffer)))))
 
 (defun leman-notifications-scroll-down-command ()

@@ -4593,7 +4593,7 @@ first time a speaker is displayed, and shown once they arrive."
 
 (defun leman-room--user-avatar-size ()
   "Return the side, in pixels, of user avatars in room buffers."
-  (round (* 1.5 (window-font-height))))
+  (round (* 2 (window-font-height))))
 
 (defun leman-room--avatar-content-type (data)
   "Return the media type of avatar image DATA, or nil if unknown."

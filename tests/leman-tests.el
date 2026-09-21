@@ -926,6 +926,22 @@ used, and plaintext messages get no marker."
     (should (< (string-match-p "🛡" formatted)
                (string-match-p "hello world" formatted)))))
 
+(ert-deftest leman-room--sender-header-shows-message-timestamp ()
+  "A sender header puts its first message's time beside the name."
+  (let* ((sender (make-leman-user :id "@vv:x.org" :displayname "Vincent"))
+         (event (make-leman-event :sender sender :origin-server-ts 1694000000000))
+         (leman-room-user-avatars nil)
+         (leman-room-timestamp-format "%H:%M:%S")
+         (leman-room (make-leman-room :id "!room:example.com"))
+         (leman-session (make-leman-session :user (make-leman-user :id "@me:x.org"))))
+    (with-temp-buffer
+      (leman-room--pp-thing (leman-room--make-sender-header event))
+      (let ((header (buffer-string)))
+        (let ((timestamp (format-time-string leman-room-timestamp-format 1694000000)))
+          (should (equal (substring-no-properties header) (format "Vincent  %s" timestamp)))
+          (should (eq (get-text-property (string-match-p timestamp header) 'face header)
+                      'leman-room-timestamp)))))))
+
 (ert-deftest leman-room--shield-image-cache-uses-visual-parameters ()
   "Shield images are not reused across font sizes or theme colors."
   (let ((leman-room--shield-images (make-hash-table :test #'equal))

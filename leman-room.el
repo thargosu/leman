@@ -82,6 +82,11 @@ to sort events and update other slots."
 (defvar-local leman-ewoc nil
   "EWOC for Leman room buffers.")
 
+(cl-defstruct (leman-room-sender-header
+               (:constructor leman-room--make-sender-header (event)))
+  "A sender header for EVENT in a room timeline."
+  event)
+
 (defvar-local leman-room nil
   "Leman room for current buffer.")
 
@@ -1828,7 +1833,8 @@ option."
       (leman-room--insert-sender-headers leman-ewoc)
     (ewoc-filter leman-ewoc (lambda (node-data)
                               ;; Return non-nil for nodes that should stay.
-                              (not (leman-user-p node-data)))))
+                              (not (or (leman-user-p node-data)
+                                       (leman-room-sender-header-p node-data))))))
   (ewoc-refresh leman-ewoc))
 
 (defun leman-room-set-topic (session room topic)
@@ -4033,21 +4039,26 @@ the first and last nodes in the buffer, respectively."
               ;; Find previous message or user header.
               (leman-room--ewoc-next-matching ewoc event-node
                 (lambda (data)
-                  (or (leman-user-p data) (message-event-p data)))
+                  (or (leman-room-sender-header-p data) (message-event-p data)))
                 #'ewoc-prev))
         (let ((sender (leman-event-sender (ewoc-data event-node))))
           (cond ((not prev-node)
                  ;; No previous message/sender: insert sender.
-                 (ewoc-enter-before ewoc event-node sender))
-                ((leman-user-p (ewoc-data prev-node))
+                 (ewoc-enter-before ewoc event-node
+                                    (leman-room--make-sender-header (ewoc-data event-node))))
+                ((leman-room-sender-header-p (ewoc-data prev-node))
                  ;; Previous node is a sender.
-                 (unless (equal sender (ewoc-data prev-node))
+                 (unless (equal sender
+                                (leman-event-sender
+                                 (leman-room-sender-header-event (ewoc-data prev-node))))
                    ;; Previous node is the wrong sender: fix it.
-                   (ewoc-set-data prev-node sender)))
+                   (ewoc-set-data prev-node
+                                  (leman-room--make-sender-header (ewoc-data event-node)))))
                 ((and (message-event-p (ewoc-data prev-node))
                       (not (equal sender (leman-event-sender (ewoc-data prev-node)))))
                  ;; Previous node is a message from a different sender: insert header.
-                 (ewoc-enter-before ewoc event-node sender))))
+                 (ewoc-enter-before ewoc event-node
+                                    (leman-room--make-sender-header (ewoc-data event-node))))))
         (setf event-node (leman-room--ewoc-next-matching ewoc event-node #'message-event-p))))))
 
 (defun leman-room--coalesce-nodes (a b ewoc)
@@ -4138,9 +4149,11 @@ Return absorbing node if coalesced."
                                   (leman-debug "No event before it: add first.")
                                   (leman-debug "EWOC empty: add first.")
                                   (ewoc-enter-first ewoc event))
-                                 ((and (leman-user-p (ewoc-data first-node))
+                                 ((and (leman-room-sender-header-p (ewoc-data first-node))
                                        (equal (leman-event-sender event)
-                                              (ewoc-data first-node)))
+                                              (leman-event-sender
+                                               (leman-room-sender-header-event
+                                                (ewoc-data first-node)))))
                                   (leman-debug "No event before it: add first.")
                                   (leman-debug "EWOC not empty.")
                                   (leman-debug "First node is header for this sender: insert after it, instead.")
@@ -4153,9 +4166,11 @@ Return absorbing node if coalesced."
                                   (ewoc-enter-first ewoc event))))
                        (leman-debug "Found event before new event: insert after it.")
                        (when-let ((next-node (ewoc-next ewoc event-node-before)))
-                         (when (and (leman-user-p (ewoc-data next-node))
+                         (when (and (leman-room-sender-header-p (ewoc-data next-node))
                                     (equal (leman-event-sender event)
-                                           (ewoc-data next-node)))
+                                           (leman-event-sender
+                                            (leman-room-sender-header-event
+                                             (ewoc-data next-node)))))
                            (leman-debug "Next node is header for this sender: insert after it, instead.")
                            (setf event-node-before next-node)))
                        (leman-debug "Inserting after event"
@@ -4247,7 +4262,7 @@ Search from FROM (either `first' or `last')."
 (defun leman-room--pp-thing (thing)
   "Pretty-print THING.
 To be used as the pretty-printer for `ewoc-create'.  THING may be
-an `leman-event' or `leman-user' struct, or a list like `(ts
+an `leman-event', `leman-user', or `leman-room-sender-header' struct, or a list like `(ts
 TIMESTAMP)', where TIMESTAMP is a Unix timestamp number of
 seconds."
   ;; TODO: Use handlers to insert so e.g. membership events can be inserted silently.
@@ -4263,6 +4278,15 @@ seconds."
        ;; Animations can only be started once the images are in this
        ;; buffer (see `leman-room--animate-images').
        (leman-room--animate-images beg (point))))
+    ((pred leman-room-sender-header-p)
+     (let* ((event (leman-room-sender-header-event thing))
+            (sender (leman-event-sender event)))
+       (insert (leman-room--user-avatar sender leman-session)
+               (propertize (leman--format-user sender)
+                           'display leman-room-username-display-property)
+               "  "
+               (funcall (alist-get ?t leman-room-event-formatters)
+                        event leman-room leman-session))))
     ((pred leman-user-p)
      (insert (leman-room--user-avatar thing leman-session)
              (propertize (leman--format-user thing)

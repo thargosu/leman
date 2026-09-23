@@ -708,6 +708,50 @@ caller: a dance step must never break syncing."
            ;; Otherwise: keep waiting for the next sync.
            )))))))
 
+(defun leman-e2ee--accept-incoming-verification (session agent request)
+  "Accept the incoming verification REQUEST with SESSION's AGENT.
+REQUEST is an alist as returned by `leman-e2ee-verification-requests'.
+Send the acceptance, register the dance (which then advances with
+the session's syncs), and pump the outgoing requests."
+  (let ((user-id (alist-get 'user_id request))
+        (flow-id (alist-get 'flow_id request))
+        (device-id (alist-get 'device_id request)))
+    (leman-e2ee-accept-verification agent user-id flow-id)
+    (setf leman-e2ee--active-verification
+          ;; NOTE: :prompted-p and :prompt-timer are seeded so that
+          ;; later `setf' of `plist-get' mutates this list in place
+          ;; (a new key would rebind and diverge the dance's copies --
+          ;; see `leman-e2ee--prompt-sas').
+          (list :session session :user-id user-id :flow-id flow-id
+                :device-id device-id :prompted-p nil :prompt-timer nil))
+    (message "Leman E2EE: verifying %s of %s; continue on the other device."
+             device-id user-id)
+    ;; Send the ready now rather than at the next sync.
+    (leman-e2ee--process-outgoing-requests session)))
+
+(defun leman-e2ee--offer-incoming-verification (session agent request)
+  "Ask the user whether to accept the incoming verification REQUEST.
+The question must not run on the sync callback's stack (it blocks
+on the user's answer), so it runs from a zero timer, like the SAS
+prompt.  Accepting starts the dance against the requesting device;
+quitting defers the request to `leman-e2ee-verify'."
+  (run-at-time
+   0 nil
+   (lambda ()
+     (condition-case err
+         (when (let ((use-dialog-box nil))
+                 (y-or-n-p (format "Leman E2EE: %s wants to verify this device from device %s. Accept?"
+                                   (alist-get 'user_id request)
+                                   (alist-get 'device_id request))))
+           (leman-e2ee--accept-incoming-verification session agent request))
+       (leman-e2ee-error
+        (leman-message "Leman E2EE: accepting the verification of %s failed: %s"
+                       (alist-get 'device_id request)
+                       (alist-get 'message (cdr err))))
+       (quit
+        (leman-message "Leman E2EE: verification of %s deferred; run M-x leman-e2ee-verify to answer it"
+                       (alist-get 'device_id request)))))))
+
 (defun leman-e2ee-verify (session)
   "Verify a device with SESSION's E2EE agent (emoji SAS).
 Pick a device, start or accept the verification request, and
@@ -775,29 +819,29 @@ a new one is started."
                            (format "Device %s is already verified; run the dance again to sign it? "
                                    device-id))))
             (user-error "Leman E2EE: device %s is already verified" device-id)))
-        (let* ((existing (seq-find (lambda (request)
-                                     (equal (alist-get 'device_id request) device-id))
-                                   (leman-e2ee-verification-requests agent user-id)))
-               (flow-id (if (and existing
-                                 (not (alist-get 'we_started existing))
-                                 (member (alist-get 'state existing) '("created" "ready")))
-                            (progn
-                              (leman-e2ee-accept-verification
-                               agent user-id (alist-get 'flow_id existing))
-                              (alist-get 'flow_id existing))
-                          (leman-e2ee-request-verification agent user-id device-id))))
-          (setf leman-e2ee--active-verification
-                ;; NOTE: :prompted-p and :prompt-timer are seeded so
-                ;; that later `setf' of `plist-get' mutates this list
-                ;; in place (a new key would rebind and diverge the
-                ;; dance's copies -- see `leman-e2ee--prompt-sas').
-                (list :session session :user-id user-id :flow-id flow-id
-                      :device-id device-id :prompted-p nil :prompt-timer nil))
-          (message "Leman E2EE: verifying %s of %s; accept the request on the other device."
-                   device-id user-id)
-          ;; The dance's to-device events travel with the session's
-          ;; syncs; send the request now rather than at the next sync.
-          (leman-e2ee--process-outgoing-requests session)))))))
+        (let ((existing (seq-find (lambda (request)
+                                    (equal (alist-get 'device_id request) device-id))
+                                  (leman-e2ee-verification-requests agent user-id))))
+          (if (and existing
+                   (not (alist-get 'we_started existing))
+                   (member (alist-get 'state existing) '("created" "ready")))
+              ;; An incoming request for that device: accept it and
+              ;; dance with its flow.
+              (leman-e2ee--accept-incoming-verification session agent existing)
+            ;; No request from that device: start one.  The dance's
+            ;; to-device events travel with the session's syncs; send
+            ;; the request now rather than at the next sync.
+            (let ((flow-id (leman-e2ee-request-verification agent user-id device-id)))
+              (setf leman-e2ee--active-verification
+                    ;; NOTE: :prompted-p and :prompt-timer are seeded so
+                    ;; that later `setf' of `plist-get' mutates this list
+                    ;; in place (a new key would rebind and diverge the
+                    ;; dance's copies -- see `leman-e2ee--prompt-sas').
+                    (list :session session :user-id user-id :flow-id flow-id
+                          :device-id device-id :prompted-p nil :prompt-timer nil))
+              (message "Leman E2EE: verifying %s of %s; accept the request on the other device."
+                       device-id user-id)
+              (leman-e2ee--process-outgoing-requests session)))))))))
 
 (defun leman-e2ee--decrypt-event (session event &optional room-id)
   "Decrypt EVENT (from ROOM-ID) with SESSION's E2EE agent.
@@ -962,9 +1006,9 @@ persists the next-batch token only then."
     t))
 
 (defun leman-e2ee--announce-requests (session agent)
-  "Tell the user about incoming verification requests for SESSION.
-Each new incoming request (not started by us) is announced once,
-in the echo area; SESSION remembers the announced flow IDs."
+  "Offer to accept incoming verification requests for SESSION.
+Each new incoming request (not started by us) asks the user once
+whether to accept it; SESSION remembers the offered flow IDs."
   (let ((announced (leman-session-e2ee-announced-requests session)))
     (dolist (request (append (ignore-errors
                                (leman-e2ee-verification-requests agent))
@@ -973,10 +1017,8 @@ in the echo area; SESSION remembers the announced flow IDs."
         (when (and (not (alist-get 'we_started request))
                    (equal (alist-get 'state request) "created")
                    (not (member flow-id announced)))
-          (leman-message "Leman E2EE: %s wants to verify device %s (run M-x leman-e2ee-verify)"
-                         (alist-get 'user_id request)
-                         (alist-get 'device_id request))
-          (push flow-id announced))))
+          (push flow-id announced)
+          (leman-e2ee--offer-incoming-verification session agent request))))
     (setf (leman-session-e2ee-announced-requests session) announced)))
 
 (defun leman-e2ee--process-outgoing-requests (session)

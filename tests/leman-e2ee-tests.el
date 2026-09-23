@@ -1299,9 +1299,76 @@ must still clear it afterwards (e.g. with `unwind-protect')."
         (setf leman-e2ee--active-verification nil)))
     (should (string-match-p "cross-signing" (car messages)))))
 
+(ert-deftest leman-e2ee-verify-accepts-incoming-request ()
+  ;; An incoming request for the picked device is accepted instead of
+  ;; starting a new one.
+  (let* ((agent (leman-e2ee--create))
+         (session (make-leman-session
+                   :e2ee agent
+                   :user (make-leman-user :id "@me:x.org")))
+         (accepts 0) (requests 0))
+    (cl-letf (((symbol-function #'read-string)
+               (lambda (&rest _) "@me:x.org"))
+              ((symbol-function #'completing-read)
+               (lambda (&rest _) "ABC"))
+              ((symbol-function #'leman-e2ee-devices)
+               (lambda (&rest _)
+                 (vector (list (cons 'device_id "ABC")
+                               (cons 'display_name "Other device")
+                               (cons 'verified nil)))))
+              ((symbol-function #'leman-e2ee-verification-requests)
+               (lambda (&rest _)
+                 (cl-incf requests)
+                 (vector (list (cons 'flow_id "flow1")
+                               (cons 'user_id "@me:x.org")
+                               (cons 'device_id "ABC")
+                               (cons 'state "created")
+                               (cons 'we_started nil)))))
+              ((symbol-function #'leman-e2ee-request-verification)
+               (lambda (&rest _) (error "must not start a new request")))
+              ((symbol-function #'leman-e2ee--accept-incoming-verification)
+               (lambda (&rest _) (cl-incf accepts)))
+              (leman-e2ee--active-verification nil))
+      (leman-e2ee-verify session))
+    (should (= accepts 1))
+    (should (= requests 1))))
+
 ;;;; Incoming request announcements
 
-(ert-deftest leman-e2ee--announce-requests-announces-new-incoming ()
+(ert-deftest leman-e2ee--accept-incoming-verification-accepts-and-registers ()
+  ;; Accepting an incoming request sends the acceptance, registers the
+  ;; dance against the requesting device, and pumps the outgoing
+  ;; requests.
+  (let* ((fake (leman-e2ee-tests--fake-agent nil))
+         (session (make-leman-session :e2ee (car fake)))
+         (pumps 0)
+         dance)
+    (cl-letf (((symbol-function #'leman-e2ee--process-outgoing-requests)
+               (lambda (&rest _) (cl-incf pumps))))
+      (unwind-protect
+          (progn
+            (leman-e2ee--accept-incoming-verification
+             session (car fake)
+             (list (cons 'flow_id "flow1")
+                   (cons 'user_id "@vv:x.org")
+                   (cons 'device_id "ABC")))
+            (setf dance leman-e2ee--active-verification))
+        (setf leman-e2ee--active-verification nil)))
+    ;; The agent received the acceptance...
+    (should (equal (alist-get 'params (leman-e2ee--decode (car (cdr (cdr fake)))))
+                   '((user_id . "@vv:x.org") (flow_id . "flow1"))))
+    ;; ...the dance is registered...
+    (should (eq (plist-get dance :session) session))
+    (should (equal (plist-get dance :user-id) "@vv:x.org"))
+    (should (equal (plist-get dance :flow-id) "flow1"))
+    (should (equal (plist-get dance :device-id) "ABC"))
+    ;; ...and the outgoing requests are pumped.
+    (should (= pumps 1))))
+
+(ert-deftest leman-e2ee--announce-requests-offers-new-incoming ()
+  ;; A new incoming request asks the user once whether to accept it:
+  ;; accepting starts the dance against the requesting device, and the
+  ;; request is not offered again.
   (let* ((fake (leman-e2ee-tests--fake-agent
                 (list (cons 'verification_requests
                             (list (cons 'requests
@@ -1311,19 +1378,57 @@ must still clear it afterwards (e.g. with `unwind-protect')."
                                                       (cons 'state "created")
                                                       (cons 'we_started nil)))))))))
          (session (make-leman-session))
-         (messages nil))
-    (cl-letf (((symbol-function #'leman-message)
-               (lambda (format &rest args)
-                 (push (apply #'format format args) messages))))
+         (pumps 0)
+         dance)
+    (cl-letf (((symbol-function #'run-at-time)
+               (lambda (_time _repeat fn &rest _args) (funcall fn)))
+              ((symbol-function #'y-or-n-p) (lambda (&rest _) t))
+              ((symbol-function #'leman-e2ee--process-outgoing-requests)
+               (lambda (&rest _) (cl-incf pumps)))
+              (leman-e2ee--active-verification nil))
+      (unwind-protect
+          (progn
+            (leman-e2ee--announce-requests session (car fake))
+            (setf dance leman-e2ee--active-verification)
+            ;; The agent received the acceptance.
+            (should (equal (alist-get 'cmd (leman-e2ee--decode (car (cdr (cdr fake)))))
+                           "accept_verification"))
+            (leman-e2ee--announce-requests session (car fake))
+            (should (= pumps 1))
+            (should (equal (leman-session-e2ee-announced-requests session)
+                           '("flow1")))
+            ;; The dance is registered against the requesting device.
+            (should (eq (plist-get dance :session) session))
+            (should (equal (plist-get dance :user-id) "@vv:x.org"))
+            (should (equal (plist-get dance :flow-id) "flow1"))
+            (should (equal (plist-get dance :device-id) "ABC")))
+        (setf leman-e2ee--active-verification nil)))))
+
+(ert-deftest leman-e2ee--announce-requests-silences-declined-requests ()
+  ;; Answering no starts nothing; the request is remembered as
+  ;; offered, so it is not asked again (the user can still accept it
+  ;; later with `leman-e2ee-verify').
+  (let* ((fake (leman-e2ee-tests--fake-agent
+                (list (cons 'verification_requests
+                            (list (cons 'requests
+                                        (vector (list (cons 'flow_id "flow1")
+                                                      (cons 'user_id "@vv:x.org")
+                                                      (cons 'device_id "ABC")
+                                                      (cons 'state "created")
+                                                      (cons 'we_started nil)))))))))
+         (session (make-leman-session))
+         (offered 0))
+    (cl-letf (((symbol-function #'run-at-time)
+               (lambda (_time _repeat fn &rest _args) (funcall fn)))
+              ((symbol-function #'y-or-n-p)
+               (lambda (&rest _) (cl-incf offered) nil))
+              (leman-e2ee--active-verification nil))
       (leman-e2ee--announce-requests session (car fake))
-      ;; A new incoming request is announced once...
-      (should (= 1 (length messages)))
-      (should (string-match-p "ABC" (car messages)))
-      (should (string-match-p "leman-e2ee-verify" (car messages)))
-      (should (equal (leman-session-e2ee-announced-requests session) '("flow1")))
-      ;; ...and not announced again.
+      (should (= offered 1))
+      (should-not leman-e2ee--active-verification)
       (leman-e2ee--announce-requests session (car fake))
-      (should (= 1 (length messages))))))
+      (should (= offered 1))
+      (should (equal (leman-session-e2ee-announced-requests session) '("flow1"))))))
 
 (ert-deftest leman-e2ee--announce-requests-ignores-outgoing-and-announced ()
   (let* ((fake (leman-e2ee-tests--fake-agent
@@ -1338,12 +1443,11 @@ must still clear it afterwards (e.g. with `unwind-protect')."
                                                       (cons 'state "created")
                                                       (cons 'we_started nil)))))))))
          (session (make-leman-session :e2ee-announced-requests '("old")))
-         (messages nil))
-    (cl-letf (((symbol-function #'leman-message)
-               (lambda (format &rest args)
-                 (push (apply #'format format args) messages))))
+         (offered 0))
+    (cl-letf (((symbol-function #'y-or-n-p)
+               (lambda (&rest _) (cl-incf offered) nil)))
       (leman-e2ee--announce-requests session (car fake))
-      (should (null messages)))))
+      (should (zerop offered)))))
 
 ;;;; Session revocation
 

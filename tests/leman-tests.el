@@ -413,6 +413,42 @@ Both the valueless attribute form (as sent by, e.g. Element's
         (should (get-text-property label-beg 'keymap string))
         (should (get-text-property label-beg 'face string))))))
 
+(ert-deftest leman-room--render-html-table-borders ()
+  "Test that tables are rendered with visible borders.
+Shr's default is to draw table borders with whitespace, i.e.
+invisibly; leman overrides that unless the user customized
+shr's table options."
+  (let ((string (let ((leman-room-use-variable-pitch nil))
+                  (leman-room--render-html
+                   "<table><tr><th>a</th><th>b</th></tr><tr><td>c</td><td>d</td></tr></table>"
+                   nil))))
+    (should (string-match-p "─" string))
+    (should (string-match-p "│" string))
+    (should (string-match-p "┼" string))))
+
+(ert-deftest leman-room--render-html-table-borders-respect-shr-options ()
+  "Test that user customizations of shr's table options win."
+  (let ((string (let ((leman-room-use-variable-pitch nil)
+                      (shr-table-vertical-line ?\=))
+                  (leman-room--render-html
+                   "<table><tr><td>c</td><td>d</td></tr></table>" nil))))
+    (should (string-match-p "=" string))))
+
+(ert-deftest leman-room--render-html-table-monospace ()
+  "Test that table content is rendered in monospace.
+Since shr pixel-aligns the columns, appending the `fixed-pitch'
+face keeps the layout while forcing the font family."
+  (let ((string (let ((leman-room-use-variable-pitch t))
+                  (leman-room--render-html
+                   "<table><tr><th>a</th><th>b</th></tr><tr><td>c</td><td>d</td></tr></table>"
+                   nil))))
+    ;; Cell text keeps shr's face and gains `fixed-pitch'.
+    (should (equal (get-text-property (string-match-p "c" string) 'face string)
+                   '(shr-text fixed-pitch)))
+    ;; Table borders have no face of their own.
+    (should (eq (get-text-property (string-match-p "│" string) 'face string)
+                'fixed-pitch))))
+
 (ert-deftest leman-room--toggle-spoiler-at-point ()
   "Test that toggling reveals and hides spoiler content.
 Toggling works both from within the content and from its label."

@@ -5046,7 +5046,17 @@ HTML is rendered to Emacs text using `shr-insert-document'."
             ;; them janky).  They are started in the room buffer by
             ;; `leman-room--animate-images' instead.
             (shr-image-animate nil)
+            ;; NOTE: By default, shr draws table borders with
+            ;; whitespace, i.e. invisibly.  Give tables visible
+            ;; borders, but don't override customizations of
+            ;; shr's table options.
+            (shr-table-vertical-line (if (eq shr-table-vertical-line ?\s) ?│
+                                       shr-table-vertical-line))
+            (shr-table-horizontal-line (or shr-table-horizontal-line ?─))
+            (shr-table-corner (if (eq shr-table-corner ?\s) ?┼
+                                shr-table-corner))
             (old-fn (symbol-function 'shr-tag-blockquote)) ;; Bind to a var to avoid unknown-function linting errors.
+            (old-table-fn (symbol-function 'shr-tag-table))
             (old-span-fn (symbol-function 'shr-tag-span)))
         (cl-letf (((symbol-function 'shr-fill-line) #'ignore)
                   ;; NOTE: Replace `shr-tag-img' to fetch images
@@ -5108,6 +5118,15 @@ HTML is rendered to Emacs text using `shr-insert-document'."
                                                line-prefix "    "))
                        ;; NOTE: We use our own gv, `leman-text-property'; very convenient.
                        (add-face-text-property beg (point-max) 'leman-room-quote 'append))))
+                  ;; NOTE: Tables are easier to read in monospace
+                  ;; (appending the face keeps any cell colors), and
+                  ;; since shr pixel-aligns the columns, the layout
+                  ;; is unaffected.
+                  ((symbol-function 'shr-tag-table)
+                   (lambda (dom)
+                     (let ((beg (point)))
+                       (funcall old-table-fn dom)
+                       (add-face-text-property beg (point) 'fixed-pitch 'append))))
                   ;; Matrix spoilers (MSC2014), e.g. as sent by
                   ;; Element's /spoiler command.
                   ((symbol-function 'shr-tag-span)

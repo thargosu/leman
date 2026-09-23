@@ -5015,6 +5015,84 @@ never blocks on the network."
   (and (url-is-cached url)
        (shr-get-image-data url)))
 
+(defun leman-room--table-rows (dom)
+  "Return the top-level rows (tr) of table DOM, ignoring nesting."
+  (cl-loop for child in (dom-non-text-children dom)
+           append (pcase (dom-tag child)
+                    ('tr (list child))
+                    ((or 'thead 'tbody 'tfoot)
+                     (cl-loop for tr in (dom-non-text-children child)
+                              when (eq (dom-tag tr) 'tr)
+                              collect tr)))))
+
+(defun leman-room--table-cell (dom)
+  "Return table cell DOM rendered to a string.
+Like shr, don't render images in table cells."
+  (string-trim
+   (with-temp-buffer
+     (let ((shr-inhibit-images t))
+       (shr-generic dom))
+     (buffer-string))))
+
+(defun leman-room--table-row-string (row widths)
+  "Return ROW of cell strings aligned to column WIDTHS.
+Multi-line cells are padded on every line."
+  (let* ((cell-lines (mapcar (lambda (cell) (split-string cell "\n")) row))
+         (height (apply #'max 1 (mapcar #'length cell-lines))))
+    (string-join
+     (cl-loop for line-number below height
+              collect (concat "| "
+                              (string-join
+                               (cl-loop for lines in cell-lines
+                                        for width in widths
+                                        for line = (or (nth line-number lines) "")
+                                        collect (concat line
+                                                        (make-string (max 0 (- width (string-width line)))
+                                                                     ?\s)))
+                               " | ")
+                              " |"))
+     "\n")))
+
+(defun leman-room--table-separator (widths)
+  "Return an org table separator line for column WIDTHS."
+  (concat "|-"
+          (string-join (mapcar (lambda (width) (make-string width ?-)) widths) "-+-")
+          "-|"))
+
+(defun leman-room--shr-tag-table (dom)
+  "Insert table DOM as an org-style table.
+Unlike shr's own tables, the borders are real characters (so they
+show with any theme), and the content is monospace.  Tables with
+no rows fall back to shr's rendering."
+  (shr-ensure-paragraph)
+  (let ((rows (leman-room--table-rows dom)))
+    (if (not rows)
+        (shr-generic dom)
+      (let* ((grid (mapcar (lambda (row)
+                             (mapcar #'leman-room--table-cell
+                                     (cl-loop for cell in (dom-non-text-children row)
+                                              when (memq (dom-tag cell) '(th td))
+                                              collect cell)))
+                           rows))
+             (ncols (apply #'max (mapcar #'length grid)))
+             (widths (cl-loop for col below ncols
+                              collect (apply #'max
+                                             (mapcar (lambda (row)
+                                                       (apply #'max 0
+                                                              (mapcar #'string-width
+                                                                      (split-string (or (nth col row) "")
+                                                                                    "\n"))))
+                                                     grid))))
+             (header-p (seq-find (lambda (cell) (eq (dom-tag cell) 'th))
+                                 (dom-non-text-children (car rows))))
+             (beg (point)))
+        (cl-loop for row in grid
+                 for i from 0
+                 do (insert (leman-room--table-row-string row widths) "\n")
+                 when (and (= i 0) header-p)
+                 do (insert (leman-room--table-separator widths) "\n"))
+        (add-face-text-property beg (point) 'fixed-pitch 'append)))))
+
 (defun leman-room--render-html (string session)
   "Return rendered version of HTML STRING from SESSION.
 HTML is rendered to Emacs text using `shr-insert-document'."
@@ -5046,17 +5124,7 @@ HTML is rendered to Emacs text using `shr-insert-document'."
             ;; them janky).  They are started in the room buffer by
             ;; `leman-room--animate-images' instead.
             (shr-image-animate nil)
-            ;; NOTE: By default, shr draws table borders with
-            ;; whitespace, i.e. invisibly.  Give tables visible
-            ;; borders, but don't override customizations of
-            ;; shr's table options.
-            (shr-table-vertical-line (if (eq shr-table-vertical-line ?\s) ?│
-                                       shr-table-vertical-line))
-            (shr-table-horizontal-line (or shr-table-horizontal-line ?─))
-            (shr-table-corner (if (eq shr-table-corner ?\s) ?┼
-                                shr-table-corner))
             (old-fn (symbol-function 'shr-tag-blockquote)) ;; Bind to a var to avoid unknown-function linting errors.
-            (old-table-fn (symbol-function 'shr-tag-table))
             (old-span-fn (symbol-function 'shr-tag-span)))
         (cl-letf (((symbol-function 'shr-fill-line) #'ignore)
                   ;; NOTE: Replace `shr-tag-img' to fetch images
@@ -5118,15 +5186,11 @@ HTML is rendered to Emacs text using `shr-insert-document'."
                                                line-prefix "    "))
                        ;; NOTE: We use our own gv, `leman-text-property'; very convenient.
                        (add-face-text-property beg (point-max) 'leman-room-quote 'append))))
-                  ;; NOTE: Tables are easier to read in monospace
-                  ;; (appending the face keeps any cell colors), and
-                  ;; since shr pixel-aligns the columns, the layout
-                  ;; is unaffected.
+                  ;; NOTE: Render tables as org-style tables: real
+                  ;; borders, monospace, one flat table (shr's own
+                  ;; header+body handling can produce nested tables).
                   ((symbol-function 'shr-tag-table)
-                   (lambda (dom)
-                     (let ((beg (point)))
-                       (funcall old-table-fn dom)
-                       (add-face-text-property beg (point) 'fixed-pitch 'append))))
+                   #'leman-room--shr-tag-table)
                   ;; Matrix spoilers (MSC2014), e.g. as sent by
                   ;; Element's /spoiler command.
                   ((symbol-function 'shr-tag-span)

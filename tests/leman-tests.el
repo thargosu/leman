@@ -413,31 +413,33 @@ Both the valueless attribute form (as sent by, e.g. Element's
         (should (get-text-property label-beg 'keymap string))
         (should (get-text-property label-beg 'face string))))))
 
-(ert-deftest leman-room--render-html-table-borders ()
-  "Test that tables are rendered with visible borders.
-Shr's default is to draw table borders with whitespace, i.e.
-invisibly; leman overrides that unless the user customized
-shr's table options."
+(ert-deftest leman-room--render-html-table ()
+  "Test that tables are rendered as org-style tables.
+The borders are real characters, so they show with any theme."
   (let ((string (let ((leman-room-use-variable-pitch nil))
                   (leman-room--render-html
                    "<table><tr><th>a</th><th>b</th></tr><tr><td>c</td><td>d</td></tr></table>"
                    nil))))
-    (should (string-match-p "─" string))
-    (should (string-match-p "│" string))
-    (should (string-match-p "┼" string))))
+    (should (string-match-p "| a | b |" string))
+    (should (string-match-p "|---\\+---|" string))
+    (should (string-match-p "| c | d |" string))))
 
-(ert-deftest leman-room--render-html-table-borders-respect-shr-options ()
-  "Test that user customizations of shr's table options win."
-  (let ((string (let ((leman-room-use-variable-pitch nil)
-                      (shr-table-vertical-line ?\=))
+(ert-deftest leman-room--render-html-table-thead-tbody ()
+  "Test that thead/tbody tables render as a single flat table.
+Shr's own rendering of such tables (as sent by, e.g. Element)
+results in a nested table."
+  (let ((string (let ((leman-room-use-variable-pitch nil))
                   (leman-room--render-html
-                   "<table><tr><td>c</td><td>d</td></tr></table>" nil))))
-    (should (string-match-p "=" string))))
+                   "<table><thead><tr><th>a</th><th>b</th></tr></thead><tbody><tr><td>c</td><td>d</td></tr></tbody></table>"
+                   nil))))
+    (should (string-match-p "| a | b |" string))
+    (should (string-match-p "| c | d |" string))
+    ;; Only one separator line: there is no wrapping table.
+    (should (= 1 (seq-count (lambda (line) (string-prefix-p "|---" line))
+                            (split-string string "\n"))))))
 
 (ert-deftest leman-room--render-html-table-monospace ()
-  "Test that table content is rendered in monospace.
-Since shr pixel-aligns the columns, appending the `fixed-pitch'
-face keeps the layout while forcing the font family."
+  "Test that table content is rendered in monospace."
   (let ((string (let ((leman-room-use-variable-pitch t))
                   (leman-room--render-html
                    "<table><tr><th>a</th><th>b</th></tr><tr><td>c</td><td>d</td></tr></table>"
@@ -446,7 +448,7 @@ face keeps the layout while forcing the font family."
     (should (equal (get-text-property (string-match-p "c" string) 'face string)
                    '(shr-text fixed-pitch)))
     ;; Table borders have no face of their own.
-    (should (eq (get-text-property (string-match-p "│" string) 'face string)
+    (should (eq (get-text-property (string-match-p "\\|" string) 'face string)
                 'fixed-pitch))))
 
 (ert-deftest leman-room--toggle-spoiler-at-point ()

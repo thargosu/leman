@@ -122,15 +122,10 @@ by users; ones who do so should know what they're doing.")
   "Options for Leman, the Matrix client."
   :group 'comm)
 
-(defcustom leman-save-sessions nil
+(defcustom leman-save-sessions t
   "Save session to disk.
 Writes the session file when Emacs is killed."
-  :type 'boolean
-  :set (lambda (option value)
-         (set-default option value)
-         (if value
-             (add-hook 'kill-emacs-hook #'leman--kill-emacs-hook)
-           (remove-hook 'kill-emacs-hook #'leman--kill-emacs-hook))))
+  :type 'boolean)
 
 (defcustom leman-sessions-file "~/.cache/leman"
   ;; FIXME: Expand correct XDG cache directory (new in Emacs 27).
@@ -2747,6 +2742,8 @@ Writes Leman session to disk when enabled."
     (when (and leman-save-sessions
                leman-sessions)
       (leman--write-sessions leman-sessions))))
+
+(add-hook 'kill-emacs-hook #'leman--kill-emacs-hook)
 
 ;;;;; Session revocation
 

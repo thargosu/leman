@@ -2142,43 +2142,47 @@ are sync batch tokens.  Used for, e.g. filling gaps in
   ;; overlap manual scrollback-induced loading of old messages with
   ;; this gap-filling loading, but that shouldn't matter, and probably
   ;; would be very rare, anyway.
+  ;; A gap request may already have a response queued when the user
+  ;; disconnects.  Its callback must not start the next page.
+  (when (leman--session-connected-p session)
   (pcase-let* (((cl-struct leman-room id) room)
                (endpoint (format "rooms/%s/messages" (url-hexify-string id)))
                (then
                 (lambda (data)
-                  (leman-room-retro-callback room session data
-                                             :set-prev-batch nil)
-                  (pcase-let* (((map end chunk) data))
-		    ;; HACK: Comparing the END and TO tokens ought to
-		    ;; work for determining whether we are done
-		    ;; filling, but it isn't (maybe the server isn't
-		    ;; returning the TO token as END when there are no
-		    ;; more events), so instead we'll check the length
-		    ;; of the chunk.
-                    (unless (< (length chunk) batch-size)
-                      ;; More pages remain to be loaded.
-                      (let ((remaining-limit (- limit batch-size)))
-                        (if (not (> remaining-limit 0))
-                            ;; FIXME: This leaves a gap if it's larger than 1,000 events.
-                            ;; Probably, the limit should be configurable, but it would be good
-                            ;; to find some way to remember the gap and fill it if the user
-                            ;; scrolls to it later (although that might be very awkward to do).
-                            (display-warning 'leman-room-retro-to-token
-                                             (format "Loaded events in %S (%S) without filling gap; not filling further"
-                                                     (leman-room-display-name room)
-                                                     (or (leman-room-canonical-alias room)
-                                                         (leman-room-id room))))
-			  ;; FIXME: Remove this message after further testing.
-                          (message "Leman: Continuing to fill gap in %S (%S) (remaining limit: %s)"
-                                   (leman-room-display-name room)
-                                   (or (leman-room-canonical-alias room)
-                                       (leman-room-id room))
-                                   remaining-limit)
-                          (leman-room-retro-to-token
-                           room session end to :limit remaining-limit))))))))
+                  (when (leman--session-connected-p session)
+                    (leman-room-retro-callback room session data
+                                               :set-prev-batch nil)
+                    (pcase-let* (((map end chunk) data))
+                      ;; HACK: Comparing the END and TO tokens ought to
+                      ;; work for determining whether we are done
+                      ;; filling, but it isn't (maybe the server isn't
+                      ;; returning the TO token as END when there are no
+                      ;; more events), so instead we'll check the length
+                      ;; of the chunk.
+                      (unless (< (length chunk) batch-size)
+                        ;; More pages remain to be loaded.
+                        (let ((remaining-limit (- limit batch-size)))
+                          (if (not (> remaining-limit 0))
+                              ;; FIXME: This leaves a gap if it's larger than 1,000 events.
+                              ;; Probably, the limit should be configurable, but it would be good
+                              ;; to find some way to remember the gap and fill it if the user
+                              ;; scrolls to it later (although that might be very awkward to do).
+                              (display-warning 'leman-room-retro-to-token
+                                               (format "Loaded events in %S (%S) without filling gap; not filling further"
+                                                       (leman-room-display-name room)
+                                                       (or (leman-room-canonical-alias room)
+                                                           (leman-room-id room))))
+                            ;; FIXME: Remove this message after further testing.
+                            (message "Leman: Continuing to fill gap in %S (%S) (remaining limit: %s)"
+                                     (leman-room-display-name room)
+                                     (or (leman-room-canonical-alias room)
+                                         (leman-room-id room))
+                                     remaining-limit)
+                            (leman-room-retro-to-token
+                             room session end to :limit remaining-limit)))))))))
     ;; FIXME: Remove this message after further testing.
     (message "Leman: Filling gap in %S (%S)"
-	     (leman-room-display-name room)
+             (leman-room-display-name room)
              (or (leman-room-canonical-alias room)
                  (leman-room-id room)))
     (leman-api session endpoint :timeout 30
@@ -2194,9 +2198,10 @@ are sync batch tokens.  Used for, e.g. filling gaps in
                                     (leman-room-display-name room)
                                     (or (leman-room-canonical-alias room)
                                         (leman-room-id room)))
-                            plz-error))))))
+                            plz-error)))))))
 
 ;; NOTE: `declare-function' doesn't recognize cl-defun forms, so this declaration doesn't work.
+(declare-function leman--session-connected-p "leman" (session))
 (declare-function leman--sync "leman" t t)
 (defun leman-room-sync (session &optional force)
   "Sync SESSION (interactively, current buffer's).

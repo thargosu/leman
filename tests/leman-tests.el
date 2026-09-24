@@ -69,6 +69,25 @@ URL differ from the previous one."
                    (list "https://example.org/_matrix/client/v3/room_keys/keys?version=12132284"
                          "https://example.org/_matrix/client/v3/messages?dir=f&limit=200")))))
 
+(ert-deftest leman-room-retro-to-token-stops-after-disconnect ()
+  ;; A limited timeline can have a /messages response in flight at
+  ;; disconnect.  Its callback must neither add events nor request a
+  ;; further page.
+  (let* ((session (make-leman-session :user (make-leman-user :id "@me:x.org")))
+         (room (make-leman-room :id "!room:x.org"))
+         (callback nil) (processed 0))
+    (cl-letf (((symbol-function #'leman-api)
+               (lambda (_session _endpoint &rest args)
+                 (setf callback (plist-get args :then))))
+              ((symbol-function #'leman-room-retro-callback)
+               (lambda (&rest _) (cl-incf processed)))
+              ((symbol-function #'message) #'ignore)
+              (leman-sessions (list (cons 'session session))))
+      (leman-room-retro-to-token room session "from" "to")
+      (setf leman-sessions nil)
+      (funcall callback '((end . "earlier") (chunk . []))))
+    (should (= processed 0))))
+
 (ert-deftest leman--format-body-mentions ()
   (let ((room (make-leman-room
                :members (map-into

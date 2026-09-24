@@ -341,6 +341,10 @@ Used when re-login replaces a session; buffers are left alive."
     (delete-process process))
   (setf (alist-get session leman-syncs nil nil #'equal) nil))
 
+(defun leman--session-connected-p (session)
+  "Return non-nil when SESSION is still connected."
+  (rassq session leman-sessions))
+
 (defun leman--session-start-sync (session)
   "Register SESSION in `leman-sessions' and start syncing it.
 If another session for the same user is registered, it is stopped
@@ -2406,10 +2410,14 @@ a filter ID).  When unspecified, the value of
 (defun leman--sync-callback (session data)
   "Process sync DATA for SESSION.
 Runs `leman-sync-callback-hook' with SESSION."
-  (leman-debug (leman-user-id (leman-session-user session)))
   ;; Remove the sync first.  We already have the data from it, and the
   ;; process has exited, so it's safe to run another one.
   (setf (map-elt leman-syncs session) nil)
+  ;; Deleting a process cannot prevent a response callback already
+  ;; queued by plz.  Do not let such a callback revive a disconnected
+  ;; session or talk to its stopped E2EE agent.
+  (when (leman--session-connected-p session)
+    (leman-debug (leman-user-id (leman-session-user session)))
   ;; Send the sync's E2EE parts to the agent (this must happen before
   ;; the next-batch token is persisted, or to-device events like room
   ;; keys can be lost), then perform its outgoing requests.  When the
@@ -2490,7 +2498,7 @@ Runs `leman-sync-callback-hook' with SESSION."
       ;; A hook may have errored before `leman--auto-sync' (in the hook)
       ;; started the next sync: keep the chain alive.
       (when (and leman-auto-sync (not (map-elt leman-syncs session)))
-        (leman--sync session :quiet t)))))
+        (leman--sync session :quiet t))))))
 
 (defun leman--push-invite-room-events (session invited-room)
   "Push events for INVITED-ROOM into that room in SESSION."

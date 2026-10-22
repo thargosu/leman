@@ -682,8 +682,7 @@ on the way (its first pump always uploads device keys)."
   ;; An encrypted room never receives plaintext, even when no agent is
   ;; running: sending must signal instead of falling back.
   (let* ((session (make-leman-session))
-         (room (make-leman-room :id "!room:x.org"))
-         (message-should-error))
+         (room (make-leman-room :id "!room:x.org")))
     (setf (leman-room-state room)
           (list (make-leman-event :id "$enc-state" :type "m.room.encryption"
                                   :content '((algorithm . "m.megolm.v1.aes-sha2")))))
@@ -1703,24 +1702,34 @@ must still clear it afterwards (e.g. with `unwind-protect')."
     ;; No source available (e.g. a PATH lookup): not stale.
     (should-not (leman-e2ee--agent-stale-p binary (make-temp-file "leman-none-" 'dir)))))
 
+(defun leman-e2ee-tests--download-response (status body)
+  "Return an HTTP response buffer with STATUS and binary BODY."
+  (let ((buffer (generate-new-buffer " *leman-agent-response*")))
+    (with-current-buffer buffer
+      (set-buffer-multibyte nil)
+      (setq-local url-http-response-status status)
+      (insert (format "HTTP/1.1 %d\r\nContent-Type: application/octet-stream\r\n\r\n" status)
+              body))
+    buffer))
+
 (ert-deftest leman-e2ee-install-agent-verifies-and-installs-download ()
   "The managed agent is only replaced after its checksum verifies."
   (let* ((directory (make-temp-file "leman-agent-download-" 'dir))
          (asset (leman-e2ee--agent-asset-name))
-         (binary "a prebuilt agent")
+         (binary (unibyte-string #x7f ?E ?L ?F 0 #x80 #xff 13 10))
          (checksum (concat (secure-hash 'sha256 binary) "  " asset "\n"))
          (leman-e2ee-agent-directory directory)
          (leman-e2ee-agent-release-url "https://example.invalid/agent/"))
-    (cl-letf (((symbol-function #'url-copy-file)
-               (lambda (url destination &rest _)
-                 (write-region
+    (cl-letf (((symbol-function #'url-retrieve-synchronously)
+               (lambda (url &rest _)
+                 (leman-e2ee-tests--download-response 200
                   (cond ((string-suffix-p ".sha256" url) checksum)
                         ((string-suffix-p ".revision" url) "revision\n")
-                        (t binary))
-                  nil destination nil 'silent))))
+                        (t binary))))))
       (let ((program (leman-e2ee-install-agent)))
         (should (equal (file-name-nondirectory program) asset))
         (should (equal (with-temp-buffer
+                         (set-buffer-multibyte nil)
                          (insert-file-contents-literally program)
                          (buffer-string))
                        binary))
@@ -1734,14 +1743,70 @@ must still clear it afterwards (e.g. with `unwind-protect')."
   (let* ((directory (make-temp-file "leman-agent-download-" 'dir))
          (leman-e2ee-agent-directory directory)
          (leman-e2ee-agent-release-url "https://example.invalid/agent/"))
-    (cl-letf (((symbol-function #'url-copy-file)
-               (lambda (url destination &rest _)
-                 (write-region (if (string-suffix-p ".sha256" url)
-                                   "not-a-digest\n"
-                                 "a prebuilt agent")
-                               nil destination nil 'silent))))
+    (cl-letf (((symbol-function #'url-retrieve-synchronously)
+               (lambda (url &rest _)
+                 (leman-e2ee-tests--download-response
+                  200 (if (string-suffix-p ".sha256" url)
+                          "not-a-digest\n"
+                        "a prebuilt agent")))))
       (should-error (leman-e2ee-install-agent))
       (should-not (file-exists-p (leman-e2ee--managed-agent-program))))))
+
+(ert-deftest leman-e2ee-install-agent-reports-http-errors ()
+  "Failed downloads must report HTTP errors and preserve the installed agent."
+  (dolist (status '(404 500))
+    (let* ((directory (make-temp-file "leman-agent-http-" 'dir))
+           (leman-e2ee-agent-directory directory)
+           (leman-e2ee-agent-release-url "https://example.invalid/agent/")
+           (program (leman-e2ee--managed-agent-program))
+           response)
+      (unwind-protect
+          (progn
+            (write-region "existing agent" nil program nil 'silent)
+            (cl-letf (((symbol-function #'url-retrieve-synchronously)
+                       (lambda (&rest _)
+                         (setq response (leman-e2ee-tests--download-response
+                                         status "Not Found")))))
+              (let ((err (should-error (leman-e2ee-install-agent))))
+                (should (string-match-p (format "HTTP %d" status)
+                                        (error-message-string err)))
+                (should (string-match-p "example.invalid" (error-message-string err)))))
+            (should-not (buffer-live-p response))
+            (should (equal (with-temp-buffer
+                             (insert-file-contents-literally program)
+                             (buffer-string))
+                           "existing agent"))
+            (should (equal (directory-files directory nil "^[^.]")
+                           (list (file-name-nondirectory program))))
+            (should-not (directory-files directory nil "^\\.leman-agent-")))
+        (when (buffer-live-p response) (kill-buffer response))
+        (delete-directory directory t)))))
+
+(ert-deftest leman-e2ee-download-agent-file-rejects-missing-response ()
+  (let ((destination (make-temp-file "leman-agent-response-")))
+    (unwind-protect
+        (cl-letf (((symbol-function #'url-retrieve-synchronously) #'ignore))
+          (let ((err (should-error (leman-e2ee--download-agent-file
+                                   "https://example.invalid/agent" destination))))
+            (should (string-match-p "no response" (error-message-string err)))))
+      (delete-file destination))))
+
+(ert-deftest leman-e2ee-download-agent-file-rejects-malformed-response ()
+  (let ((destination (make-temp-file "leman-agent-response-"))
+        (response (generate-new-buffer " *leman-malformed-response*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer response
+            (setq-local url-http-response-status 200)
+            (insert "HTTP/1.1 200 OK\nMissing header separator"))
+          (cl-letf (((symbol-function #'url-retrieve-synchronously)
+                     (lambda (&rest _) response)))
+            (let ((err (should-error (leman-e2ee--download-agent-file
+                                     "https://example.invalid/agent" destination))))
+              (should (string-match-p "malformed HTTP response" (error-message-string err)))))
+          (should-not (buffer-live-p response)))
+      (when (buffer-live-p response) (kill-buffer response))
+      (delete-file destination))))
 
 ;;;; Key backup and SSSS
 

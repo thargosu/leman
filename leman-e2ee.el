@@ -39,6 +39,9 @@
 (require 'json)
 (require 'subr-x)
 (require 'url)
+(require 'url-http)
+
+(defvar url-http-response-status)
 
 ;;;; Variables
 
@@ -355,6 +358,25 @@ If the source is not a Git checkout, leave the installed agent alone."
     (unless (and expected (string-equal (downcase expected) actual))
       (error "Leman E2EE: downloaded agent checksum does not match"))))
 
+(defun leman-e2ee--download-agent-file (url destination)
+  "Download URL to DESTINATION, requiring a successful HTTP response."
+  ;; `url-copy-file' saves HTTP error bodies too, so a missing release
+  ;; otherwise looks like a corrupt binary when its checksum is checked.
+  (let ((buffer (url-retrieve-synchronously url t t)))
+    (unless (buffer-live-p buffer)
+      (error "Leman E2EE: no response downloading %s" url))
+    (unwind-protect
+        (with-current-buffer buffer
+          (unless (eql url-http-response-status 200)
+            (error "Leman E2EE: download failed (HTTP %s): %s"
+                   (or url-http-response-status "unknown") url))
+          (goto-char (point-min))
+          (unless (re-search-forward "\r?\n\r?\n" nil t)
+            (error "Leman E2EE: malformed HTTP response from %s" url))
+          (let ((coding-system-for-write 'no-conversion))
+            (write-region (point) (point-max) destination nil 'silent)))
+      (kill-buffer buffer))))
+
 ;;;###autoload
 (defun leman-e2ee-install-agent ()
   "Download and install the prebuilt E2EE agent for this machine.
@@ -374,9 +396,9 @@ connecting after `package-vc-install' or `package-vc-upgrade'."
           (setq binary (make-temp-file (expand-file-name ".leman-agent-" directory))
                 checksum (make-temp-file (expand-file-name ".leman-agent-sha256-" directory))
                 revision (make-temp-file (expand-file-name ".leman-agent-revision-" directory)))
-          (url-copy-file base-url binary t)
-          (url-copy-file (concat base-url ".sha256") checksum t)
-          (url-copy-file (concat base-url ".revision") revision t)
+          (leman-e2ee--download-agent-file base-url binary)
+          (leman-e2ee--download-agent-file (concat base-url ".sha256") checksum)
+          (leman-e2ee--download-agent-file (concat base-url ".revision") revision)
           (leman-e2ee--verify-agent-download binary checksum)
           (rename-file binary program t)
           (setq binary nil)

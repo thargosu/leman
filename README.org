@@ -71,8 +71,8 @@ SHA-256 checksum.  ~M-x leman-e2ee-install-agent~ can be used to
 install or retry it manually; ~M-x leman-e2ee-status~ reports the
 running agent and program path.
 
-For development, build locally with ~M-x leman-e2ee-build-agent~ (or
-~cd e2ee/agent && cargo build --release~).  A manually configured or
+For development, or when a prebuilt agent is unavailable, see
+[[*Building locally on Linux][Building locally on Linux]].  A manually configured or
 PATH-discovered agent takes precedence over the managed binary.
 
 Current support:
@@ -110,6 +110,85 @@ Current support:
 
 Not yet (planned, see ~ROADMAP.org~): QR device verification and
 encrypting reactions in encrypted rooms.
+
+** Building locally on Linux
+
+*** Debian 13 (trixie): APT and backports
+
+Use Debian's Rust packages from [[https://backports.debian.org/Instructions/][trixie-backports]].  The agent's
+[[https://github.com/matrix-org/matrix-rust-sdk/blob/matrix-sdk-crypto-0.18.0/Cargo.toml][Matrix SDK dependency requires Rust 1.93 or newer]]; the Rust 1.85
+packages in regular Trixie are too old.
+
+If trixie-backports is not already configured, enable it:
+
+#+begin_src sh
+  sudo tee /etc/apt/sources.list.d/debian-backports.sources >/dev/null <<'EOF'
+  Types: deb
+  URIs: https://deb.debian.org/debian
+  Suites: trixie-backports
+  Components: main
+  Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+  EOF
+#+end_src
+
+Install the build tools and Rust:
+
+#+begin_src sh
+  sudo apt update
+  sudo apt install build-essential
+  sudo apt install -t trixie-backports rustc cargo
+  rustc --version
+  cargo --version
+#+end_src
+
+APT installs Rust and Cargo under ~/usr/bin~, which is normally
+already on Emacs's ~exec-path~ and the shell's ~PATH~.  Continue
+with [[*Build and connect][Build and connect]] below.
+
+*** Other Linux installations: rustup
+
+Install a C compiler and linker using your distribution's package
+manager.  On Ubuntu:
+
+#+begin_src sh
+  sudo apt update
+  sudo apt install build-essential curl
+#+end_src
+
+Install Rust and Cargo using [[https://rust-lang.org/tools/install/][rustup]], following the prompts to
+install the default stable toolchain.  Run these commands in a terminal:
+
+#+begin_src sh
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  . "$HOME/.cargo/env"
+  rustc --version
+  cargo --version
+#+end_src
+
+Start Emacs from that terminal so it inherits the updated ~PATH~.
+For an Emacs instance that is already running, or one started from a
+desktop launcher, evaluate this form (and add it to your init file
+if needed) so both Emacs and its compilation shell can find Cargo:
+
+#+begin_src elisp
+  (let ((cargo-bin (expand-file-name "~/.cargo/bin")))
+    (add-to-list 'exec-path cargo-bin)
+    (setenv "PATH" (concat cargo-bin path-separator (getenv "PATH"))))
+#+end_src
+
+*** Build and connect
+
+Run ~M-x leman-e2ee-build-agent~ and wait for the compilation buffer
+to report a successful build.  Alternatively, from the Leman checkout:
+
+#+begin_src sh
+  cd e2ee/agent
+  cargo build --release
+#+end_src
+
+Then disconnect and reconnect with ~M-x leman-disconnect~ and
+~M-x leman-connect~.  Leman automatically discovers the locally built
+agent.  Check it with ~M-x leman-e2ee-status~.
 
 * Upgrading (package-vc)
 

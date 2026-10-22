@@ -27,6 +27,8 @@
 (require 'leman-room-list)
 (require 'leman-tabulated-room-list)
 
+(declare-function leman-e2ee-tests--fake-agent "leman-e2ee-tests")
+
 ;;;; Helpers
 
 (defun leman-tests--member-event (id state-key old new &optional kicked-p avatar-differs-p)
@@ -1281,7 +1283,6 @@ Restoring it lets E2EE skip its whoami call."
   ;; to the destination.
   (let* ((leman-session (make-leman-session
                          :server (make-leman-server :name "x.org" :uri-prefix "https://x.org")))
-         (room (make-leman-room :id "!room:x.org"))
          (dir (make-temp-file "leman-download-test-" t))
          (destination (expand-file-name "file.bin" dir))
          (downloaded nil)
@@ -1329,7 +1330,6 @@ Restoring it lets E2EE skip its whoami call."
   ;; must not escape the download directory.
   (let* ((leman-session (make-leman-session
                          :server (make-leman-server :name "x.org" :uri-prefix "https://x.org")))
-         (room (make-leman-room :id "!room:x.org"))
          (dir (make-temp-file "leman-download-test-" t))
          (downloaded nil))
     (cl-letf (((symbol-function #'leman--media-request)

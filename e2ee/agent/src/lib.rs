@@ -10,7 +10,8 @@ use matrix_sdk_crypto::{
     store::types::{BackupDecryptionKey, CrossSigningKeyExport},
     types::events::room::encrypted::EncryptedEvent,
     types::requests::{AnyOutgoingRequest, OutgoingVerificationRequest},
-    DecryptionSettings, EncryptionSettings, EncryptionSyncChanges, OlmMachine, TrustRequirement,
+    DecryptionSettings, EncryptionSettings, EncryptionSyncChanges, OlmMachine, OlmMachineBuilder,
+    TrustRequirement,
 };
 use ruma::{
     api::client as client_api,
@@ -209,7 +210,9 @@ impl Agent {
             .await
             .context("opening crypto store")
             .map_err(crypto_error)?;
-        let machine = OlmMachine::with_store(&user_id, &device_id, store, None)
+        let machine = OlmMachineBuilder::new(&user_id, &device_id)
+            .with_crypto_store(store)
+            .build()
             .await
             .map_err(crypto_error)?;
         // The device keys, signatures and cross-signing identities are

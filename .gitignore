@@ -1,5 +1,6 @@
 /.sandbox/
 *.elc
+*.png
 /worktrees/
 /.#*
 /leman-autoloads.el

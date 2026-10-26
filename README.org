@@ -28,7 +28,9 @@ Coming soon.
   composing
 + Desktop notifications (mentions, unread rooms, etc.), a
   notifications buffer, and a mode-line unread indicator
-+ Room lists: sidebar-friendly buffers, spaces, room directory
++ Room lists: sidebar-friendly buffers, spaces, room directory, and
+  an IM-style inbox (=M-x leman-inbox=) with unread-first sorting,
+  message previews, and unread badges
 + Room management: invites, tags, topics, direct messages, spaces,
   member lists, user ignoring
 + Org-based message composition

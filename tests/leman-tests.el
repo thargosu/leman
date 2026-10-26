@@ -157,6 +157,29 @@ URL differ from the previous one."
                             (leman-tests--member-event 2 "@bob:example.com" nil "join")
                             (leman-tests--member-event 3 "@carol:example.com" nil "join"))
                    "Membership: 3 joined (@alice:example.com, @bob:example.com, @carol:example.com)."))
+    ;; Summaries longer than `leman-room-membership-summary-max-names'
+    ;; are truncated, with the full list in the help-echo.
+    (let* ((summary (funcall format-summary
+                             (leman-tests--member-event 1 "@alice:example.com" nil "join")
+                             (leman-tests--member-event 2 "@bob:example.com" nil "join")
+                             (leman-tests--member-event 3 "@carol:example.com" nil "join")
+                             (leman-tests--member-event 4 "@dave:example.com" nil "join")
+                             (leman-tests--member-event 5 "@eve:example.com" nil "join")))
+           ;; The help-echo is a text property; keep it with a raw copy.
+           (raw (leman-room--format-membership-events
+                 (make-leman-room-membership-events
+                  :events (list (leman-tests--member-event 1 "@alice:example.com" nil "join")
+                                (leman-tests--member-event 2 "@bob:example.com" nil "join")
+                                (leman-tests--member-event 3 "@carol:example.com" nil "join")
+                                (leman-tests--member-event 4 "@dave:example.com" nil "join")
+                                (leman-tests--member-event 5 "@eve:example.com" nil "join")))
+                 room)))
+      (should (string-match-p
+               "Membership: 5 joined (@alice:example.com, @bob:example.com, @carol:example.com, and 2 more)\\."
+               summary))
+      (should (string-match-p "@eve:example.com"
+                              (get-text-property (string-match-p "and 2 more" raw)
+                                                 'help-echo raw))))
     ;; Categories are listed in a fixed order.
     (should (equal (funcall format-summary
                             (leman-tests--member-event 1 "@carol:example.com" nil "join")
@@ -580,7 +603,7 @@ Names are available in the reaction's tooltip instead."
   (let ((leman-session (make-leman-session
                         :user (make-leman-user :id "@me:example.com"))))
     (let ((string (leman-tests--format-reactions)))
-      (should (string-match-p "👍 (1)" string))
+      (should (string-match-p "👍 1" string))
       (should-not (string-match-p "Alice\\|Bob\\|@other" string))
       ;; The names are delivered through the reaction's tooltip.
       (should (functionp (get-text-property (string-match "👍" string)
@@ -613,9 +636,10 @@ Names are available in the reaction's tooltip instead."
 (ert-deftest leman-room--format-reactions-custom-emoji ()
   "Test that custom-emoji reaction keys (mxc URIs) are handled.
 When the emoji's image is available (from the URL cache), it is
-rendered in place of the key; otherwise, the mxc URI is shown as
-the key.  In either case, the raw key is stored in a text
-property for toggling."
+rendered in place of the key; otherwise, a shortcode-like
+fallback (the emoji pack's shortcode, or a shortened media ID) is
+shown as the key.  In either case, the raw key is stored in a
+text property for toggling."
   (let ((leman-session (make-leman-session
                         :user (make-leman-user :id "@me:example.com")
                         :server (make-leman-server :uri-prefix "https://matrix.example.com"))))
@@ -627,9 +651,11 @@ property for toggling."
            (event (leman-tests--reacted-event "mxc://example.com/emoji"))
            (room (make-leman-room :id "!room:example.com"))
            (string (leman-room--format-reactions event room)))
-      ;; Without the image, the key is shown as the mxc URI.
-      (should (string-match-p "mxc://example.com/emoji" string))
-      (should (equal (get-text-property (string-match "mxc://" string) 'leman-reaction-key string)
+      ;; Without the image (and no emoji pack entry), a shortened
+      ;; media ID fallback is shown, not the raw mxc URI.
+      (should (string-match-p ":emoji:" string))
+      (should (equal (get-text-property (string-match ":emoji:" string)
+                                        'leman-reaction-key string)
                      "mxc://example.com/emoji")))
     ;; With the image available, the key is an image, not the mxc
     ;; URI.  Test both shapes of `shr-get-image-data' return value:
@@ -653,6 +679,331 @@ property for toggling."
         (should (equal (get-text-property (next-single-property-change 0 'leman-reaction-key string)
                                           'leman-reaction-key string)
                        "mxc://example.com/emoji"))))))
+
+(ert-deftest leman-room--format-reactions-custom-emoji-pack-shortcode ()
+  "Custom-emoji reactions without an image show the pack's shortcode."
+  (let ((leman-session (make-leman-session
+                        :user (make-leman-user :id "@me:example.com")))
+        (leman-room-images nil)
+        (room (make-leman-room
+               :id "!room:example.com"
+               :state (list (make-leman-event
+                             :type "im.ponies.room_emotes"
+                             :content '((images . ((party_parrot
+                                                    . ((url . "mxc://example.com/party")))))))))))
+    (let ((string (leman-room--format-reactions
+                   (leman-tests--reacted-event "mxc://example.com/party") room)))
+      (should (string-match-p ":party_parrot:" string))
+      (should (equal (get-text-property (string-match ":party_parrot:" string)
+                                        'leman-reaction-key string)
+                     "mxc://example.com/party")))))
+
+(ert-deftest leman-room--shield-in-headers ()
+  "With `leman-room-shield-in-headers', verified and plaintext
+messages carry no per-line shield, and the sender header shows
+the shield instead; warning shields still lead the message."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (session (make-leman-session :user (make-leman-user :id "@me:example.com")))
+         (event (make-leman-event :id "$event" :type "m.room.message"
+                                  :sender (make-leman-user :id "@other:example.com")
+                                  :origin-server-ts 1694000000000
+                                  :content '((msgtype . "m.text") (body . "hi"))))
+         (leman-room room)
+         (leman-session session)
+         (leman-room-sender-headers t)
+         (leman-room-shield-in-headers t)
+         (leman-room-user-avatars nil))
+    ;; Verified message: no shield on the line, but one on the header.
+    (setf (alist-get 'shield (leman-event-local event)) '(none))
+    (should-not (string-match-p "🛡" (leman-room--format-event event room session)))
+    (should (string-match-p "🛡" (leman-room--format-sender-header event session)))
+    ;; Red and grey warnings still lead the message itself.
+    (setf (alist-get 'shield (leman-event-local event)) '(red 1 "unverified device"))
+    (should (string-match-p "⚠" (leman-room--format-event event room session)))
+    ;; Disabling the option restores the shield on every line.
+    (setf (alist-get 'shield (leman-event-local event)) '(none))
+    (let ((leman-room-shield-in-headers nil))
+      (should (string-match-p "🛡" (leman-room--format-event event room session))))))
+
+(ert-deftest leman-room--format-message-body-reply-quote ()
+  "Replies show a quote box with the original's sender and snippet,
+and their plain-text fallback quote is stripped."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (sender (make-leman-user :id "@other:x.org"))
+         (target (make-leman-event :id "$target" :type "m.room.message"
+                                   :sender sender
+                                   :content '((msgtype . "m.text")
+                                              (body . "the original message"))))
+         (member-event (make-leman-event :id "$member" :type "m.room.member"
+                                         :sender sender
+                                         :content '((membership . "join")
+                                                    (displayname . "Other"))))
+         (reply (make-leman-event :id "$reply" :type "m.room.message"
+                                  :sender (make-leman-user :id "@vv:x.org")
+                                  :content '((msgtype . "m.text")
+                                             (body . "> <@other:x.org> the original message\na reply")
+                                             (m.relates_to . ((m.in_reply_to
+                                                               . ((event_id . "$target"))))))))
+         (leman-room room)
+         (leman-session (make-leman-session :user (make-leman-user :id "@me:x.org"))))
+    (setf (leman-room-timeline room) (list member-event target))
+    (let ((body (leman-room--format-message-body reply leman-session)))
+      ;; The quote box leads the body, with the fallback stripped.
+      (should (string-prefix-p "┃ Other\n┃ the original message\n" body))
+      (should-not (string-match-p "> <" body))
+      (should (string-suffix-p "a reply" body))
+      ;; The full original is in the snippet's tooltip.
+      (should (equal (get-text-property (string-match "┃ the original" body)
+                                        'help-echo body)
+                     "the original message")))))
+
+(ert-deftest leman-room--format-message-body-reply-fallback ()
+  "Replies whose original is not in the room show a muted fallback,
+reusing the anchor text of their own <mx-reply> fallback, which is
+stripped from the rendered body."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (reply (make-leman-event :id "$reply" :type "m.room.message"
+                                  :sender (make-leman-user :id "@vv:x.org")
+                                  :content '((msgtype . "m.text")
+                                             (body . "a reply")
+                                             (format . "org.matrix.custom.html")
+                                             (formatted_body
+                                              . "<mx-reply><blockquote><a href=\"https://matrix.to/#/!other/$x\">Message in cloud-platforms</a><br /></blockquote></mx-reply>a reply")
+                                             (m.relates_to . ((m.in_reply_to
+                                                               . ((event_id . "$missing"))))))))
+         (leman-room room)
+         (leman-session (make-leman-session :user (make-leman-user :id "@me:x.org"))))
+    (let ((body (leman-room--format-message-body reply leman-session)))
+      (should (string-match-p "\\`┃ ↩ Message in cloud-platforms" body))
+      (should (string-suffix-p "a reply" body))
+      ;; The fallback markup is gone from the rendered body.
+      (should-not (string-match-p "mx-reply\\|blockquote" body))))
+  ;; A spec-style "In reply to" anchor is not informative: use the
+  ;; generic fallback.
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (reply (make-leman-event :id "$reply" :type "m.room.message"
+                                  :sender (make-leman-user :id "@vv:x.org")
+                                  :content '((msgtype . "m.text")
+                                             (body . "a reply")
+                                             (format . "org.matrix.custom.html")
+                                             (formatted_body
+                                              . "<mx-reply><blockquote><a href=\"https://matrix.to/#/!r/$x\">In reply to</a><a href=\"https://matrix.to/#/@u:x.org\">@u:x.org</a><br /></blockquote></mx-reply>a reply")
+                                             (m.relates_to . ((m.in_reply_to
+                                                               . ((event_id . "$missing"))))))))
+         (leman-room room)
+         (leman-session (make-leman-session :user (make-leman-user :id "@me:x.org"))))
+    (should (string-match-p "┃ ↩ reply to an earlier message"
+                            (leman-room--format-message-body reply leman-session)))))
+
+(ert-deftest leman-room--format-message-body-thread-reply ()
+  "Thread replies (MSC3440) render flat: the m.in_reply_to they
+carry is a fallback to the thread root or latest event, not a
+deliberate reply, so no quote box is shown (as in other clients'
+thread views).  Fallback quotes in the bodies are still stripped."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (leman-room room)
+         (leman-session (make-leman-session :user (make-leman-user :id "@me:x.org")))
+         (thread-relates-to '((rel_type . "m.thread")
+                              (event_id . "$root")
+                              (m.in_reply_to . ((event_id . "$root")
+                                                (is_falling_back . t)))))
+         (plain (make-leman-event
+                 :id "$t" :type "m.room.message"
+                 :sender (make-leman-user :id "@vv:x.org")
+                 :content `((msgtype . "m.text")
+                            (body . "> <@other:x.org> the root\na thread reply")
+                            (m.relates_to . ,thread-relates-to))))
+         (html (make-leman-event
+                :id "$h" :type "m.room.message"
+                :sender (make-leman-user :id "@vv:x.org")
+                :content `((msgtype . "m.text")
+                           (body . "x")
+                           (format . "org.matrix.custom.html")
+                           (formatted_body
+                            . "<mx-reply><blockquote><a href=\"https://matrix.to/#/!r/$root\">In reply to</a><br /></blockquote></mx-reply>a thread reply")
+                           (m.relates_to . ,thread-relates-to)))))
+    ;; The plain-text fallback quote is stripped, and no quote box is
+    ;; prepended: the body is exactly the reply's own text.
+    (should (equal (leman-room--format-message-body plain leman-session)
+                   "a thread reply"))
+    ;; Same for the HTML fallback (<mx-reply>), and no quote box.
+    (should (equal (leman-room--format-message-body html leman-session)
+                   "a thread reply"))
+    ;; For comparison, a non-thread reply still gets the quote box.
+    (let ((reply (make-leman-event
+                  :id "$r" :type "m.room.message"
+                  :sender (make-leman-user :id "@vv:x.org")
+                  :content '((msgtype . "m.text")
+                             (body . "> <@other:x.org> the original\na reply")
+                             (m.relates_to . ((m.in_reply_to
+                                               . ((event_id . "$target")))))))))
+      (should (string-prefix-p "┃" (leman-room--format-message-body reply leman-session))))))
+
+(ert-deftest leman-room--format-message-body-code-block ()
+  "HTML code blocks get the `leman-room-code-block' background."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (leman-room room)
+         (leman-session (make-leman-session :user (make-leman-user :id "@me:x.org")))
+         (event (make-leman-event :id "$e" :type "m.room.message"
+                                  :content '((msgtype . "m.text")
+                                             (body . "status:\nStatus of pacemakerd")
+                                             (format . "org.matrix.custom.html")
+                                             (formatted_body
+                                              . "<p>status:</p><pre><code>Status of pacemakerd: running\n * Stack: corosync</code></pre>")))))
+    (let ((body (leman-room--format-message-body event leman-session)))
+      (should (string-match-p "Status of pacemakerd" body))
+      ;; The code block region carries the background face.
+      (let ((face (get-text-property (string-match "Status of pacemakerd" body)
+                                     'face body)))
+        (should (or (eq face 'leman-room-code-block)
+                    (and (listp face) (memq 'leman-room-code-block face)))))
+      ;; Regular text before the block does not.
+      (let ((face (get-text-property 0 'face body)))
+        (should-not (or (eq face 'leman-room-code-block)
+                        (and (listp face) (memq 'leman-room-code-block face))))))))
+
+(ert-deftest leman-room--format-message-body-mentions ()
+  "User mentions and literal @room get the mention face."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (leman-room room)
+         (leman-session (make-leman-session :user (make-leman-user :id "@me:x.org")))
+         (event (make-leman-event :id "$e" :type "m.room.message"
+                                  :content '((msgtype . "m.text")
+                                             (body . "ping @room, hey @vv")
+                                             (format . "org.matrix.custom.html")
+                                             (formatted_body
+                                              . "<p>ping @room, hey <a href=\"https://matrix.to/#/@vv:x.org\">@vv</a></p>")))))
+    (let ((body (leman-room--format-message-body event leman-session)))
+      ;; The matrix.to user link carries the mention face...
+      (let ((face (get-text-property (string-match "@vv" body) 'face body)))
+        (should (or (eq face 'leman-room-mention)
+                    (and (listp face) (memq 'leman-room-mention face)))))
+      ;; ...so does the literal @room...
+      (let ((face (get-text-property (string-match "@room" body) 'face body)))
+        (should (or (eq face 'leman-room-mention)
+                    (and (listp face) (memq 'leman-room-mention face)))))
+      ;; ...and a matrix.to room-ID link does not (plain link).
+      (let* ((event2 (make-leman-event :id "$e2" :type "m.room.message"
+                                       :content '((msgtype . "m.text")
+                                                  (body . "see !room")
+                                                  (format . "org.matrix.custom.html")
+                                                  (formatted_body
+                                                   . "<a href=\"https://matrix.to/#/!other:x.org\">see !room</a>"))))
+             (body2 (leman-room--format-message-body event2 leman-session))
+             (face (get-text-property 0 'face body2)))
+        (should-not (or (eq face 'leman-room-mention)
+                        (and (listp face) (memq 'leman-room-mention face))))))))
+
+(ert-deftest leman-room--event-ping-p ()
+  "Events ping the user via m.mentions, or via body text as fallback.
+The user's own messages never ping."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (leman-room room)
+         (session (make-leman-session :user (make-leman-user :id "@me:x.org")))
+         (other (make-leman-user :id "@other:x.org"))
+         (mk (lambda (content)
+               (make-leman-event :id "$e" :type "m.room.message"
+                                 :sender other :content content))))
+    ;; m.mentions naming the user.
+    (should (leman-room--event-ping-p
+             (funcall mk '((msgtype . "m.text") (body . "hey")
+                           (m.mentions . ((user_ids . ["@me:x.org"])))))
+             room session))
+    ;; m.mentions of the room.
+    (should (leman-room--event-ping-p
+             (funcall mk '((msgtype . "m.text") (body . "hey all")
+                           (m.mentions . ((room . t)))))
+             room session))
+    ;; Text fallback: the user's ID in the body.
+    (let ((leman-room-ping-text-fallback t))
+      (should (leman-room--event-ping-p
+               (funcall mk '((msgtype . "m.text") (body . "ping @me:x.org please")))
+               room session))
+      ;; Fallback disabled: no m.mentions, no ping.
+      (let ((leman-room-ping-text-fallback nil))
+        (should-not (leman-room--event-ping-p
+                     (funcall mk '((msgtype . "m.text") (body . "ping @me:x.org please")))
+                     room session))))
+    ;; The user's own messages never ping, even self-mentioning.
+    (should-not (leman-room--event-ping-p
+                 (make-leman-event :id "$own" :type "m.room.message"
+                                   :sender (make-leman-user :id "@me:x.org")
+                                   :content '((msgtype . "m.text")
+                                              (body . "note to self")
+                                              (m.mentions . ((user_ids . ["@me:x.org"])))))
+                 room session))))
+
+(ert-deftest leman-room--format-message-body-mention-tinted ()
+  "User mentions are tinted with the mentioned user's prism color."
+  (let* ((leman-users (make-hash-table :test #'equal))
+         (user (make-leman-user :id "@vv:x.org"))
+         (room (make-leman-room :id "!room:example.com"))
+         (leman-room room)
+         (leman-session (make-leman-session :user (make-leman-user :id "@me:x.org")))
+         (event (make-leman-event :id "$e" :type "m.room.message"
+                                  :content '((msgtype . "m.text")
+                                             (body . "hey @vv")
+                                             (format . "org.matrix.custom.html")
+                                             (formatted_body
+                                              . "<p>hey <a href=\"https://matrix.to/#/@vv:x.org\">@vv</a></p>")))))
+    (puthash "@vv:x.org" user leman-users)
+    (let* ((body (leman-room--format-message-body event leman-session))
+           (faces (format "%S" (get-text-property (string-match "@vv" body)
+                                                  'face body)))
+           (color (leman-user-color user)))
+      (should (string-prefix-p "#" color))
+      (should (string-match-p (regexp-quote color) faces))
+      (should (string-match-p "leman-room-mention" faces)))))
+
+(ert-deftest leman-room--format-message-body-inline-code ()
+  "Inline <code> gets the code background, outside of <pre>."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (leman-room room)
+         (leman-session (make-leman-session :user (make-leman-user :id "@me:x.org")))
+         (event (make-leman-event :id "$e" :type "m.room.message"
+                                  :content '((msgtype . "m.text")
+                                             (body . "run make foo")
+                                             (format . "org.matrix.custom.html")
+                                             (formatted_body . "<p>run <code>make foo</code></p>")))))
+    (let ((body (leman-room--format-message-body event leman-session)))
+      (let ((face (get-text-property (string-match "make foo" body) 'face body)))
+        (should (or (eq face 'leman-room-code-block)
+                    (and (listp face) (memq 'leman-room-code-block face))))))))
+
+(ert-deftest leman-room--format-reply-quote-button ()
+  "The reply quote is a button carrying the original's event ID."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (target (make-leman-event :id "$target" :type "m.room.message"
+                                   :sender (make-leman-user :id "@other:x.org")
+                                   :content '((msgtype . "m.text") (body . "the original message"))))
+         (leman-room room)
+         (leman-session (make-leman-session :user (make-leman-user :id "@me:x.org"))))
+    (setf (leman-room-timeline room) (list target))
+    (let ((quote (leman-room--format-reply-quote "$target" room)))
+      (should (string-prefix-p "┃ " quote))
+      (should (equal (get-text-property 0 'button quote) '(t)))
+      (should (equal (get-text-property 0 'leman-room-reply-event-id quote)
+                     "$target"))
+      (should (eq (get-text-property 0 'action quote)
+                  #'leman-room--reply-quote-action)))))
+
+(ert-deftest leman-room--format-message-body-unsupported ()
+  "Events with no or unknown msgtype and no body collapse to a
+single marker, with the msgtype in the tooltip."
+  (let ((room (make-leman-room :id "!room:example.com"))
+        (leman-session (make-leman-session :user (make-leman-user :id "@me:x.org"))))
+    (let ((event (make-leman-event :id "$e" :type "m.room.message" :content nil))
+          (leman-room room))
+      (let ((body (leman-room--format-message-body event leman-session)))
+        (should (equal body "[unsupported message]"))
+        (should (equal (get-text-property 0 'help-echo body) "msgtype: nil"))))
+    ;; An unknown msgtype with a body keeps the body and the appendix.
+    (let ((event (make-leman-event :id "$e2" :type "m.room.message"
+                                   :content '((msgtype . "m.beacon") (body . "here"))))
+          (leman-room room))
+      (let ((body (leman-room--format-message-body event leman-session)))
+        (should (string-match-p "here" body))
+        (should (string-match-p "\\[unsupported msgtype: m.beacon\\]" body))))))
 
 (ert-deftest leman-room--thread-data ()
   "Test storing, deduplicating, and replacing thread events."
@@ -868,6 +1219,142 @@ re-created); each re-render must not start another download."
         (leman-room--format-m.image event nil)
         (should (= downloads 2))))))
 
+(ert-deftest leman-room--sender-header-time-gap ()
+  "A same-sender header is shown again after a long silence."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (sender (make-leman-user :id "@vv:x.org"))
+         (minute (* 60 1000))
+         (early (make-leman-event :id "$early" :type "m.room.message" :sender sender
+                                  :origin-server-ts 1000))
+         (soon (make-leman-event :id "$soon" :type "m.room.message" :sender sender
+                                 :origin-server-ts (+ 1000 (* 5 minute))))
+         (late (make-leman-event :id "$late" :type "m.room.message" :sender sender
+                                 :origin-server-ts (+ 1000 (* 90 minute))))
+         (leman-room room)
+         (printer (lambda (data)
+                    (cond ((leman-room-sender-header-p data) (insert "HEADER\n"))
+                          ((leman-event-p data) (insert (leman-event-id data) "\n"))
+                          (t "")))))
+    (with-temp-buffer
+      (setf leman-ewoc (ewoc-create printer nil nil 'nosep))
+      (dolist (event (list early soon late))
+        (ewoc-enter-last leman-ewoc event))
+      (leman-room--insert-sender-headers leman-ewoc)
+      ;; A header before $early, and another before $late (after the
+      ;; 90-minute gap), but none between $early and $soon.
+      (should (equal (buffer-string) "HEADER\n$early\n$soon\nHEADER\n$late\n"))))
+  ;; When disabled, the same sender never gets a second header.
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (sender (make-leman-user :id "@vv:x.org"))
+         (minute (* 60 1000))
+         (early (make-leman-event :id "$early" :type "m.room.message" :sender sender
+                                  :origin-server-ts 1000))
+         (late (make-leman-event :id "$late" :type "m.room.message" :sender sender
+                                 :origin-server-ts (+ 1000 (* 90 minute))))
+         (leman-room room)
+         (leman-room-sender-header-time-gap nil)
+         (printer (lambda (data)
+                    (cond ((leman-room-sender-header-p data) (insert "HEADER\n"))
+                          ((leman-event-p data) (insert (leman-event-id data) "\n"))
+                          (t "")))))
+    (with-temp-buffer
+      (setf leman-ewoc (ewoc-create printer nil nil 'nosep))
+      (dolist (event (list early late))
+        (ewoc-enter-last leman-ewoc event))
+      (leman-room--insert-sender-headers leman-ewoc)
+      (should (equal (buffer-string) "HEADER\n$early\n$late\n")))))
+
+(ert-deftest leman-room--day-separators ()
+  "A divider separates events from different days, exactly once."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (sender (make-leman-user :id "@vv:x.org"))
+         (day (* 24 60 60 1000))
+         (monday (make-leman-event :id "$monday" :type "m.room.message" :sender sender
+                                   :origin-server-ts (* 3 day)))
+         (tuesday (make-leman-event :id "$tuesday" :type "m.room.message" :sender sender
+                                    :origin-server-ts (* 4 day)))
+         (leman-room room)
+         (printer (lambda (data)
+                    (cond ((leman-room-day-separator-p data) (insert "DAY\n"))
+                          ((leman-room-sender-header-p data) (insert "HEADER\n"))
+                          ((leman-event-p data) (insert (leman-event-id data) "\n"))
+                          (t "")))))
+    (with-temp-buffer
+      (setf leman-ewoc (ewoc-create printer nil nil 'nosep))
+      (dolist (event (list monday tuesday))
+        (ewoc-enter-last leman-ewoc event))
+      (leman-room--insert-day-separators leman-ewoc)
+      (should (equal (buffer-string) "$monday\nDAY\n$tuesday\n"))
+      ;; The pass is idempotent.
+      (leman-room--insert-day-separators leman-ewoc)
+      (should (equal (buffer-string) "$monday\nDAY\n$tuesday\n"))
+      ;; Same-day events do not get a divider.
+      (let ((tuesday-2 (make-leman-event :id "$tuesday-2" :type "m.room.message"
+                                         :sender sender :origin-server-ts
+                                         (+ (* 4 day) 60000))))
+        (ewoc-enter-last leman-ewoc tuesday-2)
+        (leman-room--insert-day-separators leman-ewoc)
+        (should (equal (buffer-string) "$monday\nDAY\n$tuesday\n$tuesday-2\n"))))
+    ;; With sender headers, the divider goes above the header, not
+    ;; between the header and its message.
+    (with-temp-buffer
+      (setf leman-ewoc (ewoc-create printer nil nil 'nosep))
+      (dolist (event (list monday tuesday))
+        (ewoc-enter-last leman-ewoc event))
+      (leman-room--insert-sender-headers leman-ewoc)
+      (leman-room--insert-day-separators leman-ewoc)
+      (should (equal (buffer-string)
+                     "HEADER\n$monday\nDAY\nHEADER\n$tuesday\n")))))
+
+(ert-deftest leman-room--day-separators-self-heal ()
+  "Stale dividers are removed by the rescan on the next event.
+A divider inserted before a member event becomes stale when the
+event is coalesced into a membership node (its node is deleted);
+membership nodes also carry the day, so the divider moves above
+the coalesced cluster."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (leman-room room)
+         (leman-session (make-leman-session :user (make-leman-user :id "@me:x.org")))
+         (leman-room-coalesce-events t)
+         (day (* 24 60 60 1000))
+         (mk (lambda (id ts type extra)
+               (make-leman-event :id id :type type
+                                 :origin-server-ts ts
+                                 :sender (make-leman-user :id (concat "@" id ":x.org"))
+                                 :content extra)))
+         (e1 (funcall mk "old" (* 4 day) "m.room.message"
+                      '((msgtype . "m.text") (body . "yesterday"))))
+         (e2 (funcall mk "invite" (+ (* 5 day) 1000) "m.room.member"
+                      '((membership . "invite"))))
+         (e3 (funcall mk "join" (+ (* 5 day) 2000) "m.room.member"
+                      '((membership . "join"))))
+         (e4 (funcall mk "later" (+ (* 5 day) 60000) "m.room.message"
+                      '((msgtype . "m.text") (body . "today"))))
+         (printer (lambda (data)
+                    (cond ((leman-room-day-separator-p data) (insert "DAY\n"))
+                          ((leman-room-sender-header-p data) (insert "HEADER\n"))
+                          ((leman-room-membership-events-p data) (insert "MEMBER\n"))
+                          ((leman-event-p data) (insert (leman-event-id data) "\n"))
+                          (t "")))))
+    (with-temp-buffer
+      (setf leman-ewoc (ewoc-create printer nil nil 'nosep))
+      ;; Yesterday's message.
+      (leman-room--insert-event e1)
+      (should (equal (buffer-string) "HEADER\nold\n"))
+      ;; A member event today: divider between the days.
+      (leman-room--insert-event e2)
+      (should (equal (buffer-string) "HEADER\nold\nDAY\ninvite\n"))
+      ;; Another member event, coalesced into the first: the divider
+      ;; is now stale ($invite's node was deleted), but no rescan has
+      ;; run yet.
+      (leman-room--insert-event e3)
+      (should (equal (buffer-string) "HEADER\nold\nDAY\nMEMBER\n"))
+      ;; The next event's rescan heals it: exactly one divider,
+      ;; above the membership cluster.
+      (leman-room--insert-event e4)
+      (should (equal (buffer-string)
+                     "HEADER\nold\nDAY\nMEMBER\nHEADER\nlater\n")))))
+
 (ert-deftest leman-room--format-thread-chip ()
   "Test that thread roots show a summary chip linking to the view."
   (let* ((room (make-leman-room :id "!room:example.com"))
@@ -912,7 +1399,9 @@ re-created); each re-render must not start another download."
               ((symbol-function 'svg-lib-tag) (lambda (&rest _) image)))
       (let ((chip (leman-room--format-thread-chip root room)))
         (should (stringp chip))
-        (should (equal (get-text-property 0 'display chip) image))))))
+        ;; The chip is on its own line, after a newline and
+        ;; indentation, so its display property is not at position 0.
+        (should (text-property-any 0 (length chip) 'display image chip))))))
 
 (ert-deftest leman-room--typing-footer-svg ()
   "Test that SVG typing tags are inserted through a display property."
@@ -967,7 +1456,10 @@ used, and plaintext messages get no marker."
                                  :content '((body . "photo"))))))
 
 (ert-deftest leman-room--format-event-shield-leads ()
-  "The authenticity marker is rendered at the start of the line."
+  "Warning authenticity markers are rendered at the start of the line.
+With `leman-room-shield-in-headers' (the default), verified and
+plaintext markers move to the sender header instead; disabling
+the option restores a shield on every line."
   (let* ((room (make-leman-room :id "!room:example.com"))
          (session (make-leman-session :user (make-leman-user :id "@other:x.org")))
          (event (make-leman-event :id "$msg"
@@ -982,24 +1474,119 @@ used, and plaintext messages get no marker."
          ;; its position can be asserted.
          (formatted (let ((leman-room-message-format-spec "[%t] %S> %B%r%T"))
                       (leman-room--format-event event room session))))
-    (should (< (string-match-p "🛡" formatted)
-               (string-match-p "hello world" formatted)))))
+    ;; A verified marker does not lead the line by default...
+    (should-not (string-match-p "🛡" formatted))
+    ;; ...but it does when `leman-room-shield-in-headers' is nil.
+    (let ((leman-room-shield-in-headers nil))
+      (should (< (string-match-p "🛡" (leman-room--format-event event room session))
+                 (string-match-p "hello world"
+                                 (leman-room--format-event event room session)))))
+    ;; Warning markers still lead the line.
+    (setf (alist-get 'shield (leman-event-local event)) '(red 1 "why"))
+    (let ((formatted (leman-room--format-event event room session)))
+      (should (< (string-match-p "⚠" formatted)
+                 (string-match-p "hello world" formatted))))))
+
+(ert-deftest leman-room--seen-indicator ()
+  "The seen marker shows on the latest own message, counting the
+read receipts that cover it."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (leman-room room)
+         (me (make-leman-user :id "@me:x.org" :displayname "Me"))
+         (alice (make-leman-user :id "@alice:x.org" :displayname "Alice"))
+         (bob (make-leman-user :id "@bob:x.org" :displayname "Bob"))
+         (leman-session (make-leman-session :user me))
+         (leman-users (make-hash-table :test #'equal))
+         (mine (make-leman-event :id "$mine" :type "m.room.message" :sender me
+                                 :origin-server-ts 1000))
+         (other (make-leman-event :id "$other" :type "m.room.message" :sender alice
+                                  :origin-server-ts 900)))
+    (puthash "@me:x.org" me leman-users)
+    (puthash "@alice:x.org" alice leman-users)
+    (puthash "@bob:x.org" bob leman-users)
+    (setf (leman-room-timeline room) (list mine other))
+    ;; Alice's receipt covers my message: the marker shows.
+    (puthash "@alice:x.org" (cons "$mine" 1100) (leman-room-receipts room))
+    (let ((seen (leman-room--format-seen mine room leman-session)))
+      (should (equal seen " ✓"))
+      (should (equal (get-text-property 0 'help-echo seen) "Seen by Alice"))
+      ;; And it appears in the sender header.
+      (should (string-match-p "✓" (leman-room--format-sender-header mine leman-session))))
+    ;; A receipt on an event not in the timeline (or older than mine)
+    ;; does not count.
+    (puthash "@alice:x.org" (cons "$unknown" 100) (leman-room-receipts room))
+    (should-not (leman-room--format-seen mine room leman-session))
+    ;; Two readers: the count is shown.
+    (puthash "@alice:x.org" (cons "$mine" 1100) (leman-room-receipts room))
+    (puthash "@bob:x.org" (cons "$mine" 1200) (leman-room-receipts room))
+    (let ((seen (leman-room--format-seen mine room leman-session)))
+      (should (equal seen " ✓2"))
+      ;; The readers' order follows the receipts hash, so accept both.
+      (should (member (get-text-property 0 'help-echo seen)
+                      '("Seen by Alice, Bob" "Seen by Bob, Alice"))))
+    ;; Only my latest message shows the marker.
+    (let ((newer (make-leman-event :id "$mine-2" :type "m.room.message"
+                                   :sender me :origin-server-ts 2000)))
+      (push newer (leman-room-timeline room))
+      ;; The receipts still point at the older message: no marker
+      ;; anywhere yet.
+      (should-not (leman-room--format-seen mine room leman-session))
+      (should-not (leman-room--format-seen newer room leman-session))
+      ;; Once Alice reads the new message, its marker shows.
+      (puthash "@alice:x.org" (cons "$mine-2" 3000) (leman-room-receipts room))
+      (should (string-match-p "✓" (leman-room--format-seen newer room leman-session))))
+    ;; Other users' messages get no marker.
+    (should-not (leman-room--format-seen other room leman-session))))
 
 (ert-deftest leman-room--sender-header-shows-message-timestamp ()
-  "A sender header puts its first message's time beside the name."
+  "A sender header shows its first message's time at the right edge."
   (let* ((sender (make-leman-user :id "@vv:x.org" :displayname "Vincent"))
          (event (make-leman-event :sender sender :origin-server-ts 1694000000000))
          (leman-room-user-avatars nil)
          (leman-room-timestamp-format "%H:%M:%S")
+         (leman-room-timestamp-show-day nil)
          (leman-room (make-leman-room :id "!room:example.com"))
          (leman-session (make-leman-session :user (make-leman-user :id "@me:x.org"))))
     (with-temp-buffer
       (leman-room--pp-thing (leman-room--make-sender-header event))
       (let ((header (buffer-string)))
         (let ((timestamp (format-time-string leman-room-timestamp-format 1694000000)))
-          (should (equal (substring-no-properties header) (format "Vincent  %s" timestamp)))
+          ;; The header starts with a newline: the breathing room
+          ;; above it.  The timestamp is pushed to the right edge by
+          ;; an :align-to display space.
+          (should (equal (substring-no-properties header) (format "\nVincent %s" timestamp)))
+          (should (equal (get-text-property 8 'display header)
+                         '(space :align-to (- right 8))))
           (should (eq (get-text-property (string-match-p timestamp header) 'face header)
-                      'leman-room-timestamp)))))))
+                      'leman-room-timestamp))))
+      ;; With alignment disabled, the timestamp follows the name.
+      (let ((leman-room-timestamp-align-right nil))
+        (erase-buffer)
+        (leman-room--pp-thing (leman-room--make-sender-header event))
+        (should (equal (substring-no-properties (buffer-string))
+                       (format "\nVincent  %s"
+                               (format-time-string leman-room-timestamp-format
+                                                   1694000000))))))))
+
+(ert-deftest leman-room--timestamp-shows-day-when-not-today ()
+  "Older events' timestamps are qualified with their day."
+  (let* ((sender (make-leman-user :id "@vv:x.org" :displayname "Vincent"))
+         (event (make-leman-event :sender sender :origin-server-ts 1694000000000))
+         (leman-room-user-avatars nil)
+         (leman-room (make-leman-room :id "!room:example.com"))
+         (leman-session (make-leman-session :user (make-leman-user :id "@me:x.org"))))
+    (with-temp-buffer
+      (leman-room--pp-thing (leman-room--make-sender-header event))
+      (let* ((header (buffer-string))
+             ;; The fixture's timestamp is neither today nor yesterday.
+             (expected (concat (format-time-string "%a %d %b" 1694000000)
+                               " "
+                               (format-time-string leman-room-timestamp-format 1694000000))))
+        (should (string-match-p (regexp-quote expected) header))
+        ;; The full date is still available in the tooltip.
+        (should (string-match-p (format-time-string "%Y-%m-%d %H:%M:%S" 1694000000)
+                                (get-text-property (string-match-p expected header)
+                                                   'help-echo header)))))))
 
 (ert-deftest leman-room--thread-event-uses-sender-header ()
   "Thread events use the timeline's avatar and timestamp styling."
@@ -1009,7 +1596,8 @@ used, and plaintext messages get no marker."
                                   :content '((msgtype . "m.text") (body . "hello"))))
          (leman-room (make-leman-room :id "!room:example.com"))
          (leman-session (make-leman-session :user (make-leman-user :id "@me:x.org")))
-         (leman-room-timestamp-format "%H:%M:%S"))
+         (leman-room-timestamp-format "%H:%M:%S")
+         (leman-room-timestamp-show-day nil))
     (cl-letf (((symbol-function 'leman-room--user-avatar)
                (lambda (_user _session) "avatar ")))
       (with-temp-buffer
@@ -1017,8 +1605,11 @@ used, and plaintext messages get no marker."
         (let* ((thread-event (buffer-string))
                (timestamp (format-time-string leman-room-timestamp-format 1694000000))
                (timestamp-pos (string-match-p timestamp thread-event)))
+          ;; The header itself starts with a newline (the breathing
+          ;; room above timeline headers); --insert-thread-event adds
+          ;; its own, so there are two at the start of the buffer.
           (should (equal (substring-no-properties thread-event)
-                         (format "\navatar Vincent  %s\nhello\n" timestamp)))
+                         (format "\n\navatar Vincent %s\nhello\n" timestamp)))
           (should (eq (get-text-property timestamp-pos 'face thread-event)
                       'leman-room-timestamp)))))))
 
@@ -1421,11 +2012,16 @@ duplicate requests (as in `leman-room--fetch-html-image')."
                        callbacks)
                  nil))
               ((symbol-function #'leman-room--redisplay) #'ignore))
-      ;; No data yet: nothing to display, and a fetch is queued.
-      (should (equal (leman-room--user-avatar user session) ""))
+      ;; No data yet: a blank placeholder of the avatar's size is
+      ;; shown (the avatar plus its trailing space), and a fetch is
+      ;; queued.
+      (let ((avatar (leman-room--user-avatar user session)))
+        (should (equal avatar "  "))
+        (should (eq (car-safe (get-text-property 0 'display avatar)) 'space)))
       (should (= fetches 1))
       ;; Re-rendering while the fetch is in flight does not re-fetch.
-      (should (equal (leman-room--user-avatar user session) ""))
+      (should (equal (leman-room--user-avatar user session)
+                     (leman-room--user-avatar-placeholder)))
       (should (= fetches 1))
       ;; When the data arrives, it is stored on the user and displayed.
       (funcall (caar callbacks) "\x89PNG\r\n\x1a\npixels")
@@ -1436,10 +2032,12 @@ duplicate requests (as in `leman-room--fetch-html-image')."
                                                    0 'display avatar))
                                                   :data))))
       ;; A failed fetch marks the avatar as unavailable: no more
-      ;; fetches for this user this session.
+      ;; fetches for this user this session, and a placeholder is shown.
       (funcall (cdar callbacks) 'error)
       (should (equal (leman-user-avatar user) ""))
-      (should (equal (leman-room--user-avatar user session) ""))
+      (let ((avatar (leman-room--user-avatar user session)))
+        (should (equal avatar "  "))
+        (should (eq (car-safe (get-text-property 0 'display avatar)) 'space)))
       (should (= fetches 1)))))
 
 (ert-deftest leman-room--user-avatar-disabled ()
@@ -1455,6 +2053,56 @@ duplicate requests (as in `leman-room--fetch-html-image')."
                  (cl-incf fetches) nil)))
       (should (equal (leman-room--user-avatar user nil) ""))
       (should (= fetches 0)))))
+
+(ert-deftest leman-room--avatar-gutter-indent ()
+  "With sender headers and avatars, message bodies are indented
+past the avatar so nothing appears below it; the indent is not
+applied when the sender is shown inline, margins are used, or
+avatars are disabled."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (leman-room room)
+         (leman-session (make-leman-session :user (make-leman-user :id "@me:x.org")))
+         (event (make-leman-event :id "$e" :type "m.room.message"
+                                  :sender (make-leman-user :id "@other:x.org")
+                                  :origin-server-ts 1694000000000
+                                  :content '((msgtype . "m.text")
+                                             (body . "hello world")))))
+    (cl-letf (((symbol-function #'display-images-p) (lambda (&optional _) t))
+              ((symbol-function #'window-font-height) (lambda (&optional _ _face) 20))
+              ((symbol-function #'frame-char-width) (lambda (&optional _frame) 10)))
+      (let ((leman-room-sender-headers t)
+            (leman-room-sender-in-headers t)
+            (leman-room-user-avatars t))
+        ;; Header-style layout: both line and wrap prefixes indent by
+        ;; the avatar's width (2 lines of 20px at 10px per column)
+        ;; plus the space following it.
+        (let ((body (leman-room--format-message-body event leman-session)))
+          (should (equal body "hello world"))
+          (dolist (property '(line-prefix wrap-prefix))
+            (let ((prefix (get-text-property 0 property body)))
+              (should (equal prefix " "))
+              (should (equal (get-text-property 0 'display prefix)
+                             '(space :width 5.0))))))
+        ;; An inline sender disables the indent.
+        (let ((leman-room--format-spec-active "%S> %B"))
+          (let ((body (leman-room--format-message-body event leman-session)))
+            (should-not (get-text-property 0 'line-prefix body))
+            (should (equal (get-text-property 0 'wrap-prefix body)
+                           leman-room-body-wrap-prefix))))
+        ;; A left margin disables the indent.
+        (let ((leman-room--format-spec-active "%L%B"))
+          (let ((body (leman-room--format-message-body event leman-session)))
+            (should-not (get-text-property 0 'line-prefix body))
+            (should (equal (get-text-property 0 'wrap-prefix body)
+                           leman-room-body-wrap-prefix)))))
+      ;; Avatars disabled: no indent, only the plain wrap-prefix.
+      (let ((leman-room-sender-headers t)
+            (leman-room-sender-in-headers t)
+            (leman-room-user-avatars nil))
+        (let ((body (leman-room--format-message-body event leman-session)))
+          (should-not (get-text-property 0 'line-prefix body))
+          (should (equal (get-text-property 0 'wrap-prefix body)
+                         leman-room-body-wrap-prefix)))))))
 
 (ert-deftest leman-room--member-event-updates-avatar-url ()
   "Member events keep the user's avatar URL current.

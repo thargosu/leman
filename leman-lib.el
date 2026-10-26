@@ -1571,10 +1571,14 @@ IMAGE should be one as created by, e.g. `create-image'."
 (defun leman--room-at-point ()
   "Return room at point.
 Works in major-modes `leman-room-mode',
-`leman-tabulated-room-list-mode', and `leman-room-list-mode'."
+`leman-tabulated-room-list-mode', `leman-room-list-mode', and
+`leman-inbox-mode'."
   (pcase major-mode
     ('leman-room-mode leman-room)
     ('leman-tabulated-room-list-mode (tabulated-list-get-id))
+    ('leman-inbox-mode
+     (when-let ((item (get-text-property (point) 'leman-inbox-item)))
+       (elt item 0)))
     ('leman-room-list-mode
      (cl-typecase (oref (magit-current-section) value)
        (taxy-magit-section nil)

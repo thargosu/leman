@@ -186,6 +186,33 @@ avatar is shown.  Set to nil to send no icon."
     (push-button)
     (call-interactively #'leman-room-write-reply)))
 
+(defun leman-notify-show (event room session)
+  "Show EVENT in ROOM on SESSION, raising a frame if necessary.
+Used as the desktop notification's default action, and may be
+called, e.g. from custom notification actions."
+  (with-demoted-errors "leman-notify: Error showing event: %S"
+    (leman-notify--raise-frame)
+    (leman-view-room room session)
+    (with-current-buffer (alist-get 'buffer (leman-room-local room))
+      (condition-case nil
+          (leman-room-goto-event event)
+        (error (message "Leman: Event is not in the buffer (it may be too old)"))))))
+
+(defun leman-notify--raise-frame ()
+  "Raise and focus a frame in which to show a notification's room.
+Prefers the selected frame when it is visible, so that, e.g., a
+daemonized Emacs raises the frame the user was last using."
+  (let* ((frames (cl-loop for frame in (frame-list)
+                          when (and (frame-live-p frame)
+                                    (frame-visible-p frame)
+                                    (not (frame-parameter frame 'minibuffer-only)))
+                          collect frame))
+         (frame (or (car (memq (selected-frame) frames))
+                    (car frames))))
+    (when frame
+      (raise-frame frame)
+      (select-frame-set-input-focus frame))))
+
 (defun leman-notify-switch-to-notifications-buffer ()
   "Switch to \"*Leman Notifications*\" buffer."
   (declare (function leman-notifications "leman-notifications"))
@@ -272,7 +299,7 @@ If ROOM has no existing buffer, do nothing."
                                                (b-pos))))))))))
       (mark-frame-urgent frame))))
 
-(defun leman-notify--notifications-notify (event room _session)
+(defun leman-notify--notifications-notify (event room session)
   "Call `notifications-notify' for EVENT in ROOM on SESSION."
   (pcase-let* (((cl-struct leman-event sender content) event)
                ((cl-struct leman-room avatar (display-name room-displayname)) room)
@@ -299,10 +326,14 @@ If ROOM has no existing buffer, do nothing."
                             :sound-name (when (and leman-notify-sound
                                                    (not (file-name-absolute-p leman-notify-sound)))
                                           leman-notify-sound)
-                            ;; TODO: Show when action used.
-                            ;; :actions '("default" "Show")
-                            ;; :on-action #'leman-notify-show
-                            ))))
+                            ;; Activating the notification (the
+                            ;; "default" action is invoked when the
+                            ;; notification itself is clicked) shows
+                            ;; the message in Emacs.
+                            :actions '("default" "Show in Emacs")
+                            :on-action (lambda (_id action)
+                                         (when (equal action "default")
+                                           (leman-notify-show event room session)))))))
 
 (cl-defun leman-notify--temp-file (content &key (timeout 5))
   "Return a filename holding CONTENT, and delete it after TIMEOUT seconds."

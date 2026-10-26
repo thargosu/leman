@@ -397,6 +397,11 @@ reopened for existing messages to be rendered accordingly."
   "Membership events (join/part)."
   :group 'leman-room-faces)
 
+(defface leman-room-day-separator
+  '((t (:inherit font-lock-comment-face :height 0.9)))
+  "Day separator lines in room buffers."
+  :group 'leman-room-faces)
+
 (defface leman-room-reactions
   '((t (:inherit font-lock-comment-face :height 0.9)))
   "Reactions to messages (including the user count)."
@@ -490,6 +495,15 @@ this one automatically."
   "Maximum height in pixels of room avatars shown in header lines."
   :type 'integer)
 
+(defcustom leman-room-membership-summary-max-names 3
+  "Maximum names shown per type in a membership summary.
+When more users than this match a summary type (e.g. \"joined\"),
+only this many names are shown, followed by \"and N more\"; the
+full list is available in the summary's help-echo.  Summaries
+list every name when nil."
+  :type '(choice (integer :tag "Maximum names shown")
+                 (const :tag "Show every name" nil)))
+
 (defcustom leman-room-coalesce-events 100
   "Coalesce certain events in room buffers.
 For example, membership events can be overwhelming in large
@@ -538,12 +552,21 @@ See Info node `(elisp)Header lines'."
   "Suffix for Leman room buffer names."
   :type 'string)
 
-(defcustom leman-room-timestamp-format "%H:%M:%S"
+(defcustom leman-room-timestamp-format "%H:%M"
   "Format string for event timestamps.
 See function `format-time-string'."
-  :type '(choice (const "%H:%M:%S")
+  :type '(choice (const "%H:%M")
+                 (const "%H:%M:%S")
                  (const "%Y-%m-%d %H:%M:%S")
                  string))
+
+(defcustom leman-room-timestamp-show-day t
+  "Qualify event timestamps with the day when it is not today.
+Since a time-only format like \"%H:%M\" gives no temporal context
+when scrolling through a backlog, older events show, e.g.,
+\"Yesterday 17:07\" or \"Tue 21 Oct 09:31\".  Has no effect when
+`leman-room-timestamp-format' already includes a date."
+  :type 'boolean)
 
 (defcustom leman-room-left-margin-width 0
   "Width of left margin in room buffers.
@@ -565,6 +588,41 @@ Raise it to show longer sender display names in full."
   "Show sender headers.
 Automatically set by setting `leman-room-message-format-spec',
 but may be overridden manually."
+  :type 'boolean)
+
+(defcustom leman-room-sender-header-time-gap 60
+  "Re-show a sender header after this many minutes of silence.
+When the same sender's consecutive messages are separated by more
+than this many minutes, a new header (bearing the later timestamp)
+is shown, like Slack's grouping.  Nil never re-shows a header for
+the same sender."
+  :type '(choice (integer :tag "Minutes of silence")
+                 (const :tag "Never re-show" nil)))
+
+(defcustom leman-room-timestamp-align-right t
+  "Align the timestamp in sender headers to the right edge.
+Sender headers show the sender's name on the left, and the
+timestamp at the right edge of the window, as in other chat
+clients.  Nil shows the timestamp directly after the name."
+  :type 'boolean)
+
+(defcustom leman-room-seen-indicator t
+  "Show an indicator when others have read the latest own message.
+The marker (a check mark, with the readers' names in its tooltip)
+is shown in the sender header of the session user's latest
+message, and moves to newer messages as they are sent or read."
+  :type 'boolean)
+
+(defcustom leman-room-day-separators t
+  "Separate days in room buffers with a divider line."
+  :type 'boolean)
+
+(defcustom leman-room-shield-in-headers t
+  "Show encryption shields in sender headers rather than on messages.
+Verified and plaintext markers are shown only in the sender
+header; red and grey warning shields still lead the message
+itself, where they demand attention.  Nil shows a shield on every
+message line."
   :type 'boolean)
 
 (defcustom leman-room-unread-only-counts-notifications t
@@ -1006,10 +1064,13 @@ HTML-formatted message bodies (which includes most replies)."
   :type '(choice (const :tag "Disable variable-pitch fonts" nil)
                  (const :tag "Enable variable-pitch fonts" t)))
 
-(defcustom leman-room-username-display-property '(raise -0.25)
+(defcustom leman-room-username-display-property nil
   "Display property applied to username strings.
-See Info node `(elisp)Other Display Specs'."
-  :type '(choice (list :tag "Raise" (const :tag "Raise" raise) (number :tag "Factor"))
+See Info node `(elisp)Other Display Specs'.  By default none:
+usernames sit on the text baseline, which keeps them vertically
+centered against their avatar."
+  :type '(choice (const :tag "None" nil)
+                 (list :tag "Raise" (const :tag "Raise" raise) (number :tag "Factor"))
                  (list :tag "Height" (const height)
                        (choice (list :tag "Larger" (const :tag "Larger" +) (number :tag "Steps"))
                                (list :tag "Smaller" (const :tag "Smaller" -) (number :tag "Steps"))
@@ -1017,7 +1078,7 @@ See Info node `(elisp)Other Display Specs'."
                                (function :tag "Function")
                                (sexp :tag "Form"))) ))
 
-(defcustom leman-room-event-separator-display-property '(space :ascent 50)
+(defcustom leman-room-event-separator-display-property '(space :ascent 75)
   "Display property applied to invisible space string after events.
 Allows visual separation between events without, e.g. inserting
 newlines.
@@ -1267,6 +1328,11 @@ room, and the session.  See macro
 (defvar leman-room--format-message-wrap-prefix nil
   "Set by margin-related event formatters.")
 
+(defvar leman-room--format-spec-active nil
+  "Format spec being expanded by `leman-room--format-message'.
+Bound to nil when an event body is formatted directly (e.g. in
+thread buffers), which implies a header-style layout.")
+
 (defmacro leman-room-define-event-formatter (char docstring &rest body)
   "Define an event formatter for CHAR with DOCSTRING and BODY.
 BODY is wrapped in a lambda form that binds `event', `room', and
@@ -1400,7 +1466,7 @@ spec) without requiring all events to use the same margin width."
         ;; Sender in left margin, after the shield marker: pad or
         ;; truncate so the whole margin content fits exactly.
         (let ((margin-width (- leman-room-left-margin-width
-                               (if (leman-room--shield-p event) 1 0))))
+                               (if (leman-room--line-shield-p event) 1 0))))
           (setf sender
                 (if (< (string-width sender) margin-width)
                     ;; Using :align-to or :width space display properties doesn't
@@ -1430,11 +1496,22 @@ spec) without requiring all events to use the same margin width."
 (leman-room-define-event-formatter ?t
   "Timestamp."
   (ignore room session)
-  (propertize (format-time-string leman-room-timestamp-format ;; Timestamps are in milliseconds.
-                                  (/ (leman-event-origin-server-ts event) 1000))
-              'face 'leman-room-timestamp
-              'help-echo (format-time-string "%Y-%m-%d %H:%M:%S"
-                                             (/ (leman-event-origin-server-ts event) 1000))))
+  (let* ((seconds (/ (leman-event-origin-server-ts event) 1000))
+         (format leman-room-timestamp-format))
+    (when (and leman-room-timestamp-show-day
+               ;; Only qualify time-only formats; a format that
+               ;; already shows a date needs no qualification.
+               (not (string-match-p "%Y\\|%B\\|%b\\|%d" format)))
+      (let ((days (- (time-to-days (seconds-to-time seconds))
+                     (time-to-days nil))))
+        (setf format (pcase days
+                       (0 format)
+                       (1 (concat "Yesterday " format))
+                       (_ (concat "%a %d %b " format))))))
+    (propertize (format-time-string format seconds)
+                'face 'leman-room-timestamp
+                'help-echo (format-time-string "%Y-%m-%d %H:%M:%S"
+                                               seconds))))
 
 (defconst leman-room-variable-pitch-face (or (and (facep 'shr-text) 'shr-text)
                                              'variable-pitch)
@@ -1802,6 +1879,7 @@ option."
                               ;; Return non-nil for nodes that should stay.
                               (not (or (leman-user-p node-data)
                                        (leman-room-sender-header-p node-data))))))
+  (leman-room--insert-day-separators leman-ewoc)
   (ewoc-refresh leman-ewoc))
 
 (defun leman-room-set-topic (session room topic)
@@ -2652,6 +2730,8 @@ Uses action `leman-view-room-display-buffer-action', which see."
                  :predicate (lambda (room)
                               (not (leman--space-p room)))))
   (pcase-let* (((cl-struct leman-room (local (map buffer))) room))
+    ;; Viewing the room consumes its pings.
+    (map-delete (leman-room-local room) 'pings)
     (unless (buffer-live-p buffer)
       (setf buffer (leman-room--buffer session room (leman-room--buffer-name room))
             (alist-get 'buffer (leman-room-local room))  buffer))
@@ -3035,6 +3115,7 @@ data slot."
           (leman-room--process-events (reverse (leman-room-timeline room)))
           (when leman-room-sender-in-headers
             (leman-room--insert-sender-headers leman-ewoc))
+          (leman-room--insert-day-separators leman-ewoc)
           (leman-room-move-read-markers room
             :read-event (when-let ((event (alist-get "m.read" (leman-room-account-data room) nil nil #'equal)))
                           (map-nested-elt event '(content event_id)))
@@ -3250,10 +3331,7 @@ function to `leman-room-event-fns', which see."
     (pcase rel-type
       ("m.annotation"
        ;; Look for related event in timeline.
-       (if-let ((related-event (cl-loop with fake-event = (make-leman-event :id related-id)
-                                        for timeline-event in (leman-room-timeline leman-room)
-                                        when (leman--events-equal-p fake-event timeline-event)
-                                        return timeline-event)))
+       (if-let ((related-event (leman-room--event-for-id related-id leman-room)))
            ;; Found related event: add reaction to local slot and invalidate node.
            (progn
              ;; Every time a room buffer is made, these reaction events are processed again, so we use pushnew to
@@ -3302,17 +3380,18 @@ function to `leman-room-event-fns', which see."
                    (user-displayname (if changed-user
                                          (leman--user-displayname-in room changed-user)
                                        changed-user-id)))
-        (leman-room-wrap-prefix
-          (if (not changed-user)
-              (format "%s sent a power-level event"
-                      (propertize sender-displayname
-                                  'help-echo sender-id))
-            (format "%s set %s's power level to %s"
-                    (propertize sender-displayname
-                                'help-echo sender-id)
-                    (propertize user-displayname 'help-echo changed-user-id)
-                    new-level))
-          'face 'leman-room-membership)))))
+        (leman-room--indent
+         (leman-room-wrap-prefix
+           (if (not changed-user)
+               (format "%s sent a power-level event"
+                       (propertize sender-displayname
+                                   'help-echo sender-id))
+             (format "%s set %s's power level to %s"
+                     (propertize sender-displayname
+                                 'help-echo sender-id)
+                     (propertize user-displayname 'help-echo changed-user-id)
+                     new-level))
+           'face 'leman-room-membership))))))
 
 (leman-room-defevent "m.room.canonical_alias"
   (leman-room--insert-event event))
@@ -3324,12 +3403,13 @@ function to `leman-room-event-fns', which see."
                           ;; TODO: Include old alias when it is being replaced.
                           (content (map alias)))
                event))
-    (leman-room-wrap-prefix
-      (format "%s set the canonical alias to <%s>"
-              (propertize (leman--user-displayname-in room sender)
-                          'help-echo (leman-user-id sender))
-              alias)
-      'face 'leman-room-membership)))
+    (leman-room--indent
+     (leman-room-wrap-prefix
+       (format "%s set the canonical alias to <%s>"
+               (propertize (leman--user-displayname-in room sender)
+                           'help-echo (leman-user-id sender))
+               alias)
+       'face 'leman-room-membership))))
 
 (leman-room-defevent "m.room.redaction"
   ;; We handle redaction events here rather than an `leman-defevent' handler.  This way we
@@ -3425,6 +3505,7 @@ function to `leman-room-event-fns', which see."
                            collect (leman--user-displayname-in leman-room user)
                            else collect id)))
     (with-silent-modifications
+      (setf (map-elt (leman-room-local leman-room) 'typing) names)
       (ewoc-set-hf leman-ewoc "" (leman-room--typing-footer names leman-room)))))
 
 (leman-room-defevent "m.room.avatar"
@@ -3486,7 +3567,15 @@ function to `leman-room-event-fns', which see."
           (replaced-by-id
            (leman-debug "Event replaced: not inserting." replaced-by-id))
           ;; Not replaced: insert it.
-          (t (leman-room--insert-event event)))))
+          (t (when (leman-room--own-visible-message-p event
+                          (leman-user-id (leman-session-user leman-session)))
+               ;; The previous own message's seen marker moves to this
+               ;; one: re-render its header.
+               (leman-room--refresh-seen-marker leman-room))
+             (leman-room--insert-event event)
+             (when (leman-room--event-ping-p event leman-room leman-session)
+               ;; Record the ping for the inbox's badge.
+               (cl-incf (map-elt (leman-room-local leman-room) 'pings 0)))))))
 
 (leman-room-defevent "m.room.tombstone"
   (pcase-let* (((cl-struct leman-event content) event)
@@ -3874,6 +3963,15 @@ the first and last nodes in the buffer, respectively."
                       (not (equal sender (leman-event-sender (ewoc-data prev-node)))))
                  ;; Previous node is a message from a different sender: insert header.
                  (ewoc-enter-before ewoc event-node
+                                    (leman-room--make-sender-header (ewoc-data event-node))))
+                ((and (message-event-p (ewoc-data prev-node))
+                      leman-room-sender-header-time-gap
+                      (> (- (leman-event-origin-server-ts (ewoc-data event-node))
+                            (leman-event-origin-server-ts (ewoc-data prev-node)))
+                         (* leman-room-sender-header-time-gap 60000)))
+                 ;; Same sender after a long silence: show the header
+                 ;; again, so the new timestamp is visible.
+                 (ewoc-enter-before ewoc event-node
                                     (leman-room--make-sender-header (ewoc-data event-node))))))
         (setf event-node (leman-room--ewoc-next-matching ewoc event-node #'message-event-p))))))
 
@@ -4006,6 +4104,11 @@ Return absorbing node if coalesced."
                            new-node)))
       (when leman-room-sender-in-headers
         (leman-room--insert-sender-headers ewoc new-node new-node))
+      ;; NOTE: A full rescan: coalescing may have deleted nodes a
+      ;; divider preceded, leaving it stale; rescanning the whole
+      ;; buffer removes such dividers and re-inserts them correctly,
+      ;; whatever the arrival order was.
+      (leman-room--insert-day-separators ewoc)
       ;; Return new node.
       new-node)))
 
@@ -4071,15 +4174,192 @@ Search from FROM (either `first' or `last')."
 
 ;;;;; Formatting
 
+(cl-defstruct (leman-room-day-separator
+               (:constructor leman-room--make-day-separator (ts)))
+  "A divider marking the start of a new day in the timeline.
+TS is the timestamp, in milliseconds, of the first event of the
+day."
+  ts)
+
+(defun leman-room--node-day (data)
+  "Return the day number of node datum DATA's timestamp.
+DATA may be an event or a membership-events node."
+  (time-to-days (/ (leman-room--node-ts data) 1000)))
+
+(defun leman-room--day-separator-label (ts)
+  "Return the label for the day containing timestamp TS."
+  (pcase (- (time-to-days (/ ts 1000)) (time-to-days nil))
+    (0 "Today")
+    (1 "Yesterday")
+    (_ (format-time-string "%A %d %B" (/ ts 1000)))))
+
+(cl-defun leman-room--insert-day-separators
+    (ewoc &optional (start-node (ewoc-nth ewoc 0)) (end-node (ewoc-nth ewoc -1)))
+  "Insert day divider nodes into EWOC between START-NODE and END-NODE.
+A divider is inserted before the first event of each day.  Any
+existing dividers in the range are removed first, so the pass is
+idempotent."
+  (when (and leman-room-day-separators start-node)
+    ;; The buffer is read-only, and `ewoc-delete' below removes text
+    ;; without inhibiting that itself.
+    (let ((inhibit-read-only t))
+      ;; Remove existing dividers in the range; they are re-inserted
+      ;; where the dates still differ.
+      (let ((node start-node) stale)
+        (while (and node (not (eq node end-node)))
+          (when (leman-room-day-separator-p (ewoc-data node))
+            (push node stale))
+          (setf node (ewoc-next ewoc node)))
+        (dolist (node stale)
+          (ewoc-delete ewoc node)))
+      (when end-node
+        ;; Set end node to the first event after it, so the loop runs
+        ;; through the next event (mirroring
+        ;; `leman-room--insert-sender-headers').
+        (setf end-node (leman-room--ewoc-next-matching ewoc end-node #'leman-event-p)))
+      (let ((node start-node) last-day)
+        ;; The day of the last timestamped node before the range, so a
+        ;; new event inserted into an older or newer day gets its
+        ;; divider.
+        (setf last-day
+              (cl-block nil
+                (cl-loop for node = (ewoc-prev ewoc start-node) then (ewoc-prev ewoc node)
+                         while node
+                         for data = (ewoc-data node)
+                         when (leman-room--timestamped-node-p data)
+                         do (cl-return (leman-room--node-day data)))))
+        (while (and node (not (eq node end-node)))
+          (when (leman-room--timestamped-node-p (ewoc-data node))
+            (let ((day (leman-room--node-day (ewoc-data node))))
+              (when (and last-day (/= day last-day))
+                ;; Insert above the event's sender header (if any), so
+                ;; the divider does not come between a header and its
+                ;; message.
+                (let ((insert-at node))
+                  (cl-loop for prev = (ewoc-prev ewoc insert-at)
+                           while (and prev (or (leman-room-sender-header-p (ewoc-data prev))
+                                               (leman-user-p (ewoc-data prev))))
+                           do (setf insert-at prev))
+                  (ewoc-enter-before ewoc insert-at
+                                     (leman-room--make-day-separator
+                                      (leman-room--node-ts (ewoc-data node))))))
+              (setf last-day day)))
+          (setf node (ewoc-next ewoc node)))))))
+
+(defun leman-room--display-width (string)
+  "Return the display width of STRING in columns.
+Accounts for image display specifications, e.g. the shield's."
+  (declare (function image-size "image"))
+  (or (when-let* ((display (get-text-property 0 'display string))
+                  ((and (consp display) (eq (car display) 'image)))
+                  ((display-images-p)))
+        (ceiling (/ (car (image-size display t))
+                    (float (frame-char-width)))))
+      (string-width string)))
+
+(defun leman-room--own-visible-message-p (event my-id)
+  "Return non-nil when EVENT is MY-ID's own displayable message.
+That is, a \"m.room.message\" event that is neither an edit nor a
+thread reply (neither shows as its own line in the timeline)."
+  (and (equal (leman-event-type event) "m.room.message")
+       (equal (leman-user-id (leman-event-sender event)) my-id)
+       (not (member (map-nested-elt (leman-event-content event)
+                                    '(m.relates_to rel_type))
+                    '("m.replace" "m.thread")))))
+
+(defun leman-room--seen-users (event room session)
+  "Return the user IDs who have read up to EVENT in ROOM on SESSION.
+A read receipt counts when it points at EVENT or at any later
+event in ROOM's timeline (the timeline is ordered latest-first)."
+  (when-let* ((my-index (cl-position (leman-event-id event)
+                                     (leman-room-timeline room)
+                                     :key #'leman-event-id :test #'equal))
+              (my-id (leman-user-id (leman-session-user session)))
+              (readers (make-hash-table :test #'equal)))
+    (cl-loop for user-id being the hash-keys of (leman-room-receipts room)
+             using (hash-value receipt)
+             unless (equal user-id my-id)
+             do (cl-pushnew user-id (gethash (car receipt) readers nil)
+                            :test #'equal))
+    (cl-loop for index from 0
+             for other in (leman-room-timeline room)
+             while (<= index my-index)
+             nconc (gethash (leman-event-id other) readers))))
+
+(defun leman-room--format-seen (event room session)
+  "Return the seen-indicator string for EVENT in ROOM on SESSION.
+The marker is shown only on SESSION user's latest message, and
+only when at least one other member's read receipt covers it."
+  (when-let* ((my-id (leman-user-id (leman-session-user session)))
+              ((equal (leman-user-id (leman-event-sender event)) my-id))
+              ;; Only the latest own message gets the marker.
+              (latest (cl-loop for other in (leman-room-timeline room)
+                               when (leman-room--own-visible-message-p other my-id)
+                               return other))
+              ((equal (leman-event-id latest) (leman-event-id event)))
+              (user-ids (leman-room--seen-users event room session))
+              ((not (null user-ids))))
+    (let ((names (mapcar (lambda (user-id)
+                           (or (when-let ((user (gethash user-id leman-users)))
+                                 (leman--user-displayname-in room user))
+                               user-id))
+                         user-ids)))
+      (propertize (if (cdr user-ids) (format " ✓%d" (length user-ids)) " ✓")
+                  'face 'leman-room-timestamp
+                  'help-echo (concat "Seen by " (string-join names ", "))))))
+
 (defun leman-room--format-sender-header (event session)
   "Return the sender header for EVENT on SESSION."
-  (let ((sender (leman-event-sender event)))
-    (concat (leman-room--user-avatar sender session)
+  (let* ((sender (leman-event-sender event))
+         (timestamp (funcall (alist-get ?t leman-room-event-formatters)
+                             event leman-room session))
+         (seen (when leman-room-seen-indicator
+                 (leman-room--format-seen event leman-room leman-session)))
+         (shield (let ((shield (and (leman-room--shield-in-headers-p)
+                                    (leman-room--format-shield event leman-room))))
+                   (unless (or (null shield) (string-empty-p shield))
+                     (concat " " shield)))))
+    ;; The leading newline gives the header its own blank row above:
+    ;; event text does not end with a newline (events are separated
+    ;; by an invisible display space), and the avatar image would
+    ;; otherwise share the last row of the previous message.
+    (concat "\n"
+            (leman-room--user-avatar sender session)
             (propertize (leman--format-user sender)
                         'display leman-room-username-display-property)
-            "  "
-            (funcall (alist-get ?t leman-room-event-formatters)
-                     event leman-room session))))
+            ;; With `leman-room-timestamp-align-right', the timestamp
+            ;; (with the seen marker and shield) sits at the right
+            ;; edge of the window, as in other chat clients; the
+            ;; display space stretches to push it there.
+            (if leman-room-timestamp-align-right
+                (propertize
+                 " " 'display
+                 `(space :align-to (- right ,(+ (leman-room--display-width timestamp)
+                                                (if seen (string-width seen) 0)
+                                                (if shield
+                                                    (leman-room--display-width shield)
+                                                  0)))))
+              "  ")
+            timestamp
+            (or seen "")
+            (or shield ""))))
+
+(defun leman-room--refresh-seen-marker (room)
+  "Re-render the sender header of ROOM's latest own message.
+The seen marker only appears on the latest own message, so its
+header must be re-rendered when a new message is sent or a read
+receipt arrives."
+  (when-let* ((buffer (map-elt (leman-room-local room) 'buffer))
+              ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (when-let* ((my-id (leman-user-id (leman-session-user leman-session)))
+                  (node (leman-room--ewoc-last-matching leman-ewoc
+                          (lambda (data)
+                            (and (leman-event-p data)
+                                 (leman-room--own-visible-message-p data my-id)))))
+                  (header-node (ewoc-prev leman-ewoc node))
+                  ((leman-room-sender-header-p (ewoc-data header-node))))
+        (ewoc-invalidate leman-ewoc header-node)))))
 
 (defun leman-room--pp-thing (thing)
   "Pretty-print THING.
@@ -4110,11 +4390,22 @@ struct."
      (insert (propertize " "
                          'display '(space :width text :height (1))
                          'face thing)))
+    ((pred leman-room-day-separator-p)
+     (insert (propertize
+              ;; The trailing dashes stretch to the right edge of the
+              ;; window, so the divider spans it like in other chat
+              ;; clients.
+              (concat "  ────  "
+                      (leman-room--day-separator-label
+                       (leman-room-day-separator-ts thing))
+                      (propertize " " 'display '(space :align-to (- right 8)))
+                      "  ────  ")
+              'face 'leman-room-day-separator)))
     ((pred leman-room-membership-events-p)
      (let ((formatted-events (leman-room--format-membership-events thing leman-room)))
        (add-face-text-property 0 (length formatted-events)
                                'leman-room-membership 'append formatted-events)
-       (insert (leman-room-wrap-prefix formatted-events))))))
+       (insert (leman-room--indent (leman-room-wrap-prefix formatted-events)))))))
 
 ;; (defun leman-room--format-event (event)
 ;;   "Format `leman-event' EVENT."
@@ -4192,7 +4483,9 @@ Solid \"verified\", \"red\", and \"grey\" shields, and an outlined
               (svg-polygon svg leman-room--shield-points
                            :fill "none" :stroke color :stroke-width 2)
             (svg-polygon svg leman-room--shield-points :fill color))
-          (puthash key (svg-image svg :ascent 'center :max-height max-height)
+          ;; 83% ascent centers the ~0.9-line shield on the text
+          ;; (0.3 + 0.45 = 0.75 of the 0.9-line image = 83%).
+          (puthash key (svg-image svg :ascent 83 :max-height max-height)
                    leman-room--shield-images)))))
 
 (defun leman-room--shield (kind help)
@@ -4203,6 +4496,19 @@ Solid \"verified\", \"red\", and \"grey\" shields, and an outlined
   "Return non-nil when EVENT gets an authenticity marker."
   (or (alist-get 'shield (leman-event-local event))
       (equal (leman-event-type event) "m.room.message")))
+
+(defun leman-room--shield-in-headers-p ()
+  "Return non-nil when shields are shown in sender headers."
+  (and leman-room-shield-in-headers leman-room-sender-headers))
+
+(defun leman-room--line-shield-p (event)
+  "Return non-nil when EVENT's line leads with a shield marker.
+With `leman-room-shield-in-headers', only warning shields (red and
+grey) lead the line; the other states are shown in the sender
+header instead."
+  (or (not (leman-room--shield-in-headers-p))
+      (when-let ((shield (alist-get 'shield (leman-event-local event))))
+        (memq (car shield) '(red grey)))))
 
 (defun leman-room--format-shield (event room)
   "Return the authenticity marker for EVENT in ROOM.
@@ -4236,8 +4542,12 @@ displays, emojis are used instead, and plaintext gets no marker."
   "Return EVENT in ROOM on SESSION formatted.
 Formats according to `leman-room-message-format-spec', which see."
   (concat
-   ;; The shield leads the line, before the sender.
-   (leman-room--format-shield event room)
+   ;; The shield leads the line, before the sender.  With
+   ;; `leman-room-shield-in-headers', only warning shields (red and
+   ;; grey) lead the line; the rest appear in the sender header.
+   (if (leman-room--line-shield-p event)
+       (leman-room--format-shield event room)
+     "")
    (pcase (leman-event-type event)
      ;; TODO: Define these with a macro, like the defevent and format-spec ones.
      ("m.room.message" (leman-room--format-message event room session))
@@ -4250,11 +4560,12 @@ Formats according to `leman-room-message-format-spec', which see."
       ;; Handled by defevent-based handler.
       "")
      ("m.room.avatar"
-      (leman-room-wrap-prefix
-        (format "%s changed the room's avatar."
-                (propertize (leman--user-displayname-in room (leman-event-sender event))
-                            'help-echo (leman-user-id (leman-event-sender event))))
-        'face 'leman-room-membership))
+      (leman-room--indent
+       (leman-room-wrap-prefix
+         (format "%s changed the room's avatar."
+                 (propertize (leman--user-displayname-in room (leman-event-sender event))
+                             'help-echo (leman-user-id (leman-event-sender event))))
+         'face 'leman-room-membership)))
      ("m.room.power_levels"
       (leman-room--format-power-levels-event event room session))
      ("m.room.canonical_alias"
@@ -4263,16 +4574,18 @@ Formats according to `leman-room-message-format-spec', which see."
      ;; buffer: successfully decrypted ones are made into
      ;; events of their decrypted type before rendering.
      ("m.room.encrypted"
-      (leman-room-wrap-prefix
+      (leman-room--indent
+       (leman-room-wrap-prefix
         (format "%s sent an encrypted message (unable to decrypt)."
                 (propertize (leman--user-displayname-in room (leman-event-sender event))
                             'help-echo (leman-user-id (leman-event-sender event))))
-        'face 'leman-room-membership))
-     (_ (leman-room-wrap-prefix
+        'face 'leman-room-membership)))
+     (_ (leman-room--indent
+         (leman-room-wrap-prefix
           (format "[sender:%s type:%s]"
                   (leman-user-id (leman-event-sender event))
                   (leman-event-type event))
-          'help-echo (format "%S" (leman-event-content event)))))
+          'help-echo (format "%S" (leman-event-content event))))))
    (propertize " "
                'display leman-room-event-separator-display-property)))
 
@@ -4291,6 +4604,18 @@ For Unicode emoji, derive a readable shortcode from its Unicode name."
                             (get-char-code-property (string-to-char key) 'name))))
         (format ":%s:" (replace-regexp-in-string " " "_" (downcase name))))
       key))
+
+(defun leman-room--reaction-key-fallback (key room)
+  "Return a textual fallback for custom-emoji reaction KEY in ROOM.
+Used when KEY's image cannot be rendered (not yet fetched, or
+image display unavailable): show the emoji's shortcode, or a
+shortened media ID when KEY is not in the room's emoji pack."
+  (let ((short (leman-room--reaction-shortcode key room)))
+    (if (equal short key)
+        (format ":%s:" (if (string-match "\\`mxc://[^/]+/\\(.\\{1,8\\}\\)" key)
+                           (match-string 1 key)
+                         "emoji"))
+      short)))
 
 (defun leman-room--format-reactions (event room)
   "Return formatted reactions to EVENT in ROOM."
@@ -4322,10 +4647,18 @@ For Unicode emoji, derive a readable shortcode from its Unicode name."
        (format-reaction (ks)
           (pcase-let* ((`(,raw-key . ,senders) ks)
                        (key-image (reaction-image raw-key))
-                       (key (if key-image
-                                (propertize " " 'display key-image)
-                              (propertize raw-key 'face 'leman-room-reactions-key)))
-                       (count (propertize (format " (%s)" (length senders))
+                       (key (cond (key-image
+                                   (propertize " " 'display key-image))
+                                  ((string-prefix-p "mxc://" raw-key)
+                                   ;; Custom emoji whose image is
+                                   ;; unavailable: show its shortcode
+                                   ;; instead of the raw mxc URI.
+                                   (propertize
+                                    (leman-room--reaction-key-fallback raw-key room)
+                                    'face 'leman-room-reactions-key))
+                                  (t (propertize raw-key
+                                                 'face 'leman-room-reactions-key))))
+                       (count (propertize (format " %s" (length senders))
                                           'face 'leman-room-reactions))
                        (string
                         (propertize (concat key count)
@@ -4364,7 +4697,9 @@ For Unicode emoji, derive a readable shortcode from its Unicode name."
                   for sender = (leman-event-sender reaction)
                   do (push sender (alist-get key keys-senders nil nil #'string=))
                   finally do (setf keys-senders (cl-sort keys-senders #'> :key (lambda (pair) (length (cdr pair)))))
-                  finally return (concat "\n  " (mapconcat #'format-reaction keys-senders "  ")))
+                  finally return (concat "\n"
+                                         (or (leman-room--avatar-gutter-indent) "  ")
+                                         (mapconcat #'format-reaction keys-senders "  ")))
         "")))
 
 ;;;;; User avatars
@@ -4411,7 +4746,12 @@ to fit)."
             size size content-type
             (base64-encode-string data :nolinebreak))
     "</svg>")
-   :ascent 'center))
+   ;; 65% ascent centers a one-line text against the two-line
+   ;; avatar: the text's optical center sits ~0.3 lines above the
+   ;; baseline, so the image's ascent must be 0.3 + half its height
+   ;; (0.3 + 1.0 of a 2-line image = 65%).  With `center' the
+   ;; baseline lands at (font + image) / 2 and the text sags low.
+   :ascent 65))
 
 (defun leman-room--user-avatar-image (user)
   "Return the circular avatar image of USER, if available.
@@ -4457,19 +4797,55 @@ again for USER during this session)."
                (leman-debug "User avatar fetch failed:" plz-error))))))
 
 (defun leman-room--user-avatar (user session)
-  "Return USER's avatar string, or \"\" if there is none (yet).
+  "Return USER's avatar string, or a blank placeholder if there is none (yet).
 The avatar is fetched in the background the first time it is
-needed; it is displayed once the download completes."
+needed; it is displayed once the download completes.  When
+avatars are enabled but no image is available, a blank space of
+the same size is returned, so headers do not shift when the
+avatar arrives and senders' names stay aligned."
+  (when leman-room-user-avatars
+    ;; Fetch in the background the first time it is needed; a failed
+    ;; fetch marks the avatar as unavailable, ending further fetches.
+    (when (and (leman-user-avatar-url user)
+               (null (leman-user-avatar user))
+               (not (gethash (leman-user-id user)
+                             leman-room--fetching-user-avatars)))
+      (leman-room--fetch-user-avatar user session)))
   (or (when leman-room-user-avatars
-        (leman-room--user-avatar-image user))
-      (progn
-        (when (and leman-room-user-avatars
-                   (leman-user-avatar-url user)
-                   (null (leman-user-avatar user))
-                   (not (gethash (leman-user-id user)
-                                 leman-room--fetching-user-avatars)))
-          (leman-room--fetch-user-avatar user session))
-        "")))
+        (or (leman-room--user-avatar-image user)
+            (leman-room--user-avatar-placeholder)))
+      ""))
+
+(defun leman-room--user-avatar-placeholder ()
+  "Return a blank string occupying an avatar's width in the header."
+  (concat (propertize " " 'display
+                      `(space :width ,(/ (leman-room--user-avatar-size)
+                                         (float (frame-char-width)))))
+          " "))
+
+(defun leman-room--avatar-gutter-indent ()
+  "Return a display space indenting past the sender avatar, or nil.
+Non-nil when messages are displayed beneath sender headers with
+avatar images and their bodies begin at column 0 (i.e. the format
+spec shows neither an inline sender nor margins).  The space's
+width matches the avatar plus the space following it, so the
+message body aligns with the sender's name in the header above."
+  (when (and leman-room-sender-in-headers
+             leman-room-user-avatars
+             (display-images-p)
+             (or (null leman-room--format-spec-active)
+                 (not (string-match-p (rx (or "%S" "%s" "%L" "%W"))
+                                      leman-room--format-spec-active))))
+    (propertize " " 'display
+                `(space :width ,(+ 1.0 (/ (leman-room--user-avatar-size)
+                                          (float (frame-char-width))))))))
+
+(defun leman-room--indent (string)
+  "Return STRING indented past the sender avatar, when applicable.
+Otherwise return STRING unchanged."
+  (if-let ((indent (leman-room--avatar-gutter-indent)))
+      (concat indent string)
+    string))
 
 ;;;; Threads
 
@@ -4591,6 +4967,12 @@ string."
                                                          'leman-room-reactions)))
                        (propertize label 'face 'leman-room-reactions))))
           (concat
+           ;; On its own line: if the body ends with a tall element
+           ;; (like an image rendered as a multi-line display
+           ;; specification), an inline chip would be vertically
+           ;; centered against it and become hard to notice.
+           "\n"
+           (or (leman-room--avatar-gutter-indent) "  ")
            (leman--button-buttonize
             chip
             (lambda (_button) (leman-room-view-thread)))
@@ -4814,8 +5196,12 @@ returns nil, return a placeholder string."
 Format defaults to `leman-room-message-format-spec', which see."
   ;; Bind this locally so formatters can modify it for this call.
   (let ((leman-room--format-message-margin-p)
+        (leman-room--format-spec-active format)
         (left-margin-width leman-room-left-margin-width)
-        (right-margin-width leman-room-right-margin-width))
+        (right-margin-width leman-room-right-margin-width)
+        ;; Read in the calling buffer, which may have it set locally
+        ;; (e.g. by `leman-room-set-message-format').
+        (sender-in-headers leman-room-sender-in-headers))
     (cl-labels ((expand-format-spec ()
                   ;; Copied from `format-spec'.
                   (insert format)
@@ -4856,10 +5242,153 @@ Format defaults to `leman-room-message-format-spec', which see."
         ;; HACK: Setting these buffer-locally in a temp buffer is ugly.
         (setq-local leman-room-left-margin-width left-margin-width)
         (setq-local leman-room-right-margin-width right-margin-width)
+        (setq-local leman-room-sender-in-headers sender-in-headers)
         (expand-format-spec)
         ;; Propertize margin text.
         (leman-room--propertize-margins)
         (buffer-string)))))
+
+(defface leman-room-reply-quote
+  '((t (:inherit font-lock-comment-face)))
+  "Quoted original message in the reply context."
+  :group 'leman-room-faces)
+
+(defface leman-room-code-block
+  '((t (:background "grey12" :extend t)))
+  "Code blocks (<pre>) in message bodies.
+A slightly different background, as in other chat clients, so
+pasted console output and code read as a block.  The face
+extends to the end of each line, so the whole block, including
+its empty lines, is one contiguous panel."
+  :group 'leman-room-faces)
+
+(defface leman-room-edited
+  '((t (:inherit shadow :height 0.9)))
+  "The \"[edited]\" marker on edited messages."
+  :group 'leman-room-faces)
+
+(defface leman-room-mention
+  '((t (:weight bold :background "grey20")))
+  "Mentions in message bodies (users, aliases, and @room)."
+  :group 'leman-room-faces)
+
+(defun leman-room--mention-user-face (href)
+  "Return a face spec tinting the mention link HREF's user, or nil.
+HREF is a \"https://matrix.to/#/@user:server\" link; the face
+uses the user's prism color, like Element's mention pills."
+  (when-let* ((user-id (and (string-prefix-p "https://matrix.to/#/@" href)
+                            (substring href (length "https://matrix.to/#/"))))
+              (user (gethash user-id leman-users)))
+    (list :foreground (or (leman-user-color user)
+                          (setf (leman-user-color user)
+                                (leman--prism-color user))))))
+
+(defun leman-room--mention-face (href)
+  "Return the face spec for the matrix.to link HREF, or nil.
+HREF is a matrix.to link; user and alias mentions get
+`leman-room-mention' (tinted with the user's prism color for
+users).  Room-ID links are plain links: nil."
+  (when (and href
+             (string-prefix-p "https://matrix.to/#/" href)
+             ;; Room-ID links are plain links, not mentions.
+             (not (string-prefix-p "https://matrix.to/#/!" href)))
+    (if-let ((user-face (leman-room--mention-user-face href)))
+        (append '(:inherit leman-room-mention) user-face)
+      'leman-room-mention)))
+
+(defun leman-room--shr-face-region (fn dom face)
+  "Call shr's original tag handler FN on DOM, applying FACE.
+The face is appended to the text FN inserts, so any faces FN
+applies are preserved underneath."
+  (let ((beg (point-marker)))
+    (funcall fn dom)
+    (add-face-text-property beg (point) face 'append)))
+
+(defcustom leman-room-body-wrap-prefix "  "
+  "Indentation of lines wrapped within message bodies.
+Applied as the `wrap-prefix' display property, so only lines
+wrapped by the display engine are indented: lines that begin
+after a real newline (code blocks, ASCII art, tables) are left
+alone.  Nil or an empty string for no indentation."
+  :type '(choice string (const :tag "None" nil)))
+
+(defcustom leman-room-reply-snippet-max-width 64
+  "Maximum display width of quoted snippets in reply context."
+  :type 'integer)
+
+(defun leman-room--event-for-id (event-id room)
+  "Return the event with ID in ROOM's timeline, or nil."
+  (cl-loop with fake-event = (make-leman-event :id event-id)
+           for timeline-event in (leman-room-timeline room)
+           when (leman--events-equal-p fake-event timeline-event)
+           return timeline-event))
+
+(defun leman-room--format-reply-quote (event-id room &optional anchor)
+  "Return the reply-context quote lines for the event EVENT-ID in ROOM.
+When EVENT-ID is found in ROOM's timeline, quote the original
+message's sender and a one-line snippet of its body.  Otherwise
+(a bridge cross-post, or the original is not loaded), return a
+muted fallback line, using ANCHOR -- the anchor text of the
+message's own reply fallback -- when it is informative.
+The quote is a button that jumps to the original message."
+  (let ((face 'leman-room-reply-quote))
+    (if-let ((target (leman-room--event-for-id event-id room)))
+        (let* ((sender (leman--user-displayname-in room (leman-event-sender target)))
+               (content (leman-event-content target))
+               (raw-body (or (map-nested-elt content '(m.new_content body))
+                             (map-elt content 'body)
+                             ""))
+               ;; Nested replies quote their parent: drop that
+               ;; fallback line.
+               (raw-body (if (string-match "\\`> <[^>]*>[^\n]*\n" raw-body)
+                             (substring raw-body (match-end 0))
+                           raw-body))
+               (first-line (if (string-match "\n" raw-body)
+                               (substring raw-body 0 (match-beginning 0))
+                             raw-body))
+               (snippet (truncate-string-to-width
+                         first-line (1- leman-room-reply-snippet-max-width)
+                         nil nil "…"))
+               (string (concat (propertize (concat "┃ " sender) 'face face)
+                               "\n"
+                               (propertize (concat "┃ " snippet) 'face face
+                                           'help-echo raw-body))))
+          ;; The quote jumps to the original message when clicked.
+          (add-text-properties
+           0 (length string)
+           (list 'leman-room-reply-event-id event-id
+                 'button '(t)
+                 'category 'default-button
+                 'action #'leman-room--reply-quote-action
+                 'follow-link t)
+           string)
+          string)
+      (propertize (concat "┃ ↩ "
+                          (or (and anchor (not (equal anchor "In reply to")) anchor)
+                              "reply to an earlier message"))
+                  'face face))))
+
+(defun leman-room--reply-quote-action (button)
+  "Jump to the original message of the reply quote BUTTON."
+  (leman-room--jump-to-event (get-text-property (button-start button)
+                                                'leman-room-reply-event-id)))
+
+(defun leman-room--jump-to-event (event-id)
+  "Display ROOM's buffer and highlight its event EVENT-ID."
+  (when-let* ((room leman-room)
+              (buffer (alist-get 'buffer (leman-room-local room)))
+              ((buffer-live-p buffer)))
+    (pop-to-buffer buffer)
+    (with-current-buffer buffer
+      (if-let ((node (leman-room--ewoc-last-matching leman-ewoc
+                       (lambda (data)
+                         (and (leman-event-p data)
+                              (equal event-id (leman-event-id data)))))))
+          (progn
+            (goto-char (marker-position (ewoc--node-start-marker node)))
+            (leman-room-highlight-event-at (point))
+            (recenter 3))
+        (message "Original message not in the buffer (load earlier messages)")))))
 
 (cl-defun leman-room--format-message-body (event session &key (formatted-p t))
   "Return formatted body of \"m.room.message\" EVENT on SESSION.
@@ -4869,18 +5398,38 @@ If FORMATTED-P, return the formatted body content, when available."
                            (local (map ('redacted-by local-redacted-by))))
                 event)
                ((map ('body main-body) msgtype ('format content-format) ('formatted_body formatted-body)
-                     ('m.relates_to (map ('rel_type rel-type)))
+                     ('m.relates_to (map ('rel_type rel-type)
+                                         ('m.in_reply_to (map ('event_id in-reply-to-id)))))
                      ('m.new_content (map ('body new-body) ('formatted_body new-formatted-body)
                                           ('format new-content-format))))
                 content)
+               (reply-anchor nil)
                (body (or new-body main-body))
                (formatted-body (or new-formatted-body formatted-body))
+               ;; Plain-text replies embed the Matrix fallback quote
+               ;; ("> <sender> text"): drop it, our own reply-context
+               ;; quote replaces it.
+               (body (if (and in-reply-to-id
+                              (string-match "\\`> <[^>]*>[^\n]*\n\\(?:\n\\)?" body))
+                         (substring body (match-end 0))
+                       body))
                (body (if (or (not formatted-p) (not formatted-body))
                          ;; Copy the string so as not to add face properties to the one in the struct.
                          (copy-sequence body)
                        (pcase (or new-content-format content-format)
                           ("org.matrix.custom.html"
                            (save-match-data
+                             ;; Strip the <mx-reply> fallback: our own
+                             ;; reply-context quote replaces it.  Salvage
+                             ;; the fallback's anchor text for events
+                             ;; whose original is in another room (e.g.
+                             ;; bridge cross-posts).
+                             (when (string-match "<mx-reply>\\(?:.\\|\n\\)*</mx-reply>"
+                                                 formatted-body)
+                               (let ((fallback (match-string 0 formatted-body)))
+                                 (setf formatted-body (replace-match "" t t formatted-body))
+                                 (when (string-match "<a[^>]*>\\([^<]+\\)</a>" fallback)
+                                   (setf reply-anchor (match-string 1 fallback)))))
                              (let ((rendered (leman-room--render-html formatted-body session)))
                                ;; Fetch any mxc:// images in the body
                                ;; asynchronously; the event is
@@ -4922,14 +5471,20 @@ If FORMATTED-P, return the formatted body content, when available."
                   ;; properties will be added to every time in other functions, which will
                   ;; make a very big mess of face properties if a room's buffer is opened
                   ;; and closed a few times.
-                  (if (or local-redacted-by unsigned-redacted-by)
-                      "[redacted]"
-                    "[message has no body content]"))))
-    (when appendix
+                  (cond ((or local-redacted-by unsigned-redacted-by)
+                         "[redacted]")
+                        ;; Malformed or unsupported events collapse to a
+                        ;; single marker (the msgtype is in the tooltip).
+                        ((not (member msgtype '("m.text" "m.emote" "m.notice"
+                                                "m.image" "m.file" "m.video" "m.audio")))
+                         (propertize "[unsupported message]"
+                                     'help-echo (format "msgtype: %s" msgtype)))
+                        (t "[message has no body content]")))))
+    (when (and appendix (not (string-prefix-p "[unsupported message]" body)))
       (setf body (concat body " " appendix)))
     (when (equal "m.replace" rel-type)
       ;; Message is an edit.
-      (setf body (concat body " " (propertize "[edited]" 'face 'font-lock-comment-face))))
+      (setf body (concat body " " (propertize "[edited]" 'face 'leman-room-edited))))
     (when (and (or local-redacted-by unsigned-redacted-by)
                leman-room-hide-redacted-message-content)
       ;; Message is redacted and hiding is enabled: override the body to hide the content.
@@ -4938,6 +5493,35 @@ If FORMATTED-P, return the formatted body content, when available."
       ;; now.  There are probably 3 or 4 different ways and places we could handle
       ;; redaction of content, and this seems like the simplest.)
       (setf body "[redacted]"))
+    (when (and in-reply-to-id
+               ;; Thread replies (MSC3440) reference the thread root
+               ;; or the latest event in it as a fallback, not as a
+               ;; deliberate reply: render them flat, as other clients
+               ;; do in their thread views.
+               (not (equal rel-type "m.thread"))
+               (not (equal body "[redacted]")))
+      ;; Reply context: our own quote box, above the message.
+      (setf body (concat (leman-room--format-reply-quote in-reply-to-id leman-room reply-anchor)
+                         "\n" body)))
+    ;; Highlight literal @room mentions.
+    (let ((start 0))
+      (while (string-match "\\(?:\\`\\|[^[:alnum:]_]\\)\\(@room\\)\\>" body start)
+        (add-face-text-property (match-beginning 1) (match-end 1)
+                                'leman-room-mention 'append body)
+        (setf start (match-end 1))))
+    ;; Hanging indent.  When the body is displayed beneath a sender
+    ;; header with an avatar, both the first line and wrapped lines
+    ;; are indented past the avatar, so nothing appears below it.
+    ;; Otherwise only lines wrapped by the display engine are
+    ;; indented (`line-prefix' would also indent lines that begin
+    ;; after a real newline, i.e. code blocks and ASCII art, which
+    ;; should keep their shape).
+    (if-let ((indent (leman-room--avatar-gutter-indent)))
+        (progn
+          (put-text-property 0 (length body) 'line-prefix indent body)
+          (put-text-property 0 (length body) 'wrap-prefix indent body))
+      (when (and leman-room-body-wrap-prefix (not (string-empty-p leman-room-body-wrap-prefix)))
+        (put-text-property 0 (length body) 'wrap-prefix leman-room-body-wrap-prefix body)))
     body))
 
 (defun leman-room--store-image-in-url-cache (url data)
@@ -5130,7 +5714,10 @@ HTML is rendered to Emacs text using `shr-insert-document'."
             ;; `leman-room--animate-images' instead.
             (shr-image-animate nil)
             (old-fn (symbol-function 'shr-tag-blockquote)) ;; Bind to a var to avoid unknown-function linting errors.
-            (old-span-fn (symbol-function 'shr-tag-span)))
+            (old-span-fn (symbol-function 'shr-tag-span))
+            (old-pre-fn (symbol-function 'shr-tag-pre))
+            (old-code-fn (symbol-function 'shr-tag-code))
+            (old-a-fn (symbol-function 'shr-tag-a)))
         (cl-letf (((symbol-function 'shr-fill-line) #'ignore)
                   ;; NOTE: Replace `shr-tag-img' to fetch images
                   ;; synchronously: shr's normal behavior inserts a
@@ -5191,6 +5778,30 @@ HTML is rendered to Emacs text using `shr-insert-document'."
                                                line-prefix "    "))
                        ;; NOTE: We use our own gv, `leman-text-property'; very convenient.
                        (add-face-text-property beg (point-max) 'leman-room-quote 'append))))
+                  ;; NOTE: Render tables as org-style tables: real
+                  ;; borders, monospace, one flat table (shr's own
+                  ;; header+body handling can produce nested tables).
+                  ((symbol-function 'shr-tag-table)
+                   #'leman-room--shr-tag-table)
+                  ;; Code blocks: a subtly different background, so
+                  ;; pasted console output and code read as a block.
+                  ((symbol-function 'shr-tag-pre)
+                   (lambda (dom)
+                     (leman-room--shr-face-region
+                      old-pre-fn dom 'leman-room-code-block)))
+                  ;; Inline code: the same background as blocks.
+                  ((symbol-function 'shr-tag-code)
+                   (lambda (dom)
+                     (leman-room--shr-face-region
+                      old-code-fn dom 'leman-room-code-block)))
+                  ;; Mentions: matrix.to links to users and aliases.
+                  ((symbol-function 'shr-tag-a)
+                   (lambda (dom)
+                     (let ((face (leman-room--mention-face
+                                  (dom-attr dom 'href))))
+                       (if face
+                           (leman-room--shr-face-region old-a-fn dom face)
+                         (funcall old-a-fn dom)))))
                   ;; NOTE: Render tables as org-style tables: real
                   ;; borders, monospace, one flat table (shr's own
                   ;; header+body handling can produce nested tables).
@@ -5323,6 +5934,36 @@ inserted into the room buffer."
         (or (matches-body-p (leman-user-username user))
             (matches-body-p (leman--user-displayname-in room user))
             (matches-body-p (leman-user-id user)))))))
+
+(defcustom leman-room-ping-text-fallback t
+  "Detect pings by matching the user's names in message bodies.
+Servers report pings via \\+`unread_notifications.highlight_count\\+`,
+which requires \\+`m.mentions\\+` and server-side push rules;
+bridges often set neither.  When this is non-nil, a message whose
+body matches the user's username, display name, or ID, or
+mentions \"@room\", also counts as a ping."
+  :type 'boolean)
+
+(defun leman-room--event-ping-p (event room session)
+  "Return non-nil when EVENT in ROOM pings SESSION's user.
+An event pings the user when its \\+`m.mentions\\+` names the
+user or the room, or -- with `leman-room-ping-text-fallback' --
+when its body matches the user's username, display name, or ID,
+or mentions \"@room\"."
+  (unless (equal (leman-user-id (leman-session-user session))
+                 (leman-user-id (leman-event-sender event)))
+    (pcase-let* (((cl-struct leman-event content) event)
+                 ((map ('m.mentions (map ('user_ids user-ids)
+                                         ('room room-mention))))
+                  content))
+      (or (and user-ids
+               (member (leman-user-id (leman-session-user session))
+                       (append user-ids nil)))
+          (eq room-mention t)
+          (and leman-room-ping-text-fallback
+               (or (leman-room--event-mentions-user-p
+                    event (leman-session-user session) room)
+                   (leman--event-mentions-room-p event)))))))
 
 (defun leman-room--linkify-urls (string)
   "Return STRING with URLs in it made clickable."
@@ -6305,9 +6946,20 @@ EVENTS should contain more than one event."
                                               (cl-delete-duplicates
                                                events :key #'leman-event-state-key))
                           when events
-                          collect (format "%s %s (%s)" (length users)
-                                          (propertize type 'face 'bold)
-                                          (string-join users ", ")))
+                          collect (let* ((shown (if (<= (length users)
+                                                        leman-room-membership-summary-max-names)
+                                                    users
+                                                  (cl-subseq users 0
+                                                             leman-room-membership-summary-max-names)))
+                                         (hidden (- (length users) (length shown))))
+                                    (format "%s %s (%s%s)"
+                                            (length users)
+                                            (propertize type 'face 'bold)
+                                            (string-join shown ", ")
+                                            (if (> hidden 0)
+                                                (propertize (format ", and %d more" hidden)
+                                                            'help-echo (string-join users ", "))
+                                              ""))))
                  "; "))))))
 
 (defun leman-room--format-membership-events (struct room)

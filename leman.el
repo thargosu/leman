@@ -2563,6 +2563,12 @@ Also used for left rooms, in which case STATUS should be set to
                (latest-timestamp))
     (setf (leman-room-status room) status
           (leman-room-unread-notifications room) unread-notifications)
+    ;; The server caught up on unread notifications: client-side
+    ;; ping state is stale when the room is fully read.
+    (when (and unread-notifications
+               (equal 0 (map-elt unread-notifications 'notification_count 0))
+               (equal 0 (map-elt unread-notifications 'highlight_count 0)))
+      (map-delete (leman-room-local room) 'pings))
     ;; NOTE: The idea is that, assuming that events in the sync response are in
     ;; chronological order, we push them to the lists in the room slots in that order,
     ;; leaving the head of each list as the most recent event of that type.  That means
@@ -2985,7 +2991,10 @@ and `session' to the session.  Adds function to
                          ;; MAYBE: (Should we keep them that way?  It would use less memory, I guess.)
                          do (puthash (symbol-name user-id)
                                      (cons (symbol-name event-id) (alist-get 'ts receipt))
-                                     room-receipts)))))
+                                     room-receipts)))
+    ;; A receipt may now cover the latest own message: refresh its
+    ;; "seen" indicator.
+    (leman-room--refresh-seen-marker room)))
 
 (leman-defevent "m.space.child"
   ;; SPEC: v1.2/11.35.

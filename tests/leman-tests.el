@@ -1997,6 +1997,8 @@ duplicate requests (as in `leman-room--fetch-html-image')."
          (leman-room--user-avatar-images (make-hash-table :test #'equal))
          (fetches 0)
          (callbacks nil)
+         (urls nil)
+         (arrived nil)
          (user (make-leman-user :id "@vv:x.org"
                                 :avatar-url "mxc://x.org/avatar"))
          (session (make-leman-session
@@ -2006,12 +2008,14 @@ duplicate requests (as in `leman-room--fetch-html-image')."
                    :token "secret")))
     (cl-letf (((symbol-function #'plz-run) #'ignore)
               ((symbol-function #'plz-queue)
-               (lambda (_queue &rest args)
+               (lambda (_queue _method url &rest args)
                  (cl-incf fetches)
+                 (push url urls)
                  (push (cons (plist-get args :then) (plist-get args :else))
                        callbacks)
                  nil))
-              ((symbol-function #'leman-room--redisplay) #'ignore))
+              ((symbol-function #'leman-room--avatar-arrived)
+               (lambda (user-id) (push user-id arrived))))
       ;; No data yet: a blank placeholder of the avatar's size is
       ;; shown (the avatar plus its trailing space), and a fetch is
       ;; queued.
@@ -2019,6 +2023,9 @@ duplicate requests (as in `leman-room--fetch-html-image')."
         (should (equal avatar "  "))
         (should (eq (car-safe (get-text-property 0 'display avatar)) 'space)))
       (should (= fetches 1))
+      ;; A thumbnail cropped by the server is requested.
+      (should (string-match-p "/media/thumbnail/x.org/avatar\\?.*method=crop"
+                              (car urls)))
       ;; Re-rendering while the fetch is in flight does not re-fetch.
       (should (equal (leman-room--user-avatar user session)
                      (leman-room--user-avatar-placeholder)))
@@ -2026,19 +2033,26 @@ duplicate requests (as in `leman-room--fetch-html-image')."
       ;; When the data arrives, it is stored on the user and displayed.
       (funcall (caar callbacks) "\x89PNG\r\n\x1a\npixels")
       (should (equal (leman-user-avatar user) "\x89PNG\r\n\x1a\npixels"))
+      ;; Room buffers are told, to re-render only this user's nodes.
+      (should (equal arrived '("@vv:x.org")))
       (let ((avatar (leman-room--user-avatar user session)))
         (should-not (equal avatar ""))
         (should (string-match-p "<svg" (plist-get (cdr (get-text-property
                                                    0 'display avatar))
                                                   :data))))
-      ;; A failed fetch marks the avatar as unavailable: no more
-      ;; fetches for this user this session, and a placeholder is shown.
+      ;; A failed thumbnail request falls back to the original.
+      (funcall (cdar callbacks) 'error)
+      (should (= fetches 2))
+      (should (string-match-p "/media/download/x.org/avatar\\'" (car urls)))
+      ;; When that fails too, the avatar is marked unavailable: no
+      ;; more fetches for this user this session, and a placeholder
+      ;; is shown.
       (funcall (cdar callbacks) 'error)
       (should (equal (leman-user-avatar user) ""))
       (let ((avatar (leman-room--user-avatar user session)))
         (should (equal avatar "  "))
         (should (eq (car-safe (get-text-property 0 'display avatar)) 'space)))
-      (should (= fetches 1)))))
+      (should (= fetches 2)))))
 
 (ert-deftest leman-room--user-avatar-disabled ()
   "When user avatars are disabled, nothing is displayed or fetched."
@@ -2201,6 +2215,154 @@ new one is fetched."
         (leman-room--pp-line (make-leman-event)))
       (should (equal (buffer-string) (concat "plain" separator "\n")))
       (should-not (get-text-property (1- (point-max)) 'face)))))
+
+(ert-deftest leman--media-request-thumbnail ()
+  "Thumbnails are requested from the thumbnail endpoint, falling
+back to the media itself when the server can't provide one."
+  (let ((session (make-leman-session :user (make-leman-user :id "@me:x.org")))
+        (requests nil)
+        (then (lambda (_data))))
+    (cl-letf (((symbol-function #'leman-api)
+               (lambda (_session endpoint &rest args)
+                 (push (list endpoint (plist-get args :params)
+                             (plist-get args :then) (plist-get args :else))
+                       requests))))
+      (leman--media-request "mxc://x.org/media" session
+        :then then :else #'ignore :thumbnail '(400 300 "scale"))
+      (pcase-let ((`(,endpoint ,params ,request-then ,_) (car requests)))
+        (should (equal endpoint "media/thumbnail/x.org/media"))
+        (should (equal params '(("width" "400") ("height" "300")
+                                ("method" "scale"))))
+        (should (eq request-then then)))
+      ;; The thumbnail request fails: the media itself is requested.
+      (funcall (nth 3 (car requests)) 'error)
+      (should (= (length requests) 2))
+      (pcase-let ((`(,endpoint ,params ,request-then ,request-else) (car requests)))
+        (should (equal endpoint "media/download/x.org/media"))
+        (should-not params)
+        (should (eq request-then then))
+        (should (eq request-else #'ignore)))
+      ;; Unless the session was revoked: then ELSE is called.
+      (let ((leman--revoked-sessions (make-hash-table :weakness 'key :test #'eq))
+            (failed nil))
+        (setf requests nil)
+        (leman--media-request "mxc://x.org/media" session
+          :then then :else (lambda (_) (setf failed t))
+          :thumbnail '(400 300 "scale"))
+        (puthash session t leman--revoked-sessions)
+        (funcall (nth 3 (car requests)) 'error)
+        (should failed)
+        (should (= (length requests) 1))))))
+
+(ert-deftest leman-room--image-thumbnail ()
+  "Thumbnails cover the display size, capped at 800x600, except for
+images that may be animated or already fit."
+  (cl-flet ((event (info)
+              (make-leman-event :content `((msgtype . "m.image")
+                                           (url . "mxc://x.org/full")
+                                           (info . ,info)))))
+    (cl-letf (((symbol-function #'leman-room--image-max-sizes)
+               (lambda (_window) '(200 . 1500))))
+      (let ((leman-room nil))
+        (should (equal (leman-room--image-thumbnail
+                        (event '((mimetype . "image/png") (w . 2218) (h . 2072))))
+                       '(800 200 "scale")))
+        ;; Without info, the server decides.
+        (should (equal (leman-room--image-thumbnail (event nil))
+                       '(800 200 "scale")))
+        ;; GIFs may be animated: servers may return a still frame.
+        (should-not (leman-room--image-thumbnail
+                     (event '((mimetype . "image/gif") (w . 2000) (h . 2000)))))
+        ;; Already small enough.
+        (should-not (leman-room--image-thumbnail
+                     (event '((mimetype . "image/png") (w . 100) (h . 80)))))))))
+
+(ert-deftest leman-room--image-download-thumbnails ()
+  "Image downloads request a thumbnail unless FULL, and record it."
+  (let ((requests nil)
+        (session (make-leman-session :user (make-leman-user :id "@me:x.org"))))
+    (cl-letf (((symbol-function #'leman--media-request)
+               (lambda (mxc _session &rest args)
+                 (push (list mxc (plist-get args :thumbnail)) requests)))
+              ((symbol-function #'leman-room--image-thumbnail)
+               (lambda (_event) '(800 200 "scale"))))
+      ;; No thumbnail in the event: a server thumbnail is requested.
+      (let ((event (make-leman-event
+                    :content '((url . "mxc://x.org/full")
+                               (info . ((mimetype . "image/png")))))))
+        (leman-room--image-download event session)
+        (should (equal (car requests) '("mxc://x.org/full" (800 200 "scale"))))
+        (should (map-elt (leman-event-local event) 'image-thumbnail))
+        ;; FULL: the original, and the flag is kept (the room still
+        ;; shows the thumbnail).
+        (leman-room--image-download event session :full t)
+        (should (equal (car requests) '("mxc://x.org/full" nil)))
+        (should (map-elt (leman-event-local event) 'image-thumbnail)))
+      ;; The event's own thumbnail is preferred.
+      (let ((event (make-leman-event
+                    :content '((url . "mxc://x.org/full")
+                               (info . ((thumbnail_url . "mxc://x.org/thumb")))))))
+        (leman-room--image-download event session)
+        (should (equal (car requests) '("mxc://x.org/thumb" nil)))
+        (should (map-elt (leman-event-local event) 'image-thumbnail))))))
+
+(ert-deftest leman-room--animate-images-probes-only-animatable-types ()
+  "Only GIF and WebP images are decoded to count their frames."
+  (let ((leman-room-animate-message-images t)
+        (png (list 'image :type 'png :data "\x89PNG\r\n\x1a\nrest"))
+        (gif (list 'image :type 'gif :data "GIF89a rest"))
+        (probed nil))
+    (should-not (leman-room--animatable-type-p png))
+    (should (leman-room--animatable-type-p gif))
+    (with-temp-buffer
+      (insert (propertize " " 'display png) (propertize " " 'display gif))
+      (cl-letf (((symbol-function #'image-multi-frame-p)
+                 (lambda (image) (push image probed) nil)))
+        (leman-room--animate-images (point-min) (point-max)))
+      (should (equal probed (list gif))))))
+
+(ert-deftest leman-room--arrived-avatars ()
+  "Arrived avatars are coalesced, and only their users' nodes are
+re-rendered."
+  (let* ((alice (make-leman-user :id "@alice:x.org"))
+         (bob (make-leman-user :id "@bob:x.org"))
+         (alice-event (make-leman-event :id "$a" :sender alice))
+         (bob-event (make-leman-event :id "$b" :sender bob))
+         (leman-room--arrived-avatar-user-ids nil)
+         (leman-room--arrived-avatars-timer nil)
+         (invalidated nil))
+    (unwind-protect
+        (with-temp-buffer
+          (setq-local major-mode 'leman-room-mode)
+          (setq-local leman-ewoc (ewoc-create #'ignore nil nil 'nosep))
+          (dolist (data (list (leman-room--make-sender-header alice-event)
+                              alice-event
+                              (leman-room--make-sender-header bob-event)
+                              bob-event
+                              alice))
+            (ewoc-enter-last leman-ewoc data))
+          ;; Two arrivals: one pending update.
+          (leman-room--avatar-arrived "@alice:x.org")
+          (let ((timer leman-room--arrived-avatars-timer))
+            (should (timerp timer))
+            (leman-room--avatar-arrived "@alice:x.org")
+            (should (eq timer leman-room--arrived-avatars-timer)))
+          (cl-letf (((symbol-function #'ewoc-invalidate)
+                     (lambda (_ewoc &rest nodes)
+                       (setf invalidated (mapcar #'ewoc-data nodes)))))
+            (leman-room--update-arrived-avatars))
+          ;; Alice's header and user node only.
+          (should (= (length invalidated) 2))
+          (should (cl-every (lambda (data)
+                              (or (eq data alice)
+                                  (and (leman-room-sender-header-p data)
+                                       (eq (leman-room-sender-header-event data)
+                                           alice-event))))
+                            invalidated))
+          (should-not leman-room--arrived-avatar-user-ids)
+          (should-not leman-room--arrived-avatars-timer))
+      (when (timerp leman-room--arrived-avatars-timer)
+        (cancel-timer leman-room--arrived-avatars-timer)))))
 
 (provide 'leman-tests)
 

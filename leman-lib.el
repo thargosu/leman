@@ -50,6 +50,7 @@
 (defvar leman-ewoc)
 (defvar leman-room)
 (defvar leman-session)
+(defvar leman-images-queue)
 ;; Optional dependencies: the annotator registry is registered with
 ;; in `leman--annotate-room', etc.  Marginalia renamed the registry
 ;; from `marginalia-annotator-registry' to `marginalia-annotators'.
@@ -1484,24 +1485,41 @@ Suitable for use in completion, etc."
     (format "%s/_matrix/media/r0/download/%s/%s"
             uri-prefix server-name media-id)))
 
-(defun leman--mxc-to-endpoint (uri)
+(defun leman--mxc-to-endpoint (uri &optional kind)
   "Return API endpoint for MXC URI.
-Returns string suitable for the ENDPOINT argument to `leman-api'."
+KIND is the media endpoint, \"download\" (the default) or
+\"thumbnail\".  Returns string suitable for the ENDPOINT argument
+to `leman-api'."
   (string-match (rx "mxc://" (group (1+ (not (any "/"))))
                     "/" (group (1+ anything))) uri)
   (let ((server-name (match-string 1 uri))
         (media-id (match-string 2 uri)))
-    (format "media/download/%s/%s" server-name media-id)))
+    (format "media/%s/%s/%s" (or kind "download") server-name media-id)))
 
-(defun leman--mxc-to-authenticated-url (uri session)
+(defun leman--thumbnail-params (thumbnail)
+  "Return query parameters for THUMBNAIL, a (WIDTH HEIGHT METHOD) list.
+See the Matrix spec's thumbnail endpoint, where METHOD is
+\"scale\" or \"crop\"."
+  (pcase-let ((`(,width ,height ,method) thumbnail))
+    `(("width" ,(number-to-string width))
+      ("height" ,(number-to-string height))
+      ("method" ,method))))
+
+(defun leman--mxc-to-authenticated-url (uri session &optional thumbnail)
   "Return authenticated media download URL for MXC URI on SESSION.
 Servers implementing Matrix v1.11 authenticated media (like
 Conduit) reject the unauthenticated URLs returned by
 `leman--mxc-to-url'; this URL requires the session's token (sent
-as the Authorization header)."
+as the Authorization header).  If THUMBNAIL, a (WIDTH HEIGHT
+METHOD) list, return the URL of a thumbnail with those
+parameters instead (see `leman--thumbnail-params')."
   (pcase-let* (((cl-struct leman-session server) session)
                ((cl-struct leman-server uri-prefix) server))
-    (format "%s/_matrix/client/v1/%s" uri-prefix (leman--mxc-to-endpoint uri))))
+    (if thumbnail
+        (format "%s/_matrix/client/v1/%s?%s" uri-prefix
+                (leman--mxc-to-endpoint uri "thumbnail")
+                (url-build-query-string (leman--thumbnail-params thumbnail)))
+      (format "%s/_matrix/client/v1/%s" uri-prefix (leman--mxc-to-endpoint uri)))))
 
 (defun leman--remove-face-property (string value)
   "Remove VALUE from STRING's `face' properties.
@@ -1950,16 +1968,31 @@ seconds, etc."
 
 (cl-defun leman--media-request
     (mxc session &key queue (then #'ignore) (else #'leman-api-error)
-         (as 'binary) (authenticatedp t))
+         (as 'binary) (authenticatedp t) thumbnail)
   "Request media from MXC URL on SESSION.
 If AUTHENTICATEDP, send authenticated request.  Arguments THEN,
 ELSE, and AS are passed to `leman-api' for authenticated media
 requests, or to `plz' for unauthenticated ones, each which see.
-If QUEUE, send request on it."
+If QUEUE, send request on it.
+
+If THUMBNAIL, a (WIDTH HEIGHT METHOD) list (see
+`leman--thumbnail-params'), and AUTHENTICATEDP, request a
+thumbnail scaled by the server instead.  When the server can't
+provide one (e.g. for a media type it can't thumbnail), the media
+itself is requested instead."
   (declare (indent defun))
   (if authenticatedp
-      (leman-api session (leman--mxc-to-endpoint mxc) :version "v1"
-        :json-read-fn as :then then :else else :queue queue)
+      (if thumbnail
+          (leman-api session (leman--mxc-to-endpoint mxc "thumbnail") :version "v1"
+            :params (leman--thumbnail-params thumbnail)
+            :json-read-fn as :then then :queue queue
+            :else (lambda (plz-error)
+                    (if (leman-session-revoked-p session)
+                        (funcall else plz-error)
+                      (leman--media-request mxc session
+                        :queue queue :then then :else else :as as))))
+        (leman-api session (leman--mxc-to-endpoint mxc) :version "v1"
+          :json-read-fn as :then then :else else :queue queue))
     ;; Send unauthenticated request.
     (if queue
         (plz-run
@@ -1968,6 +2001,33 @@ If QUEUE, send request on it."
            :then then :else else :noquery t))
       (plz 'get (leman--mxc-to-url mxc session) :as as
         :then then :else else :noquery t))))
+
+(defconst leman--avatar-thumbnail '(96 96 "crop")
+  "Thumbnail parameters for avatars (see `leman--thumbnail-params').
+Avatars are shown about two lines high: 96 pixels covers that on
+HiDPI displays, and is a size servers pre-generate.")
+
+(defun leman--fetch-avatar (mxc session then else)
+  "Fetch the avatar at MXC on SESSION, calling THEN with its data.
+A thumbnail cropped by the server is requested (see
+`leman--avatar-thumbnail'): avatars are often full-size photos,
+which Emacs would otherwise rescale every time they are drawn.
+When the server can't provide one, the original is fetched
+instead.  On failure, ELSE is called with the `plz-error'."
+  (cl-labels ((fetch (url fallback-url)
+                (plz-run
+                 (plz-queue leman-images-queue
+                   ;; NOTE: Authenticated media endpoint: servers like
+                   ;; Conduit reject the unauthenticated download URL.
+                   'get url :as 'binary :noquery t
+                   :headers (list (cons "Authorization"
+                                        (concat "Bearer " (leman-session-token session))))
+                   :then then
+                   :else (if fallback-url
+                             (lambda (_) (fetch fallback-url nil))
+                           else)))))
+    (fetch (leman--mxc-to-authenticated-url mxc session leman--avatar-thumbnail)
+           (leman--mxc-to-authenticated-url mxc session))))
 
 ;;; Footer
 

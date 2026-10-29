@@ -2944,7 +2944,10 @@ and erases the buffer.
         left-margin-width leman-room-left-margin-width
         right-margin-width leman-room-right-margin-width
         ;; TODO: Use EWOC header/footer for, e.g. typing messages.
-        leman-ewoc (ewoc-create #'leman-room--pp-thing))
+        ;; NOTE: Without separators: `leman-room--pp-line' ends
+        ;; each node's line itself (see there), and
+        ;; `leman-room--ewoc-set-hf' the header's and footer's.
+        leman-ewoc (ewoc-create #'leman-room--pp-line "\n" "\n" 'nosep))
   ;; Prevent line/wrap-prefix formatting properties being included in copied text.
   (setq-local filter-buffer-substring-function #'leman-room--buffer-substring-filter)
   ;; Set the URL handler.  Note that `browse-url-handlers' was added in 28.1;
@@ -3112,7 +3115,8 @@ data slot."
           (setq-local bookmark-make-record-function #'leman-room-bookmark-make-record)
           ;; Set initial header and footer.  (Do this before processing events, which
           ;; might cause the header/footer to be changed (e.g. a tombstone event).
-          (ewoc-set-hf leman-ewoc (leman-room--initial-header room)
+          (leman-room--ewoc-set-hf leman-ewoc
+                                   (leman-room--initial-header room)
                                    (leman-room--initial-footer room))
           ;; Clear new-events, because those only matter when a buffer is already open.
           (setf (alist-get 'new-events (leman-room-local room)) nil)
@@ -3517,7 +3521,7 @@ function to `leman-room-event-fns', which see."
                            else collect id)))
     (with-silent-modifications
       (setf (map-elt (leman-room-local leman-room) 'typing) names)
-      (ewoc-set-hf leman-ewoc "" (leman-room--typing-footer names leman-room)))))
+      (leman-room--ewoc-set-hf leman-ewoc "" (leman-room--typing-footer names leman-room)))))
 
 (leman-room-defevent "m.room.avatar"
   (leman-room--insert-event event))
@@ -3601,7 +3605,7 @@ function to `leman-room-event-fns', which see."
     ;; NOTE: We assume that no more typing events will be received,
     ;; which would replace the footer.
     (leman-room--insert-event event)
-    (ewoc-set-hf leman-ewoc banner banner)))
+    (leman-room--ewoc-set-hf leman-ewoc banner banner)))
 
 ;;;;; Read markers
 
@@ -4372,6 +4376,44 @@ receipt arrives."
                   ((leman-room-sender-header-p (ewoc-data header-node))))
         (ewoc-invalidate leman-ewoc header-node)))))
 
+(defun leman-room--extending-faces (face)
+  "Return the faces in FACE that extend to the end of the line.
+FACE is a `face' property value.  On a newline, these faces
+extend to the window's edge; see `:extend' in Info node
+`(elisp)Face Attributes'."
+  (cl-loop for f in (if (or (symbolp face) (keywordp (car-safe face)))
+                        (list face)
+                      face)
+           when (if (symbolp f)
+                    (and f (facep f) (eq t (face-attribute f :extend nil t)))
+                  (and (consp f) (plist-get f :extend)))
+           collect f))
+
+(defun leman-room--pp-line (thing)
+  "Insert THING with `leman-room--pp-thing', then end its line.
+To be used as the pretty-printer of a separator-less ewoc.  Unlike
+ewoc's own separator, the newline (and the event separator before
+it, if any) takes the extending faces of THING's last character,
+so that, e.g. a code block's background reaches the window's edge
+on the block's last line too, as on its other lines."
+  (let ((beg (point)))
+    (leman-room--pp-thing thing)
+    (let* ((end (point))
+           (separator-p (and (> end beg)
+                             (get-text-property (1- end) 'leman-room-event-separator)))
+           (last (if separator-p (1- end) end))
+           (faces (and (> last beg)
+                       (leman-room--extending-faces
+                        (get-text-property (1- last) 'face)))))
+      (when (and faces separator-p)
+        (put-text-property (1- end) end 'face faces))
+      (insert (propertize "\n" 'face faces)))))
+
+(defun leman-room--ewoc-set-hf (ewoc header footer)
+  "Set EWOC's HEADER and FOOTER, each ending its own line.
+The room ewoc has no separators (see `leman-room--pp-line')."
+  (ewoc-set-hf ewoc (concat header "\n") (concat footer "\n")))
+
 (defun leman-room--pp-thing (thing)
   "Pretty-print THING.
 To be used as the pretty-printer for `ewoc-create'.  THING may be
@@ -4598,7 +4640,8 @@ Formats according to `leman-room-message-format-spec', which see."
                   (leman-event-type event))
           'help-echo (format "%S" (leman-event-content event))))))
    (propertize " "
-               'display leman-room-event-separator-display-property)))
+               'display leman-room-event-separator-display-property
+               'leman-room-event-separator t)))
 
 (defun leman-room--reaction-shortcode (key room)
   "Return the shortcode for reaction KEY in ROOM.
@@ -5075,7 +5118,14 @@ from the server and the buffer re-rendered when it arrives."
     (insert "\n"
             (leman-room--format-sender-header event leman-session)
             "\n"
-            body "\n")
+            body
+            ;; The newline takes the body's extending faces, so that,
+            ;; e.g. a code block's background reaches the window's
+            ;; edge on its last line too.
+            (propertize "\n" 'face (and (not (string-empty-p body))
+                                        (leman-room--extending-faces
+                                         (get-text-property (1- (length body))
+                                                            'face body)))))
     (when-let ((reactions (leman-room--format-reactions event leman-room)))
       (unless (string-empty-p reactions)
         (insert reactions)))))

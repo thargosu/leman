@@ -2174,6 +2174,34 @@ new one is fetched."
             (leman-room--animation-tick))
           (should-not leman-room--animations))))))
 
+(ert-deftest leman-room--pp-line-extends-last-line ()
+  "The newline ending an event takes its last line's extending faces."
+  (let ((leman-room-animate-message-images nil)
+        (separator (propertize " " 'display '(space :ascent 75)
+                               'leman-room-event-separator t)))
+    (with-temp-buffer
+      ;; A message ending with a code block: the separator and the
+      ;; newline get the block's face, but not the other faces.
+      (cl-letf (((symbol-function 'leman-room--format-event)
+                 (lambda (&rest _)
+                   (concat (propertize "code\nlast" 'face
+                                       '(fixed-pitch leman-room-code-block))
+                           separator))))
+        (leman-room--pp-line (make-leman-event)))
+      (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                     "code\nlast \n"))
+      (should (equal (get-text-property (- (point-max) 2) 'face)
+                     '(leman-room-code-block)))
+      (should (equal (get-text-property (1- (point-max)) 'face)
+                     '(leman-room-code-block)))
+      ;; A plain message: no face on the newline.
+      (erase-buffer)
+      (cl-letf (((symbol-function 'leman-room--format-event)
+                 (lambda (&rest _) (concat "plain" separator))))
+        (leman-room--pp-line (make-leman-event)))
+      (should (equal (buffer-string) (concat "plain" separator "\n")))
+      (should-not (get-text-property (1- (point-max)) 'face)))))
+
 (provide 'leman-tests)
 
 ;;; leman-tests.el ends here

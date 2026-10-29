@@ -2135,6 +2135,45 @@ new one is fetched."
                (make-leman-session :user (make-leman-user :id "@me:x.org")))
       (should (equal (leman-user-avatar user) "cached")))))
 
+(ert-deftest leman-room--animation-tick ()
+  "Only visible animated images advance, and stale ones are dropped."
+  (let ((visible (list 'image :type 'gif :data "a"))
+        (hidden (list 'image :type 'gif :data "b"))
+        (redisplays 0)
+        (leman-room-animate-message-images t)
+        (leman-room--animation-timer nil))
+    (with-temp-buffer
+      (insert (propertize " " 'display visible) "\n"
+              (propertize " " 'display hidden))
+      (let ((buffer (current-buffer)))
+        ;; Both started 0.25 s ago, with 0.1 s frames.
+        (setf leman-room--animations
+              (list (list visible (copy-marker 1) 99.75 10 0.1)
+                    (list hidden (copy-marker 3) 99.75 10 0.1)))
+        ;; A window shows only the first line.
+        (cl-letf (((symbol-function #'get-buffer-window-list)
+                   (lambda (b &rest _) (when (eq b buffer) '(window))))
+                  ((symbol-function #'window-start) (lambda (_) 1))
+                  ((symbol-function #'window-end) (lambda (_) 2))
+                  ((symbol-function #'float-time) (lambda (&rest _) 100.0))
+                  ((symbol-function #'input-pending-p) #'ignore)
+                  ((symbol-function #'force-window-update)
+                   (lambda (_) (cl-incf redisplays))))
+          (leman-room--animation-tick)
+          (should (eql (image-property visible :index) 2))
+          (should-not (image-property hidden :index))
+          (should (= redisplays 1))
+          ;; The visible image is replaced (e.g. its event re-rendered):
+          ;; its animation is dropped.
+          (let ((inhibit-read-only t))
+            (put-text-property 1 2 'display (list 'image :type 'gif :data "a")))
+          (leman-room--animation-tick)
+          (should (equal (mapcar #'car leman-room--animations) (list hidden)))
+          ;; Disabling animations drops them all.
+          (let ((leman-room-animate-message-images nil))
+            (leman-room--animation-tick))
+          (should-not leman-room--animations))))))
+
 (provide 'leman-tests)
 
 ;;; leman-tests.el ends here

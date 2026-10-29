@@ -2887,36 +2887,33 @@ and `session' to the session.  Adds function to
     ;; means that, if a user has them disabled and then reenables them, they will
     ;; likely need to reconnect to cause them to be displayed in most rooms.
     (if-let ((url (alist-get 'url (leman-event-content event))))
-        (plz-run
-         (plz-queue leman-images-queue
-           ;; NOTE: Authenticated media endpoint: servers like Conduit
-           ;; reject the unauthenticated download URL.
-           'get (leman--mxc-to-authenticated-url url session) :as 'binary :noquery t
-           :headers (list (cons "Authorization"
-                                (concat "Bearer " (leman-session-token session))))
-           :then (lambda (data)
-                   (when leman-room-avatars
-                     ;; MAYBE: Store the raw image data instead of using create-image here.
-                     (let ((image (create-image data nil 'data-p
-                                                :ascent 'center
-                                                :max-width leman-room-avatar-max-width
-                                                :max-height leman-room-avatar-max-height)))
-                       (if (not image)
-                           (progn
-                      (display-warning 'leman (format "Room avatar seems unreadable:  ROOM-ID:%S  AVATAR-URL:%S"
-                                                      (leman-room-id room) (leman--mxc-to-authenticated-url url session)))
-                             (setf (leman-room-avatar room) nil
-                                   (alist-get 'room-list-avatar (leman-room-local room)) nil))
-                         (when (fboundp 'imagemagick-types)
-                           ;; Only do this when ImageMagick is supported.
-                           ;; FIXME: When requiring Emacs 27+, remove this (I guess?).
-                           (setf (image-property image :type) 'imagemagick))
-                         ;; We set the room-avatar slot to a propertized string that
-                         ;; displays as the image.  This seems the most convenient thing to
-                         ;; do.  We also unset the cached room-list-avatar so it can be
-                         ;; remade.
-                         (setf (leman-room-avatar room) (propertize " " 'display image)
-                               (alist-get 'room-list-avatar (leman-room-local room)) nil)))))))
+        (leman--fetch-avatar
+         url session
+         (lambda (data)
+           (when leman-room-avatars
+             ;; MAYBE: Store the raw image data instead of using create-image here.
+             (let ((image (create-image data nil 'data-p
+                                        :ascent 'center
+                                        :max-width leman-room-avatar-max-width
+                                        :max-height leman-room-avatar-max-height)))
+               (if (not image)
+                   (progn
+                     (display-warning 'leman (format "Room avatar seems unreadable:  ROOM-ID:%S  AVATAR-URL:%S"
+                                                     (leman-room-id room) (leman--mxc-to-authenticated-url url session)))
+                     (setf (leman-room-avatar room) nil
+                           (alist-get 'room-list-avatar (leman-room-local room)) nil))
+                 (when (fboundp 'imagemagick-types)
+                   ;; Only do this when ImageMagick is supported.
+                   ;; FIXME: When requiring Emacs 27+, remove this (I guess?).
+                   (setf (image-property image :type) 'imagemagick))
+                 ;; We set the room-avatar slot to a propertized string that
+                 ;; displays as the image.  This seems the most convenient thing to
+                 ;; do.  We also unset the cached room-list-avatar so it can be
+                 ;; remade.
+                 (setf (leman-room-avatar room) (propertize " " 'display image)
+                       (alist-get 'room-list-avatar (leman-room-local room)) nil)))))
+         (lambda (plz-error)
+           (leman-debug "Room avatar fetch failed:" plz-error)))
       ;; Unset avatar.
       (setf (leman-room-avatar room) nil
             (alist-get 'room-list-avatar (leman-room-local room)) nil))))

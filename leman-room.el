@@ -4825,30 +4825,69 @@ its visual parameters."
 
 (defun leman-room--fetch-user-avatar (user session)
   "Fetch USER's avatar from its mxc URI on SESSION in the background.
-When the data arrives, it is stored on USER and room buffers are
-redisplayed; on failure, no avatar is shown (and none fetched
-again for USER during this session)."
+When the data arrives, it is stored on USER and the nodes showing
+USER are re-rendered (see `leman-room--avatar-arrived'); on
+failure, no avatar is shown (and none fetched again for USER
+during this session)."
   (let ((id (leman-user-id user)))
     (puthash id t leman-room--fetching-user-avatars)
-    (plz-run
-     (plz-queue leman-images-queue
-       ;; NOTE: Authenticated media endpoint: servers like Conduit
-       ;; reject the unauthenticated download URL.
-       'get (leman--mxc-to-authenticated-url (leman-user-avatar-url user) session)
-       :as 'binary :noquery t
-       :headers (list (cons "Authorization"
-                            (concat "Bearer " (leman-session-token session))))
-       :then (lambda (data)
-               (remhash id leman-room--fetching-user-avatars)
-               (setf (leman-user-avatar user) data)
-               (clrhash leman-room--user-avatar-images)
-               (leman-room--redisplay))
-       :else (lambda (plz-error)
-               (remhash id leman-room--fetching-user-avatars)
-               ;; Mark as unavailable to avoid re-fetching on every
-               ;; redisplay.
-               (setf (leman-user-avatar user) "")
-               (leman-debug "User avatar fetch failed:" plz-error))))))
+    (leman--fetch-avatar
+     (leman-user-avatar-url user) session
+     (lambda (data)
+       (remhash id leman-room--fetching-user-avatars)
+       ;; NOTE: `leman-room--user-avatar-images' needs no flushing:
+       ;; it is keyed by avatar URL, and nothing was cached for this
+       ;; URL before its data arrived.
+       (setf (leman-user-avatar user) data)
+       (leman-room--avatar-arrived id))
+     (lambda (plz-error)
+       (remhash id leman-room--fetching-user-avatars)
+       ;; Mark as unavailable to avoid re-fetching on every
+       ;; redisplay.
+       (setf (leman-user-avatar user) "")
+       (leman-debug "User avatar fetch failed:" plz-error)))))
+
+(defvar leman-room--arrived-avatar-user-ids nil
+  "IDs of users whose avatar arrived since room buffers were updated.
+See `leman-room--avatar-arrived'.")
+
+(defvar leman-room--arrived-avatars-timer nil
+  "Timer updating room buffers for arrived avatars, if pending.")
+
+(defun leman-room--avatar-arrived (user-id)
+  "Show USER-ID's newly arrived avatar in room buffers, shortly.
+Opening a room can fetch dozens of avatars, so arrivals are
+coalesced, and only the nodes showing these users are re-rendered
+(see `leman-room--update-arrived-avatars'), rather than whole
+buffers."
+  (cl-pushnew user-id leman-room--arrived-avatar-user-ids :test #'equal)
+  (unless (timerp leman-room--arrived-avatars-timer)
+    (setf leman-room--arrived-avatars-timer
+          (run-with-timer 0.5 nil #'leman-room--update-arrived-avatars))))
+
+(defun leman-room--update-arrived-avatars ()
+  "Re-render the room nodes showing users whose avatar arrived.
+That is, their sender headers, and user nodes (when
+`leman-room-sender-in-headers' is nil)."
+  (let ((user-ids leman-room--arrived-avatar-user-ids))
+    (setf leman-room--arrived-avatar-user-ids nil
+          leman-room--arrived-avatars-timer nil)
+    (dolist (buffer (buffer-list))
+      (when (eq 'leman-room-mode (buffer-local-value 'major-mode buffer))
+        (with-current-buffer buffer
+          (let ((node (ewoc-nth leman-ewoc 0))
+                (nodes nil))
+            (while node
+              (let* ((data (ewoc-data node))
+                     (user (cond ((leman-room-sender-header-p data)
+                                  (leman-event-sender
+                                   (leman-room-sender-header-event data)))
+                                 ((leman-user-p data) data))))
+                (when (and user (member (leman-user-id user) user-ids))
+                  (push node nodes)))
+              (setf node (ewoc-next leman-ewoc node)))
+            (when nodes
+              (apply #'ewoc-invalidate leman-ewoc nodes))))))))
 
 (defun leman-room--user-avatar (user session)
   "Return USER's avatar string, or a blank placeholder if there is none (yet).
@@ -5970,6 +6009,18 @@ time START.  See `leman-room--animation-tick'.")
         ((and (consp display) (imagep (car display)))
          (car display))))
 
+(defun leman-room--animatable-type-p (image)
+  "Return non-nil if IMAGE is of a type that may be animated.
+That is GIF or WebP, as detected from the data's header.  Cheap,
+unlike `image-multi-frame-p', which decodes the image (tens of
+milliseconds for a screenshot, even if it's not displayed)."
+  (let ((data (image-property image :data))
+        (file (image-property image :file)))
+    (memq (cond (data (image-type-from-data data))
+                (file (image-type-from-file-header file))
+                (t (image-property image :type)))
+          '(gif webp))))
+
 (defun leman-room--animate-images (beg end)
   "Start animating multi-frame images between BEG and END.
 Images are rendered by shr in a temporary buffer, where an
@@ -5990,6 +6041,7 @@ all of them together, and only those actually visible."
       (while (< (point) end)
         (when-let* ((image (leman-room--display-image
                             (get-text-property (point) 'display)))
+                    ((leman-room--animatable-type-p image))
                     (multi-frame (image-multi-frame-p image))
                     ((cdr multi-frame)))
           (setf leman-room--animations
@@ -7227,12 +7279,30 @@ options `leman-room-image-thumbnail-height' and
       (leman-room-image-show (posn-point pos)))))
 
 (defun leman-room-image-show (pos)
-  "Show image at POS in a new buffer."
+  "Show image at POS in a new buffer.
+When the room shows a thumbnail of the image, the original is
+downloaded and shown."
   (interactive "d")
   (pcase-let* ((image (copy-sequence (get-text-property pos 'display)))
                (leman-event (ewoc-data (ewoc-locate leman-ewoc pos)))
-               ((cl-struct leman-event id) leman-event)
+               ((cl-struct leman-event id local) leman-event)
                (buffer-name (format "*Leman image: %s*" id)))
+    (cond ((get-buffer buffer-name)
+           (leman-room--pop-to-image-buffer buffer-name))
+          ((map-elt local 'image-thumbnail)
+           (message "Leman: Downloading full-size image...")
+           (leman-room--image-download leman-event leman-session :full t
+             :then (lambda (data)
+                     (leman-room--pop-to-image-buffer
+                      buffer-name (create-image data nil 'data-p)))
+             :else (lambda (_plz-error)
+                     (message "Leman: Failed to download the full-size image"))))
+          (t (leman-room--pop-to-image-buffer buffer-name image)))))
+
+(defun leman-room--pop-to-image-buffer (buffer-name &optional image)
+  "Pop to buffer BUFFER-NAME, showing IMAGE at full size.
+If IMAGE is nil, the buffer must already exist."
+  (when image
     (when (fboundp 'imagemagick-types)
       ;; Only do this when ImageMagick is supported.
       ;; FIXME: When requiring Emacs 27+, remove this (I guess?).
@@ -7240,29 +7310,63 @@ options `leman-room-image-thumbnail-height' and
     (setf (image-property image :scale) 1.0
           (image-property image :max-width) nil
           (image-property image :max-height) nil)
-    (unless (get-buffer buffer-name)
-      (with-current-buffer (get-buffer-create buffer-name)
-        (erase-buffer)
-        (insert-image image)
-        (image-mode)))
-    (pop-to-buffer buffer-name
-                   '((display-buffer-pop-up-frame
-                      (pop-up-frame-parameters . ((fullscreen . t) (maximized . t))))))))
+    (with-current-buffer (get-buffer-create buffer-name)
+      (erase-buffer)
+      (insert-image image)
+      (image-mode)))
+  (pop-to-buffer buffer-name
+                 '((display-buffer-pop-up-frame
+                    (pop-up-frame-parameters . ((fullscreen . t) (maximized . t)))))))
 
-(cl-defun leman-room--image-download (event session &key then else (authenticatedp t))
+(cl-defun leman-room--image-download (event session &key then else (authenticatedp t) full)
   "Download image EVENT on SESSION and call THEN, else ELSE.
 If AUTHENTICATEDP, send authenticated request to new
 endpoint (Matrix 1.11, MSC3911); otherwise send old-style,
-unauthenticated request to old endpoint.  Prefers the event's
-thumbnail, if any, for speed (the full-size image can be very
-large; use `leman-room-image-show' to view it)."
+unauthenticated request to old endpoint.
+
+Unless FULL, prefers the event's thumbnail, if any, or else a
+thumbnail scaled by the server to the size the image is shown at
+(see `leman-room--image-thumbnail'): Emacs rescales images from
+their original size every time they are drawn, which takes
+hundreds of milliseconds for a large screenshot.  When a
+thumbnail is requested, EVENT's `image-thumbnail' local is set,
+so that `leman-room-image-show' downloads the original (with
+FULL)."
   (declare (indent defun))
   (pcase-let* (((cl-struct leman-event content) event)
                ((map ('url mxc)) content)
                ((map ('info (map ('thumbnail_url thumbnail-mxc)))) content)
-               (mxc (or thumbnail-mxc mxc)))
+               (thumbnail (unless (or full thumbnail-mxc)
+                            (leman-room--image-thumbnail event)))
+               (mxc (if (and thumbnail-mxc (not full)) thumbnail-mxc mxc)))
+    (unless full
+      (setf (map-elt (leman-event-local event) 'image-thumbnail)
+            (and (or thumbnail-mxc thumbnail) t)))
     (leman--media-request mxc session :then then :else else
-      :queue leman-images-queue :authenticatedp authenticatedp)))
+      :queue leman-images-queue :authenticatedp authenticatedp
+      :thumbnail thumbnail)))
+
+(defun leman-room--image-thumbnail (event)
+  "Return the thumbnail to request for image EVENT, or nil.
+Return a (WIDTH HEIGHT \"scale\") list (see
+`leman--thumbnail-params') covering the size the image is shown
+at in the current room (see `leman-room--image-max-sizes'),
+capped at 800x600, the largest size servers commonly
+pre-generate.  Return nil when the original should be downloaded:
+for types that may be animated (servers may return a still frame)
+or that servers can't scale, and for images that already fit."
+  (pcase-let* (((cl-struct leman-event content) event)
+               ((map ('info (map mimetype w h))) content)
+               (buffer (and (bound-and-true-p leman-room)
+                            (map-elt (leman-room-local leman-room) 'buffer)))
+               (`(,max-height . ,max-width)
+                (leman-room--image-max-sizes
+                 (and (buffer-live-p buffer) (get-buffer-window buffer))))
+               (width (min max-width 800))
+               (height (min max-height 600)))
+    (unless (or (member mimetype '("image/gif" "image/webp" "image/svg+xml"))
+                (and (numberp w) (numberp h) (<= w width) (<= h height)))
+      (list width height "scale"))))
 
 (defun leman-room--m.image-download-error (event session then plz-error)
   "Handle PLZ-ERROR from a failed request to download EVENT's image on SESSION.

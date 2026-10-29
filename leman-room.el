@@ -309,8 +309,19 @@ the second, the optional event ID.  Both may be percent-encoded.")
 (defcustom leman-room-animate-message-images t
   "Animate images in message bodies, if the format supports it.
 Rooms containing many animated images can overload redisplay, in
-which case setting this to nil shows their first frame instead."
+which case setting this to nil shows their first frame instead.
+See also `leman-room-image-animation-interval'."
   :type 'boolean
+  :group 'leman-room-images)
+
+(defcustom leman-room-image-animation-interval 0.1
+  "Seconds between frame updates of animated images in rooms.
+Animated images are advanced together, at most this often, and
+only while visible in a window.  Frames shorter than this are
+skipped (the animation keeps its speed).  Larger values reduce the
+redisplay load in rooms with many animated images.  Takes effect
+when the next animation is started."
+  :type 'number
   :group 'leman-room-images)
 
 (defvar leman-room-message-history nil
@@ -5894,29 +5905,104 @@ it (see `leman-room-toggle-spoiler')."
       (funcall (symbol-function 'shr-generic) dom)
       (add-text-properties content-beg (point) props))))
 
+(defvar-local leman-room--animations nil
+  "Animated images in this buffer.
+A list of (IMAGE MARKER START COUNT DELAY): IMAGE is displayed at
+MARKER, and has COUNT frames shown DELAY seconds each, starting at
+time START.  See `leman-room--animation-tick'.")
+
+(defvar leman-room--animation-timer nil
+  "Timer advancing animated images in room buffers.")
+
+(defun leman-room--display-image (display)
+  "Return the image in DISPLAY property value, if any."
+  (cond ((imagep display) display)
+        ((and (consp display) (imagep (car display)))
+         (car display))))
+
 (defun leman-room--animate-images (beg end)
   "Start animating multi-frame images between BEG and END.
 Images are rendered by shr in a temporary buffer, where an
 animation cannot be anchored (the rendering is copied out of that
-buffer, and animations must be anchored to where an image is
-actually displayed to keep running and be updated), so instead
-the animations are started here, after the rendering has been
-inserted into the room buffer."
+buffer), so instead the animations are registered here, after the
+rendering has been inserted into the room buffer.
+
+NOTE: Images are not animated with `image-animate', which runs a
+timer per image at the image's own frame rate (often 30-50 fps for
+custom emoji), and forces a redisplay of the whole window for each
+frame, even when the image is scrolled out of view or its buffer is
+hidden.  A room with a few dozen animated emoji then keeps Emacs
+busy redisplaying.  Instead, `leman-room--animation-tick' advances
+all of them together, and only those actually visible."
   (when leman-room-animate-message-images
     (save-excursion
       (goto-char beg)
       (while (< (point) end)
-        (when-let* ((display (get-text-property (point) 'display))
-                    (image (cond ((imagep display) display)
-                                 ((and (consp display) (imagep (car display)))
-                                  (car display))))
-                    ((cdr (image-multi-frame-p image))))
-          ;; Anchoring the animation to this buffer and position
-          ;; makes it stop by itself when the image is no longer
-          ;; displayed here (e.g. its node was re-rendered).
-          (image-animate image nil t (point)))
+        (when-let* ((image (leman-room--display-image
+                            (get-text-property (point) 'display)))
+                    (multi-frame (image-multi-frame-p image))
+                    ((cdr multi-frame)))
+          (setf leman-room--animations
+                (cons (list image (copy-marker (point)) (float-time)
+                            (car multi-frame)
+                            (max (cdr multi-frame) image-minimum-frame-delay))
+                      (cl-delete image leman-room--animations
+                                 :key #'car :test #'eq))))
         (goto-char (or (next-single-property-change (point) 'display nil end)
-                       end))))))
+                       end))))
+    (when (and leman-room--animations
+               (not (memq leman-room--animation-timer timer-list)))
+      (setf leman-room--animation-timer
+            (run-with-timer leman-room-image-animation-interval
+                            leman-room-image-animation-interval
+                            #'leman-room--animation-tick)))))
+
+(defun leman-room--animation-tick ()
+  "Advance the animated images of room buffers.
+Only images within a window's visible range are advanced, with one
+redisplay per buffer.  Frames are chosen by elapsed time, so
+animations keep their speed even when frames are skipped.
+Animations of images no longer displayed (e.g. their event was
+re-rendered) are dropped, and the timer is cancelled when none
+remain."
+  (let ((now (float-time))
+        (remaining nil))
+    (dolist (buffer (buffer-list))
+      (when (buffer-local-value 'leman-room--animations buffer)
+        (with-current-buffer buffer
+          (with-demoted-errors "Leman: Error animating images: %S"
+            (setf leman-room--animations
+                  (cl-delete-if-not
+                   (pcase-lambda (`(,image ,marker . ,_))
+                     (and leman-room-animate-message-images
+                          (marker-position marker)
+                          (eq image (leman-room--display-image
+                                     (get-text-property marker 'display)))))
+                   leman-room--animations))
+            (when leman-room--animations
+              (setf remaining t)
+              ;; Don't delay input handling with redisplays.
+              (unless (input-pending-p)
+                (let ((ranges (mapcar (lambda (window)
+                                        (cons (window-start window)
+                                              (window-end window)))
+                                      (get-buffer-window-list buffer nil 'visible)))
+                      (changed nil))
+                  (when ranges
+                    (pcase-dolist (`(,image ,marker ,start ,count ,delay)
+                                   leman-room--animations)
+                      (when (cl-loop for (beg . end) in ranges
+                                     thereis (<= beg marker end))
+                        (let ((frame (mod (floor (- now start) delay) count)))
+                          (unless (eql frame (or (image-property image :index) 0))
+                            (setf (image-property image :index) frame
+                                  changed t)))))
+                    (when changed
+                      (force-window-update buffer))))))))))
+    (unless remaining
+      (when leman-room--animation-timer
+        (cancel-timer leman-room--animation-timer))
+      (setf leman-room--animation-timer nil))))
 
 (cl-defun leman-room--event-mentions-user-p (event user &optional (room leman-room))
   "Return non-nil if EVENT in ROOM mentions USER."

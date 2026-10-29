@@ -26,14 +26,18 @@
 ;;   and name beside a timestamp on the first line, and a preview of
 ;;   the latest message beside an unread badge on the second.
 ;;
-;; * Invitations, if any, are listed first; then favourite rooms; then
+;; * Only rooms with unread messages, and invitations, are listed by
+;;   default (see `leman-inbox-unread-only'; press "a" to show all
+;;   rooms).  Invitations are listed first; then favourite rooms; then
 ;;   everything else.  Within each group, unread rooms float to the
 ;;   top, most recently active first.  That makes
 ;;   `leman-inbox-next-unread' (bound to SPC) the main flow: press it
 ;;   repeatedly to open each unread room in turn.  Rooms are opened in
-;;   another window (see `leman-inbox-display-buffer-action'), which
-;;   remains unselected by default (see `leman-inbox-select-room'), so
-;;   the inbox stays visible and in focus.
+;;   another window, beside the inbox (see
+;;   `leman-inbox-display-buffer-action' and
+;;   `leman-inbox-split-direction'), which remains unselected by
+;;   default (see `leman-inbox-select-room'), so the inbox stays
+;;   visible and in focus.
 ;;
 ;; * Left rooms are hidden by default, and low-priority rooms are not
 ;;   treated specially.
@@ -106,6 +110,13 @@ derived from its name."
   "Show rooms that have been left."
   :type 'boolean)
 
+(defcustom leman-inbox-unread-only t
+  "Show only rooms with unread messages, and invitations.
+While a filter is active (see `leman-inbox-filter'), all matching
+rooms are shown, so that any room can be found.  Toggled with
+\\<leman-inbox-mode-map>\\[leman-inbox-toggle-unread-only]."
+  :type 'boolean)
+
 (defcustom leman-inbox-line-spacing 2
   "Space in pixels between inbox rows, or nil for none."
   :type '(choice (const :tag "None" nil) natnum))
@@ -113,11 +124,21 @@ derived from its name."
 (defcustom leman-inbox-display-buffer-action '((leman-inbox--display-room))
   "Display action used when opening a room from the inbox.
 By default, a window already showing a Leman room buffer is
-reused, or a new one is split off, so the inbox remains visible.
+reused, or a new one is split off the inbox's window (see
+`leman-inbox-split-direction'), so the inbox remains visible.
 See function `display-buffer' and Info node `(elisp) Buffer
 Display Action Functions'."
   :type display-buffer--action-custom-type
   :risky t)
+
+(defcustom leman-inbox-split-direction 'right
+  "Where to split off a window for rooms opened from the inbox.
+The inbox's window is split in this direction (with `right', the
+room is shown beside the inbox), unless a window already shows a
+room.  When the inbox's window is too small to be split that way,
+it is split below.  Used by `leman-inbox--display-room'."
+  :type '(choice (const :tag "Beside the inbox" right)
+                 (const :tag "Below the inbox" below)))
 
 (defcustom leman-inbox-select-room nil
   "Select the room's window after opening it from the inbox.
@@ -211,6 +232,7 @@ when SVG images are available."
     (define-key map "k" #'leman-inbox-kill-room-buffer)
     (define-key map "m" #'leman-inbox-mark-read)
     (define-key map "/" #'leman-inbox-filter)
+    (define-key map "a" #'leman-inbox-toggle-unread-only)
     map)
   "Keymap for `leman-inbox' buffers.
 See also `leman-inbox-row-map'.")
@@ -320,12 +342,19 @@ POSITION defaults to point.  Return nil if point is not on a row."
 (defun leman-inbox--row-bounds (&optional position)
   "Return (BEG . END) of the row at POSITION, or nil.
 POSITION defaults to point."
-  (when (get-text-property (or position (setq position (point)))
-                           'leman-inbox-item)
-    (cons (or (previous-single-property-change position 'leman-inbox-item)
-              (point-min))
-          (or (next-single-property-change position 'leman-inbox-item)
-              (point-max)))))
+  (let* ((position (or position (point)))
+         (item (get-text-property position 'leman-inbox-item)))
+    (when item
+      ;; At a row's first character, the previous character belongs to
+      ;; the previous row (or to no row), so scanning backward would
+      ;; find the previous row's start.
+      (cons (if (and (> position (point-min))
+                     (eq item (get-text-property (1- position) 'leman-inbox-item)))
+                (or (previous-single-property-change position 'leman-inbox-item)
+                    (point-min))
+              position)
+            (or (next-single-property-change position 'leman-inbox-item)
+                (point-max))))))
 
 (defun leman-inbox--next-item-position (position)
   "Return the position of the first row after POSITION, or nil."
@@ -639,6 +668,14 @@ reactions; the latest message is shown instead."
         ;; SVG generation failed: plain text badge.
         (propertize (format " %s " label) 'face face))))
 
+(defun leman-inbox--unread-p (room session)
+  "Return non-nil if ROOM on SESSION is unread, as shown in the inbox.
+That is, if it is unread per `leman--room-unread-p', or has pings
+detected client-side (shown in its badge)."
+  (let ((pings (map-elt (leman-room-local room) 'pings)))
+    (or (and pings (not (zerop pings)))
+        (leman--room-unread-p room session))))
+
 (defun leman-inbox--badge (room session)
   "Return the unread badge string for ROOM on SESSION.
 The string is empty when the room has no unread messages."
@@ -695,7 +732,7 @@ from this week their weekday, and older ones their date."
          (face (pcase status
                  ('invite 'leman-inbox-name-invited)
                  ('leave 'leman-inbox-name-left)
-                 (_ (if (leman--room-unread-p room session)
+                 (_ (if (leman-inbox--unread-p room session)
                         'leman-inbox-name-unread
                       'leman-inbox-name))))
          (name (or (leman-room-display-name room)
@@ -796,20 +833,27 @@ currently displayed."
                        (concat (leman-inbox--align-to-right badge-columns)
                                badge))
                      "\n")
+             ;; NOTE: No `mouse-face': hovering highlights the whole
+             ;; run of text with the same `mouse-face' value, i.e.
+             ;; every consecutive row.  The row at point is
+             ;; highlighted by `hl-line-mode'.
              'leman-inbox-item item
-             'mouse-face 'highlight
              'keymap leman-inbox-row-map))))
 
 ;;;; Entries
 
 (defun leman-inbox--included-p (item)
   "Return non-nil if ITEM, a [room session] vector, should be shown."
-  (pcase-let* ((`[,room ,_session] item)
+  (pcase-let* ((`[,room ,session] item)
                (name (or (leman-room-display-name room)
                          (leman--room-display-name room)
                          "")))
     (and (or leman-inbox-show-left
              (not (equal 'leave (leman-room-status room))))
+         (or (not leman-inbox-unread-only)
+             leman-inbox-filter-regexp
+             (equal 'invite (leman-room-status room))
+             (leman-inbox--unread-p room session))
          (or (null leman-inbox-filter-regexp)
              (string-match-p leman-inbox-filter-regexp name)
              (when-let ((alias (leman-room-canonical-alias room)))
@@ -823,8 +867,8 @@ broken by room ID so that the order is deterministic."
   (cl-labels ((newer-p (a b)
                 (pcase-let* ((`[,room-a ,session-a] a)
                              (`[,room-b ,session-b] b)
-                             (unread-a (leman--room-unread-p room-a session-a))
-                             (unread-b (leman--room-unread-p room-b session-b))
+                             (unread-a (leman-inbox--unread-p room-a session-a))
+                             (unread-b (leman-inbox--unread-p room-b session-b))
                              (ts-a (or (leman-room-latest-ts room-a) 0))
                              (ts-b (or (leman-room-latest-ts room-b) 0)))
                   (cond ((not (equal unread-a unread-b)) unread-a)
@@ -836,8 +880,8 @@ broken by room ID so that the order is deterministic."
 (defun leman-inbox--groups ()
   "Return (INVITED FAVOURITES OTHER) for display.
 Each is a list of [room session] vectors, sorted by
-`leman-inbox--sort'.  Left rooms and rooms not matching
-`leman-inbox-filter-regexp' are omitted."
+`leman-inbox--sort'.  Rooms are omitted per
+`leman-inbox--included-p'."
   (let ((invited nil) (favourites nil) (other nil))
     (cl-loop for (_id . session) in leman-sessions
              do (cl-loop for room in (leman-session-rooms session)
@@ -881,8 +925,8 @@ buffer, used to compute row widths, or nil if not displayed."
                  (entries (append invited favourites other))
                  (unread-count (cl-count-if
                                 (lambda (item)
-                                  (leman--room-unread-p (elt item 0)
-                                                        (elt item 1)))
+                                  (leman-inbox--unread-p (elt item 0)
+                                                         (elt item 1)))
                                 entries))
                  (previous-item (leman-inbox--item-at-point)))
       (setf leman-inbox--render-width
@@ -895,12 +939,19 @@ buffer, used to compute row widths, or nil if not displayed."
         (when favourites
           (leman-inbox--insert-group "Pinned" favourites window))
         (if (and (null invited) (null favourites) (null other))
-            (insert (propertize " No chats\n" 'face 'leman-inbox-header))
+            (insert (propertize (if (and leman-inbox-unread-only
+                                         (not leman-inbox-filter-regexp))
+                                    " No unread chats\n"
+                                  " No chats\n")
+                                'face 'leman-inbox-header))
           (dolist (item other)
             (leman-inbox--insert-row item window))))
       (setf header-line-format
-            (concat (propertize (format " Inbox · %d chats · %d unread"
-                                        (length entries) unread-count)
+            (concat (propertize (if (and leman-inbox-unread-only
+                                         (not leman-inbox-filter-regexp))
+                                    (format " Inbox · %d unread" unread-count)
+                                  (format " Inbox · %d chats · %d unread"
+                                          (length entries) unread-count))
                                 'face 'leman-inbox-header)
                     (when leman-inbox-filter-regexp
                       (propertize (format " · filter: %s"
@@ -1099,7 +1150,8 @@ like binary garbage."
   "Display room BUFFER for rooms opened from the inbox.
 Reuse a window already showing a Leman room or thread buffer, if
 any; otherwise split off a new window, preferably from the
-inbox's.  To be used as a `display-buffer' action function; see
+inbox's, in `leman-inbox-split-direction'.  To be used as a
+`display-buffer' action function; see
 `leman-inbox-display-buffer-action', which defaults to it."
   (or (display-buffer-reuse-window buffer alist)
       (if-let ((window (cl-loop for window in (window-list nil 'never)
@@ -1112,8 +1164,11 @@ inbox's.  To be used as a `display-buffer' action function; see
                                                               (window-buffer window)))
                                 return window)))
           (window--display-buffer buffer window 'reuse)
-        (let ((window (or (split-window-sensibly (selected-window))
-                          (split-window (selected-window) nil 'below))))
+        (let ((window (condition-case nil
+                          (split-window (selected-window) nil
+                                        leman-inbox-split-direction)
+                        ;; Too small to be split that way.
+                        (error (split-window (selected-window) nil 'below)))))
           (window--display-buffer buffer window 'window)))))
 
 (defun leman-inbox--view (room session)
@@ -1160,12 +1215,12 @@ By default the inbox remains visible and selected; see
   "Return the first unread item at a row at or after POSITION, or nil."
   (catch 'found
     (when-let ((item (get-text-property position 'leman-inbox-item))
-               ((leman--room-unread-p (elt item 0) (elt item 1))))
+               ((leman-inbox--unread-p (elt item 0) (elt item 1))))
       (throw 'found item))
     (let ((scan position))
       (while (setf scan (leman-inbox--next-item-position scan))
         (let ((item (get-text-property scan 'leman-inbox-item)))
-          (when (leman--room-unread-p (elt item 0) (elt item 1))
+          (when (leman-inbox--unread-p (elt item 0) (elt item 1))
             (throw 'found item))))
       nil)))
 
@@ -1220,6 +1275,15 @@ With empty input, clear the filter."
                       leman-inbox-filter-regexp)))
   (setf leman-inbox-filter-regexp (and (not (string-empty-p regexp)) regexp))
   (leman-inbox--render))
+
+(defun leman-inbox-toggle-unread-only ()
+  "Toggle showing only unread rooms, or all rooms.
+See `leman-inbox-unread-only'."
+  (interactive)
+  (setf leman-inbox-unread-only (not leman-inbox-unread-only))
+  (leman-inbox--render)
+  (message "Leman inbox: showing %s"
+           (if leman-inbox-unread-only "unread rooms" "all rooms")))
 
 ;;;; Mode
 

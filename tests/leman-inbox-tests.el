@@ -131,9 +131,11 @@
     session))
 
 (defmacro leman-inbox-tests--with-inbox (&rest body)
-  "Run BODY in a rendered inbox buffer with fixture rooms."
+  "Run BODY in a rendered inbox buffer with fixture rooms.
+All rooms are shown, not only unread ones."
   (declare (indent 0))
-  `(let ((leman-inbox-buffer-name "*leman-inbox-tests*"))
+  `(let ((leman-inbox-buffer-name "*leman-inbox-tests*")
+         (leman-inbox-unread-only nil))
      (setf leman-sessions (list (cons "@me:example.org"
                                       (leman-inbox-tests--session))))
      (leman-inbox :display-buffer-action nil)
@@ -169,10 +171,10 @@
                    '("!invite:example.org"  ; Invites group.
                      "!fav:example.org"     ; Pinned group.
                      "!mention:example.org" ; Unread, most recent first.
+                     "!pinged:example.org"  ; Client-side pings count as unread.
                      "!group:example.org"
                      "!enc:example.org"
-                     "!pinged:example.org"  ; Read, most recent first.
-                     "!edited:example.org"
+                     "!edited:example.org"  ; Read, most recent first.
                      "!dm:example.org"
                      "!space:example.org")))
     ;; Left rooms are hidden by default.
@@ -294,7 +296,8 @@
   ;; A body containing raw binary data (for example image bytes that a
   ;; bridge mislabels as text) is shown as a placeholder, never as
   ;; binary garbage.
-  (let* ((session (make-leman-session :user (make-leman-user :id "@me:example.org")))
+  (let* ((leman-inbox-unread-only nil)
+         (session (make-leman-session :user (make-leman-user :id "@me:example.org")))
          (room (make-leman-room
                 :id "!bin:example.org" :status 'join :display-name "Binary Room"
                 :timeline (list (make-leman-event
@@ -350,7 +353,8 @@
             ((symbol-function 'svg-lib-tag)
              (lambda (label &optional style &rest args)
                (list 'image :type 'svg :data (format "<svg>%s</svg>" label)))))
-    (let* ((leman-inbox-avatar-generation t)
+    (let* ((leman-inbox-unread-only nil)
+           (leman-inbox-avatar-generation t)
            (session (make-leman-session :user (make-leman-user :id "@me:example.org")))
            (string-display (make-leman-room :id "!s:example.org" :status 'join
                                             :display-name "String Display"
@@ -375,7 +379,8 @@
 (ert-deftest leman-inbox-debug ()
   ;; `leman-inbox-debug' reports binary characters as text, including
   ;; the row they occur in, and binary data in the live sessions.
-  (let* ((session (make-leman-session :user (make-leman-user :id "@me:example.org")))
+  (let* ((leman-inbox-unread-only nil)
+         (session (make-leman-session :user (make-leman-user :id "@me:example.org")))
          (room (make-leman-room
                 :id "!bin:example.org" :status 'join :display-name "Binary Room"
                 :timeline (list (make-leman-event
@@ -472,7 +477,41 @@
     (leman-inbox-tests--at-row 0
       (let ((bounds (leman-inbox--row-bounds)))
         (should (and bounds (< (car bounds) (cdr bounds))))
-        (should (equal bounds (leman-inbox--hl-line-range)))))))
+        (should (equal bounds (leman-inbox--hl-line-range))))
+      ;; At a row's start, the bounds don't extend into the previous row.
+      (leman-inbox-next-row)
+      (let ((bounds (leman-inbox--row-bounds)))
+        (should (= (car bounds) (point)))
+        (should (equal "!fav:example.org"
+                       (leman-room-id (elt (get-text-property (1- (cdr bounds))
+                                                              'leman-inbox-item)
+                                           0)))))))
+  ;; Rows have no `mouse-face': it would highlight every consecutive
+  ;; row at once.
+  (leman-inbox-tests--with-inbox
+    (should-not (text-property-not-all (point-min) (point-max) 'mouse-face nil))))
+
+(ert-deftest leman-inbox-unread-only ()
+  "By default, only unread rooms and invites are shown."
+  (leman-inbox-tests--with-inbox
+    (setf leman-inbox-unread-only t)
+    (leman-inbox--render)
+    (should (equal (leman-inbox-tests--room-ids)
+                   '("!invite:example.org"
+                     "!mention:example.org"
+                     "!pinged:example.org"
+                     "!group:example.org"
+                     "!enc:example.org")))
+    (should (string-match-p "4 unread" (format "%s" header-line-format)))
+    ;; A filter searches all rooms, read ones included.
+    (leman-inbox-filter "Chen")
+    (should (equal (leman-inbox-tests--room-ids) '("!dm:example.org")))
+    (leman-inbox-filter "")
+    ;; Toggling shows all rooms, and back.
+    (leman-inbox-toggle-unread-only)
+    (should (member "!fav:example.org" (leman-inbox-tests--room-ids)))
+    (leman-inbox-toggle-unread-only)
+    (should-not (member "!fav:example.org" (leman-inbox-tests--room-ids)))))
 
 (ert-deftest leman-inbox-filter ()
   (leman-inbox-tests--with-inbox
@@ -548,7 +587,10 @@
         (let ((leman-room-unread-only-counts-notifications t))
           (cl-loop for (_id . session) in leman-sessions
                    do (cl-loop for room in (leman-session-rooms session)
-                               do (setf (leman-room-unread-notifications room) nil)))
+                               do (setf (leman-room-unread-notifications room) nil
+                                        ;; No client-side pings either (the
+                                        ;; fixture's alist is a constant).
+                                        (leman-room-local room) nil)))
           (leman-inbox--render)
           (goto-char (point-min))
           (leman-inbox-next-unread)
@@ -578,7 +620,7 @@
   (let ((leman-inbox-buffer-name "*leman-inbox-tests-empty*"))
     (leman-inbox :display-buffer-action nil)
     (with-current-buffer leman-inbox-buffer-name
-      (should (string-match-p "No chats" (buffer-substring-no-properties
+      (should (string-match-p "No unread chats" (buffer-substring-no-properties
                                           (point-min) (point-max)))))))
 
 (ert-deftest leman-inbox--display-room-reuses-or-splits-windows ()
@@ -612,6 +654,8 @@ never used."
                                               '((leman-inbox--display-room)))))
               (should (window-live-p displayed))
               (should-not (eq displayed inbox-window))
+              ;; Beside the inbox, per `leman-inbox-split-direction'.
+              (should (eq displayed (window-in-direction 'right inbox-window)))
               (should (eq (window-buffer displayed) new-room))
               (should (eq (window-buffer inbox-window) inbox)))))
       (dolist (buffer (list inbox room-buffer new-room))

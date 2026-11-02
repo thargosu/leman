@@ -694,6 +694,198 @@ never used."
                    'leman-inbox-preview-mention))
     (should-not (get-text-property (string-match-p "please" string) 'face string))))
 
+;;;; Threads
+
+(defun leman-inbox-tests--reply (id sender body root-id seconds-ago)
+  "Return a reply event with ID, SENDER, and BODY in thread ROOT-ID."
+  (make-leman-event :id id :type "m.room.message" :sender sender
+                    :origin-server-ts (leman-inbox-tests--ts seconds-ago)
+                    :content `((body . ,body) (msgtype . "m.text")
+                               (m.relates_to . ((rel_type . "m.thread")
+                                                (event_id . ,root-id))))))
+
+(defun leman-inbox-tests--threads-session (&optional bridge-content)
+  "Return a session with a room whose new messages are mostly in a thread.
+The room was read up to its root message, 1000 seconds ago.  Then
+came one main message, and four thread replies, one of which was
+sent before the room was read.  With BRIDGE-CONTENT, the room has
+bridge-published unread threads with that content."
+  (let* ((me (make-leman-user :id "@me:example.org" :displayname "Me"))
+         (bob (make-leman-user :id "@bob:example.org" :displayname "Bob"))
+         (carol (make-leman-user :id "@carol:example.org" :displayname "Carol"))
+         (root (leman-inbox-tests--msg "$root" carol "Malicious attachments" 2000))
+         (timeline
+          (list (leman-inbox-tests--reply "$r4" bob "on it @me:example.org" "$root" 10)
+                (leman-inbox-tests--msg "$main" bob "unrelated news" 20)
+                (leman-inbox-tests--reply "$r3" bob "third" "$root" 30)
+                (leman-inbox-tests--reply "$r2" carol "second" "$root" 40)
+                (leman-inbox-tests--msg "$read" carol "read up to here" 1000)
+                (leman-inbox-tests--reply "$r1" bob "first, already read" "$root" 1500)
+                root))
+         (events (make-hash-table :test #'equal))
+         (session (make-leman-session :user me :events events))
+         (room (make-leman-room
+                :id "!sec:example.org" :status 'join :display-name "securite"
+                ;; Conduit counts the thread replies too.
+                :unread-notifications '((notification_count . 4) (highlight_count . 1))
+                :account-data
+                (append
+                 (list (cons "m.fully_read"
+                             (list (cons 'content (list (cons 'event_id "$read"))))))
+                 (when bridge-content
+                   (list (cons leman-threads-bridge-account-data-type
+                               (list (cons 'type leman-threads-bridge-account-data-type)
+                                     (cons 'content bridge-content))))))
+                :timeline timeline
+                :latest-ts (leman-inbox-tests--ts 10))))
+    (dolist (event timeline)
+      (puthash (leman-event-id event) event events))
+    (puthash "@me:example.org"
+             (cons "$read" (leman-inbox-tests--ts 900))
+             (leman-room-receipts room))
+    (setf (leman-session-rooms session) (list room))
+    session))
+
+(defmacro leman-inbox-tests--with-threads (bridge-content &rest body)
+  "Run BODY with `room' and `session' bound to a threads fixture.
+BRIDGE-CONTENT is passed to `leman-inbox-tests--threads-session'.
+Saving read positions and sending receipts are stubbed: receipts
+are pushed to `receipts' as (EVENT-ID . ROOT-ID)."
+  (declare (indent 1))
+  `(let* ((session (leman-inbox-tests--threads-session ,bridge-content))
+          (room (car (leman-session-rooms session)))
+          (receipts nil)
+          (leman-room-ping-text-fallback t))
+     (ignore room receipts)
+     (cl-letf (((symbol-function 'leman-threads--schedule-save) #'ignore)
+               ((symbol-function 'leman-threads--send-receipt)
+                (lambda (_room _session event root-id)
+                  (push (cons (leman-event-id event) root-id) receipts))))
+       ,@body)))
+
+(ert-deftest leman-threads-unread-from-replies ()
+  "Unread threads are computed from known replies."
+  (leman-inbox-tests--with-threads nil
+    (let ((threads (leman-threads-unread room session)))
+      (should (= 1 (length threads)))
+      (should (equal "$root" (leman-thread-root-id (car threads))))
+      ;; The reply sent before the room was read is read.
+      (should (= 3 (leman-thread-count (car threads))))
+      (should (= 1 (leman-thread-mentions (car threads))))
+      (should (equal "$r4" (leman-thread-latest-event-id (car threads)))))
+    ;; The room's counts exclude the thread's replies.
+    (should (equal '(1 . 0) (leman-threads-main-counts room session)))
+    (should (leman-threads-room-unread-p room session))))
+
+(ert-deftest leman-threads-own-reply-reads-thread ()
+  "Replying in a thread marks the replies before it read."
+  (leman-inbox-tests--with-threads nil
+    (push (leman-inbox-tests--reply "$mine" (leman-session-user session)
+                                    "looking" "$root" 25)
+          (leman-room-timeline room))
+    (should (= 1 (leman-thread-count (car (leman-threads-unread room session)))))))
+
+(ert-deftest leman-threads-reading-main-timeline-keeps-threads-unread ()
+  "Moving the room's read marker past thread replies keeps them unread."
+  (leman-inbox-tests--with-threads nil
+    ;; Track the room's threads, then read its main timeline.
+    (leman-threads-unread room session)
+    (setf (alist-get "m.fully_read" (leman-room-account-data room) nil nil #'equal)
+          (list (cons 'content (list (cons 'event_id "$main")))))
+    (cl-incf leman-threads--tick)
+    (should (= 3 (leman-thread-count (car (leman-threads-unread room session)))))))
+
+(ert-deftest leman-threads-mark-read ()
+  "Marking a thread read clears it, without sending receipts unbridged."
+  (leman-inbox-tests--with-threads nil
+    (leman-threads-mark-read room session "$root")
+    (should-not (leman-threads-unread room session))
+    ;; Conduit would reset the room's counts on any receipt.
+    (should-not receipts)))
+
+(ert-deftest leman-threads-bridge ()
+  "Bridge-published unread threads are used when present."
+  (leman-inbox-tests--with-threads
+      ;; As read by `json-read': keys are symbols.
+      `((main . ((unread . 6) (mentions . 0)))
+        (threads . (($root . ((unread . 42) (mentions . 1)
+                              (latest_ts . ,(leman-inbox-tests--ts 10))
+                              (latest_event_id . "$r4"))))))
+    (let ((thread (car (leman-threads-unread room session))))
+      (should (= 42 (leman-thread-count thread)))
+      (should (= 1 (leman-thread-mentions thread)))
+      (should (equal "$r4" (leman-event-id (leman-thread-latest-event thread)))))
+    (should (equal '(6 . 0) (leman-threads-main-counts room session)))
+    ;; Reading it hides it until the bridge updates, and sends a
+    ;; threaded receipt, for the bridge to mark it read.
+    (leman-threads-mark-read room session "$root")
+    (should-not (leman-threads-unread room session))
+    (should (equal '(("$r4" . "$root")) receipts))))
+
+(ert-deftest leman-threads-latest-main-event ()
+  "Main-timeline read markers skip thread replies."
+  (leman-inbox-tests--with-threads nil
+    (should (equal "$main" (leman-event-id
+                            (leman-threads-latest-main-event room session))))))
+
+(ert-deftest leman-threads-timeline-unread-ignores-replies ()
+  "A thread reply after the read markers doesn't make the timeline unread."
+  (let* ((me (make-leman-user :id "@me:example.org"))
+         (bob (make-leman-user :id "@bob:example.org"))
+         (receipts (make-hash-table :test #'equal)))
+    (puthash "@me:example.org" (cons "$main" 0) receipts)
+    (should-not (leman--timeline-unread-p
+                 (list (leman-inbox-tests--reply "$r" bob "reply" "$root" 1)
+                       (leman-inbox-tests--msg "$main" bob "main" 2))
+                 receipts "$main" (leman-user-id me)))))
+
+(ert-deftest leman-inbox-threads-section ()
+  "Unread threads are listed in their own section."
+  (leman-inbox-tests--with-threads nil
+    (let ((leman-inbox-buffer-name "*leman-inbox-tests*")
+          (leman-inbox-unread-only t))
+      (setf leman-sessions (list (cons "@me:example.org" session)))
+      (leman-inbox :display-buffer-action nil)
+      (with-current-buffer leman-inbox-buffer-name
+        (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+          (should (string-match-p " Chats\n" text))
+          (should (string-match-p " Threads\n" text))
+          ;; The room's preview is its latest main message.
+          (should (string-match-p "Bob: unrelated news" text))
+          ;; The thread's row shows its room, root, and latest reply.
+          (should (string-match-p "securite › Carol: Malicious attachments" text))
+          (should (string-match-p "Bob: on it" text))
+          (should (string-match-p "· 1 thread" (format "%s" header-line-format))))
+        ;; SPC opens the room, then the thread.
+        (let (opened)
+          (cl-letf (((symbol-function 'leman-view-room)
+                     (lambda (room _session) (push (leman-room-id room) opened)))
+                    ((symbol-function 'leman-room-goto-fully-read-marker) #'ignore)
+                    ((symbol-function 'leman-room--view-thread)
+                     (lambda (root-id &rest _) (push root-id opened))))
+            (goto-char (point-min))
+            (leman-inbox-next-unread)
+            (leman-inbox-tests--at-row 1
+              (leman-inbox-next-unread))
+            (should (equal '("$root" "!sec:example.org") opened))))
+        ;; "m" on the thread row marks the thread read, not the room.
+        (leman-inbox-tests--at-row 1
+          (leman-inbox-mark-read))
+        (should-not (string-match-p " Threads\n" (buffer-string)))
+        (should (string-match-p "unrelated news" (buffer-string)))))))
+
+(ert-deftest leman-inbox-thread-only-room-not-unread ()
+  "A room whose only new messages are thread replies is not listed as unread."
+  (leman-inbox-tests--with-threads nil
+    ;; Drop the main message, and the server's count of it.
+    (setf (leman-room-timeline room)
+          (cl-remove "$main" (leman-room-timeline room)
+                     :key #'leman-event-id :test #'equal)
+          (leman-room-unread-notifications room)
+          '((notification_count . 3) (highlight_count . 1)))
+    (should-not (leman-threads-room-unread-p room session))
+    (should (leman-threads-unread room session))))
+
 ;;;; Footer
 
 (provide 'leman-inbox-tests)

@@ -88,7 +88,7 @@ Hooks are called with one argument, the session that was
 synced.")
 
 (defvar leman-event-hook
-  '(leman-notify leman--process-event leman--put-event)
+  '(leman-notify leman--process-event leman--put-event leman-room--thread-event)
   "Hook called for events.
 Each function is called with three arguments: the event, the
 room, and the session.  This hook isn't intended to be modified

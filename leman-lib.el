@@ -1709,6 +1709,20 @@ Works in major-modes `leman-room-mode',
           (string (setf tag (intern tag))))
         (assoc tag tags)))))
 
+(defun leman--event-thread-root-id (event &optional session)
+  "Return the ID of the root of the thread EVENT is part of, or nil.
+EVENT is part of a thread if it relates to its root with an
+\"m.thread\" relationship, or, when SESSION's events table knows
+the event it edits, if it edits such an event."
+  (pcase-let (((map ('m.relates_to (map ('rel_type rel-type) ('event_id related-id))))
+               (leman-event-content event)))
+    (pcase rel-type
+      ("m.thread" related-id)
+      ("m.replace" (when-let* ((events (and session (leman-session-events session)))
+                               (edited (gethash related-id events))
+                               ((not (eq edited event))))
+                     (leman--event-thread-root-id edited))))))
+
 (defun leman--timeline-unread-p (timeline receipts fully-read-event-id our-id)
   "Return non-nil if room TIMELINE is unread for user OUR-ID.
 RECEIPTS is the room's hash table of read receipts, and
@@ -1732,7 +1746,10 @@ event, if known."
 
                   ;; FIXME: Use code from `leman-room--format-member-event' to
                   ;; distinguish ones that should count.
-                  (equal "m.room.message" (leman-event-type event))))
+                  (and (equal "m.room.message" (leman-event-type event))
+                       ;; Thread replies are not part of the main
+                       ;; timeline, whose read markers they never reach.
+                       (not (leman--event-thread-root-id event)))))
       (let ((our-read-receipt-event-id (car (gethash our-id receipts)))
             (first-counting-event (cl-find-if #'event-counts-toward-unread-p timeline)))
         (cond ((equal fully-read-event-id (leman-event-id (car timeline)))

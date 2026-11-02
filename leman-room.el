@@ -51,6 +51,7 @@
 (require 'leman-lib)
 (require 'leman-macros)
 (require 'leman-structs)
+(require 'leman-threads)
 
 ;;;; Structs
 
@@ -3561,16 +3562,10 @@ function to `leman-room-event-fns', which see."
            nil)
           ((equal "m.thread" rel-type)
            ;; Thread reply: aggregate into the thread's data; replies are not shown in the main timeline.
-           (pcase-let* ((root-id (leman-room--add-thread-event event leman-room)))
-             (when-let ((nodes (leman-room--ewoc-last-matching leman-ewoc
-                                 (lambda (data)
-                                   (and (leman-event-p data)
-                                        (equal root-id (leman-event-id data)))))))
-               (ewoc-invalidate leman-ewoc nodes))
-             ;; Refresh an open thread view for this thread.
-             (when-let* ((thread-buffer (leman-room--thread-buffer root-id leman-room))
-                         (root-event (gethash root-id (leman-session-events leman-session))))
-               (leman-room--render-thread thread-buffer root-event))))
+           ;; NOTE: Open thread views are refreshed by
+           ;; `leman-room--thread-event', for rooms without buffers too.
+           (leman-room--invalidate-thread-root
+            (leman-room--add-thread-event event leman-room)))
           ((and leman-room-replace-edited-messages
                 replaces-event-id (equal "m.replace" rel-type))
            ;; Event replaces existing event: find and replace it in buffer if possible, otherwise insert it.
@@ -3763,7 +3758,9 @@ Interactively, mark both types as read up to event at point."
                                     ;; The node is at the end of the buffer: use the last event in the timeline
                                     ;; instead of the last node in the EWOC, because the last event in the timeline
                                     ;; might not be the last event in the EWOC (e.g. a reaction to an earlier event).
-                                    (car (leman-room-timeline leman-room))
+                                    ;; Thread replies are skipped: they are read in their thread.
+                                    (or (leman-threads-latest-main-event leman-room leman-session)
+                                        last-event)
                                   event-at-point)))
        (list leman-room leman-session
              :read-event event-to-mark-read
@@ -5010,6 +5007,41 @@ original ID and relationships."
                "m.thread")
     (map-nested-elt (leman-event-content event) '(m.relates_to event_id))))
 
+(defun leman-room--invalidate-thread-root (root-id)
+  "Redisplay the thread root ROOT-ID in the current room buffer.
+This updates its thread chip."
+  (when-let ((node (leman-room--ewoc-last-matching leman-ewoc
+                     (lambda (data)
+                       (and (leman-event-p data)
+                            (equal root-id (leman-event-id data)))))))
+    (ewoc-invalidate leman-ewoc node)))
+
+(defun leman-room--thread-event (event room session)
+  "Record thread-reply EVENT in ROOM on SESSION.
+Refresh the open thread view showing it, if any, and when it is
+displayed, mark the thread read.  To be called in
+`leman-event-hook', so that thread data is kept for every room,
+not only for ones with buffers."
+  (when-let ((root-id (leman-room--thread-root-id event)))
+    (leman-room--add-thread-event event room)
+    (cl-incf leman-threads--tick)
+    (when-let ((buffer (leman-room--thread-buffer root-id room)))
+      (leman-room--render-thread
+       buffer (or (gethash root-id (leman-session-events session))
+                  (make-leman-event :id root-id)))
+      (when (get-buffer-window buffer 'visible)
+        (leman-threads-mark-read room session root-id)))))
+
+(defun leman-room--thread-read (room _session root-id)
+  "Update the chip of thread ROOT-ID in ROOM's buffer, after it was read.
+To be called in `leman-threads-read-functions'."
+  (when-let ((buffer (alist-get 'buffer (leman-room-local room)))
+             ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (leman-room--invalidate-thread-root root-id))))
+
+(add-hook 'leman-threads-read-functions #'leman-room--thread-read)
+
 (defun leman-room--rerender-thread-for-event (event room)
   "Re-render any open thread buffer for ROOM that shows EVENT.
 EVENT may be the thread's root or a reply in it.  This is
@@ -5053,7 +5085,10 @@ string."
                           (truncate-string-to-width
                            (or (map-elt (leman-event-content latest-event) 'body) "")
                            40 nil nil "…")))
-               (label (if (= count 1) "1 reply" (format "%d replies" count)))
+               (unread (leman-threads-unread-thread room leman-session root-id))
+               (label (concat (if (= count 1) "1 reply" (format "%d replies" count))
+                              (when unread
+                                (format " · %d new" (leman-thread-count unread)))))
                (chip (if (leman-room--svg-rendering-p room)
                          (propertize " " 'display
                                      (svg-lib-tag label (svg-lib-style-compute-default
@@ -5086,13 +5121,14 @@ thread reply at POSITION relates to."
                  (root-id (if (equal rel-type "m.thread") related-id (leman-event-id event))))
       (leman-room--view-thread root-id))))
 
-(cl-defun leman-room--view-thread (root-id)
-  "Open a buffer showing the thread rooted at ROOT-ID.
-The thread's known events are shown; the full thread is fetched
-from the server and the buffer re-rendered when it arrives."
-  (let* ((room leman-room)
-         (session leman-session)
-         (root-event (or (gethash root-id (leman-session-events session))
+(cl-defun leman-room--view-thread (root-id &key (room leman-room) (session leman-session)
+                                            display-action)
+  "Open a buffer showing the thread rooted at ROOT-ID in ROOM on SESSION.
+The buffer is displayed with `pop-to-buffer' and DISPLAY-ACTION.
+The thread's known events are shown, and it is marked read; the
+full thread is fetched from the server and the buffer re-rendered
+when it arrives."
+  (let* ((root-event (or (gethash root-id (leman-session-events session))
                          (make-leman-event :id root-id)))
          (buffer (get-buffer-create
                   (format "*Leman Thread: %s*"
@@ -5105,7 +5141,22 @@ from the server and the buffer re-rendered when it arrives."
             leman-room room
             leman-session session)
       (leman-room--render-thread buffer root-event))
-    (pop-to-buffer buffer)
+    (pop-to-buffer buffer display-action)
+    (leman-threads-mark-read room session root-id)
+    (unless (leman-event-type root-event)
+      ;; Root not known yet (e.g. a thread opened from the inbox):
+      ;; fetch it too.
+      (leman-api session (format "rooms/%s/event/%s"
+                                 (url-hexify-string (leman-room-id room))
+                                 (url-hexify-string root-id))
+        :version "v3"
+        :then (lambda (data)
+                (let ((event (leman--make-event data)))
+                  (puthash root-id event (leman-session-events session))
+                  (when (buffer-live-p buffer)
+                    (setf root-event event)
+                    (leman-room--render-thread buffer root-event))))
+        :else #'ignore))
     ;; Fetch the full thread from the server.
     (leman-api session
         (format "rooms/%s/relations/%s"
@@ -5114,12 +5165,15 @@ from the server and the buffer re-rendered when it arrives."
       :version "v1"
       :params '(("dir" "f") ("limit" "200"))
       :then (lambda (data)
-              (when-let ((buffer-live buffer))
+              (when (buffer-live-p buffer)
                 (with-current-buffer buffer
                   (cl-loop for raw-event across (alist-get 'chunk data)
                            for event = (leman--make-event raw-event)
                            do (leman-room--process-fetched-thread-event event room))
-                  (leman-room--render-thread buffer root-event)))))))
+                  (cl-incf leman-threads--tick)
+                  (leman-room--render-thread buffer root-event)
+                  (when (get-buffer-window buffer 'visible)
+                    (leman-threads-mark-read room session root-id))))))))
 
 (defun leman-room--process-fetched-thread-event (event room)
   "Add fetched thread EVENT to ROOM's thread data."

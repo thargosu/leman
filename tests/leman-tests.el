@@ -1186,6 +1186,95 @@ displayed."
       (should (string-search "[error inserting image" (buffer-string))))
     (kill-buffer thread-buffer)))
 
+(ert-deftest leman-room--add-timeline-thread-events ()
+  "Timeline replies are added to the thread data, with their edits.
+A room's replies are otherwise only added when its buffer
+processes them, so a thread opened from the inbox showed only its
+root."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (reply (make-leman-event :id "$reply" :origin-server-ts 2000
+                                  :type "m.room.message"
+                                  :content '((msgtype . "m.text") (body . "old")
+                                             (m.relates_to . ((rel_type . "m.thread")
+                                                              (event_id . "$root"))))))
+         (edit (make-leman-event :id "$edit" :origin-server-ts 3000
+                                 :type "m.room.message"
+                                 :content '((msgtype . "m.text") (body . "* new")
+                                            (m.new_content . ((msgtype . "m.text")
+                                                              (body . "new")))
+                                            (m.relates_to . ((rel_type . "m.replace")
+                                                             (event_id . "$reply"))))))
+         (other (make-leman-event :id "$other" :origin-server-ts 2500
+                                  :type "m.room.message"
+                                  :content '((msgtype . "m.text") (body . "other")
+                                             (m.relates_to . ((rel_type . "m.thread")
+                                                              (event_id . "$other-root")))))))
+    ;; Latest first, as in `leman-room-timeline'.
+    (setf (leman-room-timeline room) (list edit other reply))
+    (leman-room--add-timeline-thread-events room "$root")
+    (let ((events (leman-room--thread-events room "$root")))
+      (should (equal '("$reply") (mapcar #'leman-event-id events)))
+      (should (equal "new" (alist-get 'body (leman-event-content (car events))))))
+    (should-not (leman-room--thread-events room "$other-root"))
+    ;; Adding again neither duplicates replies nor reapplies edits.
+    (leman-room--add-timeline-thread-events room "$root")
+    (let ((events (leman-room--thread-events room "$root")))
+      (should (= 1 (length events)))
+      ;; The edit's body prepended once to the original's.
+      (should (= 2 (cl-count 'body (leman-event-content (car events))
+                             :key #'car-safe))))))
+
+(ert-deftest leman-room--fetch-thread-paginates ()
+  "Thread replies are fetched page by page, without \"dir=f\".
+Conduit returns no events for \"dir=f\" without a \"from\" token."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (session (make-leman-session :events (make-hash-table :test #'equal)))
+         (requests nil)
+         (done nil))
+    (cl-flet ((raw (id)
+                `((event_id . ,id) (type . "m.room.message") (origin_server_ts . 1)
+                  (sender . "@other:example.com")
+                  (content . ((msgtype . "m.text") (body . ,id)
+                              (m.relates_to . ((rel_type . "m.thread")
+                                               (event_id . "$root"))))))))
+      (cl-letf (((symbol-function #'leman-api)
+                 (lambda (_session endpoint &rest args)
+                   (let ((params (plist-get args :params)))
+                     (push (cons endpoint params) requests)
+                     (funcall (plist-get args :then)
+                              (if (assoc "from" params)
+                                  `((chunk . ,(vector (raw "$b"))))
+                                `((chunk . ,(vector (raw "$a")))
+                                  (next_batch . "page2"))))))))
+        (leman-room--fetch-thread room session "$root"
+          (lambda () (setf done t)))))
+    (should done)
+    (should (= 2 (length requests)))
+    (should-not (cl-some (lambda (request) (assoc "dir" (cdr request))) requests))
+    (should (equal '("$a" "$b")
+                   (sort (mapcar #'leman-event-id
+                                 (leman-room--thread-events room "$root"))
+                         #'string<)))))
+
+(ert-deftest leman-room--rerender-thread-other-thread ()
+  "A thread's late response doesn't render over another thread.
+Thread buffers are per room."
+  (let ((buffer (get-buffer-create "*Leman Thread: test*"))
+        (rendered nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (leman-thread-mode)
+            (setf leman-thread-root-id "$second"))
+          (cl-letf (((symbol-function 'leman-room--render-thread)
+                     (lambda (_buffer event) (push (leman-event-id event) rendered))))
+            (should-not (leman-room--rerender-thread
+                         buffer "$first" (make-leman-event :id "$first")))
+            (should (leman-room--rerender-thread
+                     buffer "$second" (make-leman-event :id "$second"))))
+          (should (equal '("$second") rendered)))
+      (kill-buffer buffer))))
+
 (ert-deftest leman-room--format-m.image-no-duplicate-downloads ()
   "Re-rendering an event does not start a second image download.
 The event may be re-rendered while its image is being downloaded

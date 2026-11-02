@@ -1059,6 +1059,11 @@ otherwise be set manually with `leman-room-left-margin-width' and
   "Number of messages to retrieve when loading earlier messages."
   :type 'integer)
 
+(defcustom leman-room-goto-event-limit 2000
+  "Maximum number of earlier messages to load when looking for an event.
+E.g. when showing a thread's root in its room."
+  :type 'natnum)
+
 (defcustom leman-room-replace-edited-messages t
   "Replace edited messages with their new content.
 When nil, edited messages are displayed as new messages, leaving
@@ -5134,6 +5139,10 @@ when it arrives."
                   (format "*Leman Thread: %s*"
                           (or (leman-room-display-name room)
                               (leman-room-id room))))))
+    ;; Replies seen in the room's timeline are only added to its
+    ;; thread data when its buffer processes them, which it may not
+    ;; have (e.g. a thread opened from the inbox).
+    (leman-room--add-timeline-thread-events room root-id)
     (with-current-buffer buffer
       (unless (derived-mode-p 'leman-thread-mode)
         (leman-thread-mode))
@@ -5153,27 +5162,70 @@ when it arrives."
         :then (lambda (data)
                 (let ((event (leman--make-event data)))
                   (puthash root-id event (leman-session-events session))
-                  (when (buffer-live-p buffer)
-                    (setf root-event event)
-                    (leman-room--render-thread buffer root-event))))
+                  (setf root-event event)
+                  (leman-room--rerender-thread buffer root-id root-event)))
         :else #'ignore))
-    ;; Fetch the full thread from the server.
-    (leman-api session
-        (format "rooms/%s/relations/%s"
-                (url-hexify-string (leman-room-id room))
-                (url-hexify-string root-id))
-      :version "v1"
-      :params '(("dir" "f") ("limit" "200"))
-      :then (lambda (data)
-              (when (buffer-live-p buffer)
-                (with-current-buffer buffer
-                  (cl-loop for raw-event across (alist-get 'chunk data)
-                           for event = (leman--make-event raw-event)
-                           do (leman-room--process-fetched-thread-event event room))
-                  (cl-incf leman-threads--tick)
-                  (leman-room--render-thread buffer root-event)
-                  (when (get-buffer-window buffer 'visible)
-                    (leman-threads-mark-read room session root-id))))))))
+    (leman-room--fetch-thread room session root-id
+      (lambda ()
+        (when (leman-room--rerender-thread buffer root-id root-event)
+          (when (get-buffer-window buffer 'visible)
+            (leman-threads-mark-read room session root-id)))))))
+
+(defun leman-room--rerender-thread (buffer root-id root-event)
+  "Render ROOT-EVENT in thread BUFFER if it still shows thread ROOT-ID.
+Thread buffers are per room, so another thread of the room may
+have been opened since a request was made.  Return non-nil if
+rendered."
+  (when (and (buffer-live-p buffer)
+             (equal root-id (buffer-local-value 'leman-thread-root-id buffer)))
+    (leman-room--render-thread buffer root-event)
+    t))
+
+(defun leman-room--add-timeline-thread-events (room root-id)
+  "Add ROOM's timeline replies to thread ROOT-ID to its thread data.
+Edits of the added replies are applied too."
+  (let* ((known (leman-room--thread-events room root-id))
+         (added (cl-loop for event in (reverse (leman-room-timeline room))
+                         when (and (equal root-id (leman-room--thread-root-id event))
+                                   (not (cl-find (leman-event-id event) known
+                                                 :key #'leman-event-id :test #'equal)))
+                         do (leman-room--add-thread-event event room)
+                         and collect (leman-event-id event))))
+    (when added
+      (cl-loop for event in (reverse (leman-room-timeline room))
+               when (and (equal "m.replace" (map-nested-elt (leman-event-content event)
+                                                            '(m.relates_to rel_type)))
+                         (member (map-nested-elt (leman-event-content event)
+                                                 '(m.relates_to event_id))
+                                 added))
+               do (leman-room--replace-thread-event event room))
+      (cl-incf leman-threads--tick))))
+
+(defun leman-room--fetch-thread (room session root-id then &optional from)
+  "Fetch the replies of thread ROOT-ID in ROOM on SESSION, then call THEN.
+The replies are added to ROOM's thread data.  FROM is a
+pagination token, for the following pages."
+  (declare (indent defun))
+  ;; NOTE: Fetched newest first (the default direction): some servers
+  ;; (e.g. Conduit) return no events for "dir=f" without a "from"
+  ;; token.  The order doesn't matter, as replies are sorted when
+  ;; rendered.
+  (leman-api session
+      (format "rooms/%s/relations/%s/m.thread"
+              (url-hexify-string (leman-room-id room))
+              (url-hexify-string root-id))
+    :version "v1"
+    :params (append '(("limit" "100"))
+                    (when from (list (list "from" from))))
+    :then (lambda (data)
+            (cl-loop for raw-event across (alist-get 'chunk data)
+                     for event = (leman--make-event raw-event)
+                     do (leman-room--process-fetched-thread-event event room))
+            (cl-incf leman-threads--tick)
+            (if-let ((next (alist-get 'next_batch data))
+                     ((> (length (alist-get 'chunk data)) 0)))
+                (leman-room--fetch-thread room session root-id then next)
+              (funcall then)))))
 
 (defun leman-room--process-fetched-thread-event (event room)
   "Add fetched thread EVENT to ROOM's thread data."
@@ -5198,6 +5250,8 @@ when it arrives."
       (goto-char (point-max))
       (insert (propertize (format "\n%s" (concat (propertize "RET" 'face 'help-key-binding)
                                                  " Reply in thread  "
+                                                 (propertize "o" 'face 'help-key-binding)
+                                                 " Show in room  "
                                                  (propertize "g" 'face 'help-key-binding)
                                                  " Refresh  "
                                                  (propertize "q" 'face 'help-key-binding)
@@ -5229,6 +5283,7 @@ when it arrives."
     (define-key map (kbd "S-<return>") #'leman-room-reply-in-thread)
     (define-key map (kbd "r") #'leman-room-reply-in-thread)
     (define-key map (kbd "g") #'leman-room-refresh-thread)
+    (define-key map (kbd "o") #'leman-room-thread-goto-root)
     (define-key map (kbd "q") #'quit-window)
     map)
   "Keymap for Leman thread buffers.")
@@ -5242,22 +5297,64 @@ when it arrives."
 (defun leman-room-refresh-thread ()
   "Refresh the current thread buffer."
   (interactive)
-  (when-let* ((root-id leman-thread-root-id)
-              (root-event (gethash root-id (leman-session-events leman-session))))
-    (let ((buffer (current-buffer)))
-      (leman-api leman-session
-          (format "rooms/%s/relations/%s"
-                  (url-hexify-string (leman-room-id leman-room))
-                  (url-hexify-string root-id))
-        :version "v1"
-        :params '(("dir" "f") ("limit" "200"))
-        :then (lambda (data)
-                (when (buffer-live-p buffer)
-                  (with-current-buffer buffer
-                    (cl-loop for raw-event across (alist-get 'chunk data)
-                             for event = (leman--make-event raw-event)
-                             do (leman-room--process-fetched-thread-event event leman-room))
-                    (leman-room--render-thread buffer root-event))))))))
+  (when-let ((root-id leman-thread-root-id))
+    (let ((buffer (current-buffer))
+          (session leman-session))
+      (leman-room--fetch-thread leman-room session root-id
+        (lambda ()
+          (leman-room--rerender-thread
+           buffer root-id
+           (or (gethash root-id (leman-session-events session))
+               (make-leman-event :id root-id))))))))
+
+(defun leman-room-thread-goto-root ()
+  "Show the current thread's root in its room's buffer.
+The room is shown in the thread's window.  If the root is not
+loaded yet, earlier messages are loaded until it is found."
+  (interactive)
+  (unless (derived-mode-p 'leman-thread-mode)
+    (user-error "Not in a Leman thread buffer"))
+  (let ((root-id leman-thread-root-id)
+        (leman-view-room-display-buffer-action '(display-buffer-same-window)))
+    (leman-view-room leman-room leman-session)
+    (leman-room--goto-event-id root-id)))
+
+(defun leman-room--goto-event-id (event-id &optional retrieved)
+  "Move to the event EVENT-ID in the current room buffer.
+If it is not in the buffer, load earlier messages until it is, up
+to `leman-room-goto-event-limit'.  RETRIEVED is the number of
+messages loaded so far."
+  (if-let ((node (leman-room--ewoc-last-matching leman-ewoc
+                   (lambda (data)
+                     (and (leman-event-p data)
+                          (equal event-id (leman-event-id data)))))))
+      (let ((pos (ewoc-location node)))
+        (goto-char pos)
+        (when-let ((window (get-buffer-window (current-buffer))))
+          (set-window-point window pos)
+          (with-selected-window window
+            (recenter 0)))
+        (pulse-momentary-highlight-region
+         pos (if-let ((next (ewoc-next leman-ewoc node)))
+                 (ewoc-location next)
+               (point-max))))
+    (let ((retrieved (or retrieved 0))
+          (buffer (current-buffer))
+          (room leman-room)
+          (session leman-session))
+      (cond ((>= retrieved leman-room-goto-event-limit)
+             (message "Leman: Event not found in the latest %d messages" retrieved))
+            ((not (leman-room-prev-batch room))
+             (message "Leman: Event not found in the room's history"))
+            (t
+             (message "Leman: Looking back for event (%d messages loaded)..." retrieved)
+             (leman-room-retro room session 100
+               :buffer buffer
+               :then (lambda (data)
+                       (leman-room-retro-callback room session data)
+                       (when (buffer-live-p buffer)
+                         (with-current-buffer buffer
+                           (leman-room--goto-event-id event-id (+ retrieved 100)))))))))))
 
 (defun leman-room-reply-in-thread ()
   "Reply in the thread shown in the current buffer."

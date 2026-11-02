@@ -1343,6 +1343,88 @@ are not in them, and they may not be open."
           (should-error (leman-room--event-at (point)) :type 'user-error))
       (kill-buffer buffer))))
 
+(defun leman-tests--emote-pack (state-key images)
+  "Return an image pack state event with STATE-KEY and IMAGES.
+IMAGES is an alist of shortcode symbols and image alists."
+  (make-leman-event :type "im.ponies.room_emotes" :state-key state-key
+                    :content `((pack . ((display_name . "pack")))
+                               (images . ,images))))
+
+(ert-deftest leman-room--custom-emojis ()
+  "Custom emoji come from room, user and globally enabled packs.
+Only a room pack's latest version counts, and stickers are left out."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (other (make-leman-room :id "!other:example.com"))
+         (unrelated (make-leman-room :id "!unrelated:example.com"))
+         (session (make-leman-session
+                   :rooms (list room other unrelated)
+                   :account-data
+                   `(((type . "im.ponies.user_emotes")
+                      (content . ((images . ((mine . ((url . "mxc://x/mine"))))))))
+                     ((type . "im.ponies.emote_rooms")
+                      (content . ((rooms . ((!other:example.com . ((global . nil))))))))))))
+    (setf (leman-room-state room)
+          (list (leman-tests--emote-pack
+                 "" '((parrot . ((url . "mxc://x/parrot")))
+                      (sticker . ((url . "mxc://x/sticker") (usage . ["sticker"])))
+                      (emote . ((url . "mxc://x/emote") (usage . ["emote"])))))
+                (leman-tests--emote-pack "chunk-1" '((ok . ((url . "mxc://x/ok")))))
+                ;; An earlier version of the first pack.
+                (leman-tests--emote-pack "" '((removed . ((url . "mxc://x/removed"))))))
+          (leman-room-state other)
+          (list (leman-tests--emote-pack "global" '((shared . ((url . "mxc://x/shared")))))
+                (leman-tests--emote-pack "not-enabled" '((hidden . ((url . "mxc://x/hidden"))))))
+          (leman-room-state unrelated)
+          (list (leman-tests--emote-pack "" '((far . ((url . "mxc://x/far")))))))
+    (should (equal '(("emote" . "mxc://x/emote")
+                     ("mine" . "mxc://x/mine")
+                     ("ok" . "mxc://x/ok")
+                     ("parrot" . "mxc://x/parrot")
+                     ("shared" . "mxc://x/shared"))
+                   (sort (leman-room--custom-emojis room session)
+                         (lambda (a b) (string< (car a) (car b))))))))
+
+(ert-deftest leman-room-emoji-search-inserts-custom-emoji-uri ()
+  "Choosing a custom emoji inserts its mxc URI, the reaction key."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (session (make-leman-session :events (make-hash-table :test #'equal))))
+    (setf (leman-room-state room)
+          (list (leman-tests--emote-pack "" '((parrot . ((url . "mxc://x/parrot")))))))
+    (with-temp-buffer
+      (setq-local leman-room room
+                  leman-session session)
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (_prompt collection &rest _)
+                   (should (member ":parrot:" (all-completions "" collection)))
+                   ":parrot:")))
+        (leman-room-emoji-search))
+      (should (equal "mxc://x/parrot" (buffer-string))))))
+
+(ert-deftest leman-room-send-reaction-custom-emoji-shortcode ()
+  "Custom emoji reactions carry their shortcode."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (session (make-leman-session :user (make-leman-user :id "@me:example.com")
+                                      :events (make-hash-table :test #'equal)
+                                      :transaction-id 0))
+         (event (make-leman-event :id "$event"))
+         (sent nil))
+    (setf (leman-room-state room)
+          (list (leman-tests--emote-pack "" '((parrot . ((url . "mxc://x/parrot")))))))
+    (with-temp-buffer
+      (setq-local leman-room room
+                  leman-session session)
+      (cl-letf (((symbol-function 'leman-room-highlight-event-at) #'ignore)
+                ((symbol-function #'leman-api)
+                 (lambda (_session _endpoint &rest args)
+                   (push (json-read-from-string (plist-get args :data)) sent))))
+        (leman-room-send-reaction "mxc://x/parrot" (point) event)
+        (leman-room-send-reaction "👍" (point) event)))
+    (pcase-let ((`(,unicode ,custom) sent))
+      (should (equal ":parrot:" (alist-get 'shortcode custom)))
+      (should (equal ":parrot:" (alist-get 'com.beeper.reaction.shortcode custom)))
+      (should (equal "mxc://x/parrot" (map-nested-elt custom '(m.relates_to key))))
+      (should-not (alist-get 'shortcode unicode)))))
+
 (ert-deftest leman-room--fetch-thread-paginates ()
   "Thread replies are fetched page by page, without \"dir=f\".
 Conduit returns no events for \"dir=f\" without a \"from\" token."

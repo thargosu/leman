@@ -275,6 +275,7 @@ makes a best effort to keep it accurate.")
 (defvar leman-room-reaction-map
   (let ((map (make-sparse-keymap)))
     (define-key map "c" #'insert-char)
+    (define-key map "e" #'leman-room-emoji-search)
     (when (commandp 'emoji-insert)
       (define-key map "i" 'emoji-insert))
     (when (commandp 'emoji-search)
@@ -905,16 +906,18 @@ To do the same in lisp code, set the option with `setopt'."
   :type 'key-sequence
   :set #'leman-room-self-insert-option-setter)
 
-(defcustom leman-room-reaction-picker (if (commandp 'emoji-search)
-                                          'emoji-search
-                                        #'insert-char)
+(defcustom leman-room-reaction-picker #'leman-room-emoji-search
   "Command used to select a reaction by `leman-room-send-reaction'.
 Should be set to a command that somehow prompts the user for an
-emoji and inserts it into the current buffer.  In Emacs 29
-reasonable choices include `emoji-insert' which uses a transient
-interface, and `emoji-search' which uses `completing-read'.  If
-those are not available, one can use `insert-char'."
+emoji and inserts it into the current buffer.  The default,
+`leman-room-emoji-search', completes the room's custom emoji and
+Unicode emoji.  In Emacs 29 other reasonable choices include
+`emoji-insert' which uses a transient interface, and
+`emoji-search' which uses `completing-read'.  If those are not
+available, one can use `insert-char'."
   :type `(choice
+          (const :tag "Complete emoji name, including custom emoji"
+                 leman-room-emoji-search)
           (const :tag "Complete unicode character name" insert-char)
           ,@(when (commandp 'emoji-insert)
               '((const :tag "Categorized emoji menu" emoji-insert)))
@@ -2594,6 +2597,118 @@ Interactively, to event at point."
     (interactive)
     (set-input-method "emoji")))
 
+(defun leman-room--custom-emojis (room session)
+  "Return the custom emoji usable in ROOM on SESSION.
+Return an alist mapping shortcodes (without colons) to mxc URIs,
+from the image packs (MSC2545) of the user's account data, of
+ROOM, and of the rooms whose packs the user enabled everywhere.
+Stickers are omitted."
+  (let ((emojis (make-hash-table :test #'equal)))
+    (cl-labels ((key-name (key)
+                  (if (symbolp key) (symbol-name key) key))
+                (account-data (type)
+                  (alist-get 'content (cl-find-if (lambda (event)
+                                                    (equal type (alist-get 'type event)))
+                                                  (leman-session-account-data session))))
+                (sticker-only-p (usage)
+                  (and (> (length usage) 0)
+                       (seq-every-p (lambda (use) (equal "sticker" use)) usage)))
+                (add-pack (content)
+                  (let ((pack-usage (map-nested-elt content '(pack usage))))
+                    (cl-loop for (shortcode . image) in (alist-get 'images content)
+                             for url = (alist-get 'url image)
+                             for name = (key-name shortcode)
+                             when (and (stringp url)
+                                       (not (sticker-only-p (or (alist-get 'usage image)
+                                                                pack-usage)))
+                                       (not (gethash name emojis)))
+                             do (puthash name url emojis))))
+                (add-room-packs (room &optional state-keys)
+                  ;; The room's state may hold earlier versions of a
+                  ;; pack: use the latest (the first) only.
+                  (let ((seen nil))
+                    (dolist (event (leman-room-state room))
+                      (let ((state-key (leman-event-state-key event)))
+                        (when (and (equal "im.ponies.room_emotes" (leman-event-type event))
+                                   (not (member state-key seen))
+                                   (or (null state-keys) (member state-key state-keys)))
+                          (push state-key seen)
+                          (add-pack (leman-event-content event))))))))
+      (add-pack (account-data "im.ponies.user_emotes"))
+      (add-room-packs room)
+      (cl-loop for (room-id . packs) in (alist-get 'rooms (account-data "im.ponies.emote_rooms"))
+               for other = (cl-find (key-name room-id) (leman-session-rooms session)
+                                    :key #'leman-room-id :test #'equal)
+               when (and other (not (eq other room)))
+               do (add-room-packs other (mapcar (lambda (pack) (key-name (car pack)))
+                                                packs))))
+    (map-pairs emojis)))
+
+(defvar leman-room-emoji-search-max-fetches 50
+  "Maximum number of candidates whose images `leman-room-emoji-search' fetches.
+Images are fetched for the candidates displayed, unless more
+than this many are, as when the completion UI shows them all.")
+
+(defun leman-room-emoji-search ()
+  "Insert an emoji chosen with completion, custom ones included.
+Offers the custom emoji of the current room (see
+`leman-room--custom-emojis'), displayed as images, and Unicode
+emoji.  A custom emoji is inserted as its mxc URI, which is how
+reactions refer to it."
+  (declare (function emoji--init "emoji"))
+  (interactive)
+  (defvar emoji--all-bases)
+  (pcase-let* ((buffer (if (minibufferp)
+                           (window-buffer (minibuffer-selected-window))
+                         (current-buffer)))
+               (room (buffer-local-value 'leman-room buffer))
+               (session (buffer-local-value 'leman-session buffer))
+               (candidates (make-hash-table :test #'equal))
+               (images (make-hash-table :test #'equal)))
+    (pcase-dolist (`(,shortcode . ,mxc) (leman-room--custom-emojis room session))
+      (puthash (format ":%s:" shortcode) mxc candidates))
+    (when (and (require 'emoji nil t) (fboundp 'emoji--init))
+      (emoji--init)
+      (maphash (lambda (name glyph)
+                 (unless (gethash name candidates)
+                   (puthash name glyph candidates)))
+               emoji--all-bases))
+    (cl-labels ((image (mxc fetch)
+                  (or (gethash mxc images)
+                      (let ((url (leman--mxc-to-authenticated-url mxc session)))
+                        (if-let ((data (leman-room--shr-image-data url)))
+                            (puthash mxc (leman-room--emoji-image data) images)
+                          ;; Shown when displayed again after it arrives.
+                          (when fetch
+                            (leman-room--fetch-html-image url nil nil
+                              (leman-session-token session)))
+                          nil))))
+                (affixate (names)
+                  (let ((fetch (<= (length names) leman-room-emoji-search-max-fetches)))
+                    (mapcar (lambda (name)
+                              (let* ((value (gethash name candidates))
+                                     (image (and leman-room-images
+                                                 (string-prefix-p "mxc://" value)
+                                                 (image value fetch))))
+                                (list name
+                                      (concat (cond (image (propertize " " 'display image))
+                                                    ((string-prefix-p "mxc://" value) " ")
+                                                    (t value))
+                                              " ")
+                                      "")))
+                            names))))
+      (let ((choice (completing-read
+                     "Emoji: "
+                     (lambda (string predicate action)
+                       (if (eq action 'metadata)
+                           `(metadata (category . emoji)
+                                      (affixation-function . ,#'affixate))
+                         (complete-with-action action candidates string predicate)))
+                     nil t)))
+        (if-let ((value (gethash choice candidates)))
+            (insert value)
+          (user-error "No emoji chosen"))))))
+
 (defun leman-room-send-reaction (key position &optional event)
   "Send reaction of KEY to event at POSITION.
 KEY should be a reaction string, e.g. \"👍\".
@@ -2634,10 +2749,20 @@ these all require at least version 29 of Emacs):
                  ((cl-struct leman-room (id room-id)) leman-room)
                  (endpoint (format "rooms/%s/send/m.reaction/%s" (url-hexify-string room-id)
                                    (leman--update-transaction-id leman-session)))
-                 (content (leman-alist "m.relates_to"
-                                       (leman-alist "rel_type" "m.annotation"
-                                                    "event_id" event-id
-                                                    "key" key))))
+                 (shortcode (when (string-prefix-p "mxc://" key)
+                              (let ((shortcode (leman-room--reaction-shortcode key leman-room)))
+                                (unless (equal shortcode key)
+                                  shortcode))))
+                 (content (append (leman-alist "m.relates_to"
+                                               (leman-alist "rel_type" "m.annotation"
+                                                            "event_id" event-id
+                                                            "key" key))
+                                  ;; For custom emoji, so that clients
+                                  ;; can show their name (MSC4027, and
+                                  ;; e.g. Cinny's key).
+                                  (when shortcode
+                                    (leman-alist "com.beeper.reaction.shortcode" shortcode
+                                                 "shortcode" shortcode)))))
       (leman-api leman-session endpoint :method 'put :data (json-encode content)
         :then (apply-partially #'leman-room-send-event-callback
                                :room leman-room :session leman-session :content content
@@ -4649,6 +4774,21 @@ Formats according to `leman-room-message-format-spec', which see."
                'display leman-room-event-separator-display-property
                'leman-room-event-separator t)))
 
+(defun leman-room--emoji-image (data)
+  "Return an image of custom emoji DATA, sized like reaction keys.
+DATA is as returned by `leman-room--shr-image-data'.  Return nil
+if it can't be made into an image."
+  ;; NOTE: `shr-get-image-data' returns (DATA CONTENT-TYPE) in Emacs
+  ;; 30+, and just DATA (a string) in older versions; normalize to
+  ;; the data string.
+  (condition-case err
+      (create-image (if (consp data) (car data) data)
+                    nil 'data-p :ascent 'center
+                    :max-width leman-room-reaction-emoji-max-size
+                    :max-height leman-room-reaction-emoji-max-size)
+    ;; Don't let an unreadable image break message rendering.
+    (error (leman-debug "Reaction emoji image error:" err) nil)))
+
 (defun leman-room--reaction-shortcode (key room)
   "Return the shortcode for reaction KEY in ROOM.
 For custom emoji, look up KEY's mxc URI in the room's emoji pack.
@@ -4694,16 +4834,7 @@ shortened media ID when KEY is not in the room's emoji pack."
                                   (leman-room--fetch-html-image
                                    url event room (leman-session-token session))
                                   nil))))
-            ;; NOTE: `shr-get-image-data' returns (DATA CONTENT-TYPE)
-            ;; in Emacs 30+, and just DATA (a string) in older
-            ;; versions; normalize to the data string.
-            (condition-case err
-                (create-image (if (consp data) (car data) data)
-                              nil 'data-p :ascent 'center
-                              :max-width leman-room-reaction-emoji-max-size
-                              :max-height leman-room-reaction-emoji-max-size)
-              ;; Don't let an unreadable image break message rendering.
-              (error (leman-debug "Reaction emoji image error:" err) nil))))
+            (leman-room--emoji-image data)))
        (format-reaction (ks)
           (pcase-let* ((`(,raw-key . ,senders) ks)
                        (key-image (reaction-image raw-key))
@@ -5907,7 +6038,8 @@ TOKEN is the bearer token, for authenticated media URLs.  When
 the data arrives, it is stored in the URL cache -- where the
 renderer picks it up -- and every event waiting for the URL (at
 least EVENT) is invalidated, re-rendering its message with the
-image displayed.
+image displayed.  EVENT and ROOM may be nil, to only fill the
+cache.
 
 While a fetch for URL is already in flight, EVENT is registered
 as waiting and no new request is made: re-renders (e.g. caused by
@@ -5934,7 +6066,8 @@ a duplicate request each time."
                    (setf leman-room--fetching-html-images
                          (delq entry leman-room--fetching-html-images))
                    (pcase-dolist (`(,waiting-event . ,waiting-room) (cdr entry))
-                     (leman-room--invalidate-event-node waiting-event waiting-room))))
+                     (when waiting-event
+                       (leman-room--invalidate-event-node waiting-event waiting-room)))))
          :else (lambda (plz-error)
                  ;; Stop tracking the failed fetch: waiting events
                  ;; keep their current rendering (as before).

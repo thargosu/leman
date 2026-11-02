@@ -1645,6 +1645,38 @@ the coalesced cluster."
       (should (equal (buffer-string)
                      "HEADER\nold\nDAY\nMEMBER\nHEADER\nlater\n")))))
 
+(ert-deftest leman-room-thread-of-edited-message ()
+  "An edited message's thread is rooted at the original event.
+Edits replace the edited event in the room buffer, but threads
+relate to the original: threads started from an edited message
+were rooted at the edit, and its thread chip was missing."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (session (make-leman-session :events (make-hash-table :test #'equal)))
+         (original (make-leman-event
+                    :id "$original"
+                    :unsigned '((m.relations . ((m.thread . ((count . 3))))))))
+         (edit (make-leman-event
+                :id "$edit"
+                :content '((body . "* new")
+                           (m.new_content . ((body . "new")))
+                           (m.relates_to . ((rel_type . "m.replace")
+                                            (event_id . "$original"))))))
+         (viewed nil))
+    (puthash "$original" original (leman-session-events session))
+    (should (equal "$original" (leman-room--original-event-id edit)))
+    (should (equal "$original" (leman-room--original-event-id original)))
+    (with-temp-buffer
+      (setq-local leman-room room
+                  leman-session session
+                  leman-ewoc (ewoc-create #'ignore))
+      (ewoc-enter-last leman-ewoc edit)
+      ;; The chip uses the original's server-side summary.
+      (should (string-match-p "3 replies" (leman-room--format-thread-chip edit room)))
+      (cl-letf (((symbol-function 'leman-room--view-thread)
+                 (lambda (root-id &rest _) (push root-id viewed))))
+        (leman-room-view-thread (point-min)))
+      (should (equal '("$original") viewed)))))
+
 (ert-deftest leman-room--format-thread-chip ()
   "Test that thread roots show a summary chip linking to the view."
   (let* ((room (make-leman-room :id "!room:example.com"))

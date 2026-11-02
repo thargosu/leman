@@ -5147,13 +5147,24 @@ original ID and relationships."
                "m.thread")
     (map-nested-elt (leman-event-content event) '(m.relates_to event_id))))
 
+(defun leman-room--original-event-id (event)
+  "Return the ID of the message EVENT shows in a room buffer.
+That is, for an edit (which replaces the edited event in the
+buffer), the edited event's ID; otherwise, EVENT's.  Threads and
+replies relate to that ID."
+  (pcase-let (((map ('m.relates_to (map ('rel_type rel-type) ('event_id related-id))))
+               (leman-event-content event)))
+    (if (and (equal "m.replace" rel-type) related-id)
+        related-id
+      (leman-event-id event))))
+
 (defun leman-room--invalidate-thread-root (root-id)
   "Redisplay the thread root ROOT-ID in the current room buffer.
 This updates its thread chip."
   (when-let ((node (leman-room--ewoc-last-matching leman-ewoc
                      (lambda (data)
                        (and (leman-event-p data)
-                            (equal root-id (leman-event-id data)))))))
+                            (equal root-id (leman-room--original-event-id data)))))))
     (ewoc-invalidate leman-ewoc node)))
 
 (defun leman-room--thread-event (event room session)
@@ -5262,13 +5273,18 @@ This is the \"m.thread\" aggregation in EVENT's unsigned data."
 (defun leman-room--format-thread-chip (event room)
   "Return a summary chip for the thread rooted at EVENT in ROOM.
 If EVENT is not a thread root with known replies, return an empty
-string."
-  (let* ((root-id (leman-event-id event))
+string.  EVENT may be an edit of the root, which replaces it in
+the room buffer."
+  (let* ((root-id (leman-room--original-event-id event))
+         (root (if (equal root-id (leman-event-id event))
+                   event
+                 (or (gethash root-id (leman-session-events leman-session))
+                     event)))
          (local-events (leman-room--thread-events room root-id))
          ;; NOTE: The server-side summary may know about replies we
          ;; haven't seen; the local events may include ones the
          ;; summary doesn't (e.g. while the server aggregates).
-         (summary (leman-room--thread-summary event))
+         (summary (leman-room--thread-summary root))
          (count (max (length local-events)
                      (or (alist-get 'count summary) 0))))
     (if (> count 0)
@@ -5307,16 +5323,16 @@ string."
 
 (defun leman-room-view-thread (&optional position)
   "View the thread at POSITION in the current room buffer.
-The thread root is the event at POSITION, or the event that a
-thread reply at POSITION relates to."
+The thread root is the event at POSITION (the edited one, for an
+edit), or the event that a thread reply at POSITION relates to.
+A message without replies yet starts a new thread: reply in the
+thread view to create it."
   (interactive "d")
   (pcase-let* ((event (ewoc-data (ewoc-locate leman-ewoc (or position (point))))))
     (unless (leman-event-p event)
       (user-error "No event at point"))
-    (pcase-let* (((cl-struct leman-event content) event)
-                 ((map ('m.relates_to (map ('rel_type rel-type) ('event_id related-id)))) content)
-                 (root-id (if (equal rel-type "m.thread") related-id (leman-event-id event))))
-      (leman-room--view-thread root-id))))
+    (leman-room--view-thread (or (leman-room--thread-root-id event)
+                                 (leman-room--original-event-id event)))))
 
 (cl-defun leman-room--view-thread (root-id &key (room leman-room) (session leman-session)
                                             display-action)

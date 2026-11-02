@@ -1192,6 +1192,7 @@ A room's replies are otherwise only added when its buffer
 processes them, so a thread opened from the inbox showed only its
 root."
   (let* ((room (make-leman-room :id "!room:example.com"))
+         (session (make-leman-session :events (make-hash-table :test #'equal)))
          (reply (make-leman-event :id "$reply" :origin-server-ts 2000
                                   :type "m.room.message"
                                   :content '((msgtype . "m.text") (body . "old")
@@ -1211,18 +1212,136 @@ root."
                                                               (event_id . "$other-root")))))))
     ;; Latest first, as in `leman-room-timeline'.
     (setf (leman-room-timeline room) (list edit other reply))
-    (leman-room--add-timeline-thread-events room "$root")
+    (leman-room--add-timeline-thread-events room session "$root")
     (let ((events (leman-room--thread-events room "$root")))
       (should (equal '("$reply") (mapcar #'leman-event-id events)))
       (should (equal "new" (alist-get 'body (leman-event-content (car events))))))
     (should-not (leman-room--thread-events room "$other-root"))
     ;; Adding again neither duplicates replies nor reapplies edits.
-    (leman-room--add-timeline-thread-events room "$root")
+    (leman-room--add-timeline-thread-events room session "$root")
     (let ((events (leman-room--thread-events room "$root")))
       (should (= 1 (length events)))
       ;; The edit's body prepended once to the original's.
       (should (= 2 (cl-count 'body (leman-event-content (car events))
                              :key #'car-safe))))))
+
+(defun leman-tests--reaction (id related-id key)
+  "Return reaction event ID of KEY to RELATED-ID."
+  (make-leman-event :id id :type "m.reaction" :origin-server-ts 3000
+                    :sender (make-leman-user :id "@other:example.com")
+                    :content `((m.relates_to . ((rel_type . "m.annotation")
+                                                (event_id . ,related-id)
+                                                (key . ,key))))))
+
+(defun leman-tests--reaction-ids (event)
+  "Return the IDs of EVENT's reactions."
+  (mapcar #'leman-event-id (map-elt (leman-event-local event) 'reactions)))
+
+(ert-deftest leman-room--add-timeline-thread-events-reactions ()
+  "Timeline reactions to a thread's root and replies are attached.
+Except redacted ones."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (session (make-leman-session :events (make-hash-table :test #'equal)))
+         (root (make-leman-event :id "$root" :type "m.room.message"
+                                 :content '((msgtype . "m.text") (body . "root"))))
+         (reply (make-leman-event :id "$reply" :type "m.room.message"
+                                  :content '((msgtype . "m.text") (body . "reply")
+                                             (m.relates_to . ((rel_type . "m.thread")
+                                                              (event_id . "$root"))))))
+         (redaction (make-leman-event :id "$redaction" :type "m.room.redaction"
+                                      :local '((redacts . "$gone")))))
+    (puthash "$root" root (leman-session-events session))
+    (setf (leman-room-timeline room)
+          (list redaction
+                (leman-tests--reaction "$gone" "$reply" "👎")
+                (leman-tests--reaction "$on-reply" "$reply" "👍")
+                (leman-tests--reaction "$on-root" "$root" "🎉")
+                (leman-tests--reaction "$elsewhere" "$other" "👍")
+                reply root))
+    (leman-room--add-timeline-thread-events room session "$root")
+    (should (equal '("$on-reply")
+                   (leman-tests--reaction-ids
+                    (car (leman-room--thread-events room "$root")))))
+    (should (equal '("$on-root") (leman-tests--reaction-ids root)))))
+
+(ert-deftest leman-room--thread-event-reactions ()
+  "Reactions to thread events, and their redactions, update the thread view.
+Room buffers attach reactions to their events, but thread replies
+are not in them, and they may not be open."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (session (make-leman-session :user (make-leman-user :id "@me:example.com")
+                                      :events (make-hash-table :test #'equal)))
+         (reply (make-leman-event :id "$reply" :type "m.room.message"
+                                  :content '((msgtype . "m.text") (body . "reply")
+                                             (m.relates_to . ((rel_type . "m.thread")
+                                                              (event_id . "$root"))))))
+         (root (make-leman-event :id "$root" :type "m.room.message"
+                                 :content '((msgtype . "m.text") (body . "root"))))
+         (refreshed nil))
+    (puthash "$root" root (leman-session-events session))
+    (leman-room--add-thread-event reply room)
+    (cl-letf (((symbol-function 'leman-room--refresh-thread-buffer)
+               (lambda (root-id &rest _) (push root-id refreshed))))
+      (leman-room--thread-event (leman-tests--reaction "$r1" "$reply" "👍") room session)
+      (leman-room--thread-event (leman-tests--reaction "$r2" "$root" "🎉") room session)
+      ;; Not about this room's threads: ignored.
+      (leman-room--thread-event (leman-tests--reaction "$r3" "$other" "👍") room session)
+      (should (equal '("$r1") (leman-tests--reaction-ids
+                               (car (leman-room--thread-events room "$root")))))
+      (should (equal '("$r2") (leman-tests--reaction-ids root)))
+      (should (equal '("$root" "$root") refreshed))
+      ;; Room version 11 redactions have the key in their content.
+      (leman-room--thread-event (make-leman-event :id "$x" :type "m.room.redaction"
+                                                  :content '((redacts . "$r1")))
+                                room session)
+      (should-not (leman-tests--reaction-ids
+                   (car (leman-room--thread-events room "$root"))))
+      (should (= 3 (length refreshed))))))
+
+(ert-deftest leman-room-send-reaction-in-thread-buffer ()
+  "Reactions can be sent to a thread's events from its buffer."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (session (make-leman-session :user (make-leman-user :id "@me:example.com")
+                                      :events (make-hash-table :test #'equal)
+                                      :transaction-id 0))
+         (root (make-leman-event :id "$root" :origin-server-ts 1000
+                                 :type "m.room.message"
+                                 :sender (make-leman-user :id "@me:example.com")
+                                 :content '((msgtype . "m.text") (body . "root"))))
+         (reply (make-leman-event :id "$reply" :origin-server-ts 2000
+                                  :type "m.room.message"
+                                  :sender (make-leman-user :id "@other:example.com")
+                                  :content '((msgtype . "m.text") (body . "the reply")
+                                             (m.relates_to . ((rel_type . "m.thread")
+                                                              (event_id . "$root"))))))
+         (buffer (get-buffer-create "*Leman Thread: reactions test*"))
+         (sent nil))
+    (puthash "$root" root (leman-session-events session))
+    (leman-room--add-thread-event reply room)
+    (unwind-protect
+        (with-current-buffer buffer
+          (leman-thread-mode)
+          (setf leman-thread-root-id "$root"
+                leman-room room
+                leman-session session)
+          (leman-room--render-thread buffer root)
+          (goto-char (point-min))
+          (search-forward "the reply")
+          (should (eq reply (leman-room--event-at (point))))
+          (pcase-let ((`(,start . ,end) (leman-room--thread-event-bounds (point))))
+            (should (string-search "the reply" (buffer-substring start end)))
+            (should-not (string-search "root" (buffer-substring start end))))
+          (cl-letf (((symbol-function #'leman-api)
+                     (lambda (_session endpoint &rest args)
+                       (push (cons endpoint (json-read-from-string (plist-get args :data)))
+                             sent))))
+            (leman-room-send-reaction "👍" (point)))
+          (should (= 1 (length sent)))
+          (should (string-search "/send/m.reaction/" (caar sent)))
+          (should (equal "$reply" (map-nested-elt (cdar sent) '(m.relates_to event_id))))
+          (goto-char (point-max))
+          (should-error (leman-room--event-at (point)) :type 'user-error))
+      (kill-buffer buffer))))
 
 (ert-deftest leman-room--fetch-thread-paginates ()
   "Thread replies are fetched page by page, without \"dir=f\".

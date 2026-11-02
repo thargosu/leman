@@ -1294,20 +1294,23 @@ constant throughout STRING."
   "Highlight event at POSITION using `leman-room-replying-to-overlay'.
 See `leman-room-with-highlighted-event-at'."
   ;; MAYBE: Accept a marker for POSITION.
-  (let* ((node (ewoc-locate leman-ewoc position))
-         (event (ewoc-data node)))
-    (unless (and (leman-event-p event)
-                 (leman-event-id event))
-      (error "No event at point"))
-    (setf leman-room-replying-to-overlay
-          (make-overlay (ewoc-location node)
-                        ;; NOTE: It doesn't seem possible to get the end position of
-                        ;; a node, so if there is no next node, we use point-max.
-                        ;; But this might break if we were to use an EWOC footer.
-                        (if (ewoc-next leman-ewoc node)
-                            (ewoc-location (ewoc-next leman-ewoc node))
-                          (point-max))))
-    (overlay-put leman-room-replying-to-overlay 'face 'highlight)))
+  (if (derived-mode-p 'leman-thread-mode)
+      (pcase-let ((`(,start . ,end) (leman-room--thread-event-bounds position)))
+        (setf leman-room-replying-to-overlay (make-overlay start end)))
+    (let* ((node (ewoc-locate leman-ewoc position))
+           (event (ewoc-data node)))
+      (unless (and (leman-event-p event)
+                   (leman-event-id event))
+        (error "No event at point"))
+      (setf leman-room-replying-to-overlay
+            (make-overlay (ewoc-location node)
+                          ;; NOTE: It doesn't seem possible to get the end position of
+                          ;; a node, so if there is no next node, we use point-max.
+                          ;; But this might break if we were to use an EWOC footer.
+                          (if (ewoc-next leman-ewoc node)
+                              (ewoc-location (ewoc-next leman-ewoc node))
+                            (point-max))))))
+  (overlay-put leman-room-replying-to-overlay 'face 'highlight))
 
 (defun leman-room-unhighlight-event ()
   "Delete overlay in `leman-room-replying-to-overlay'.
@@ -2605,9 +2608,8 @@ these all require at least version 29 of Emacs):
 
 \\{leman-room-reaction-map}"
   (interactive
-   (let ((event (ewoc-data (ewoc-locate leman-ewoc))))
-     (unless (leman-event-p event)
-       (user-error "No event at point"))
+   (progn
+     (leman-room--event-at (point))
      (list (minibuffer-with-setup-hook
                (lambda ()
                  (setq-local after-change-functions
@@ -2625,9 +2627,7 @@ these all require at least version 29 of Emacs):
   ;; SPEC: MSC2677 <https://github.com/matrix-org/matrix-doc/pull/2677>
   ;; HACK: We could simplify this by storing the key in a text property...
   (leman-room-with-highlighted-event-at position
-    (pcase-let* ((event (or event
-                            (ewoc-data (ewoc-locate leman-ewoc position))
-                            (user-error "No event at point")))
+    (pcase-let* ((event (or event (leman-room--event-at position)))
                  ;; NOTE: Sadly, `face-at-point' doesn't work here because, e.g. if
                  ;; hl-line-mode is enabled, it only returns the hl-line face.
                  ((cl-struct leman-event (id event-id)) event)
@@ -2671,7 +2671,7 @@ these all require at least version 29 of Emacs):
                       (lambda () (face-at-point-p 'leman-room-reactions-key))))))))
      (list (or (key-at (point))
                (char-to-string (read-char-by-name "Reaction (prepend \"*\" for substring search): ")))
-           (ewoc-data (ewoc-locate leman-ewoc))
+           (leman-room--event-at (point))
            leman-room leman-session)))
   (pcase-let* (((cl-struct leman-event (local (map reactions))) event)
                ((cl-struct leman-session user) session)
@@ -2795,15 +2795,19 @@ To be used in `leman-room-view-hook', which see."
     (error "Event not found in buffer: %S" (leman-event-id event))))
 
 (defun leman-room--event-at (pos)
-  "Return event at POS or signal an error."
+  "Return event at POS or signal an error.
+Works in room and thread buffers."
   ;; TODO: Use this where appropriate.
-  (save-excursion
-    (goto-char pos)
-    (cl-assert leman-ewoc)
-    (let ((data (ewoc-data (ewoc-locate leman-ewoc))))
-      (cl-typecase data
-        (leman-event data)
-        (otherwise (user-error "No event at point"))))))
+  (if (derived-mode-p 'leman-thread-mode)
+      (or (get-text-property pos 'leman-thread-event)
+          (user-error "No event at point"))
+    (save-excursion
+      (goto-char pos)
+      (cl-assert leman-ewoc)
+      (let ((data (ewoc-data (ewoc-locate leman-ewoc))))
+        (cl-typecase data
+          (leman-event data)
+          (otherwise (user-error "No event at point")))))))
 
 (defun leman-room--process-retro-chunk (chunk session)
   "Process \"dir=b\" CHUNK of events for SESSION.
@@ -5023,19 +5027,76 @@ This updates its thread chip."
 
 (defun leman-room--thread-event (event room session)
   "Record thread-reply EVENT in ROOM on SESSION.
+Also record reactions to thread events, and their redactions.
 Refresh the open thread view showing it, if any, and when it is
 displayed, mark the thread read.  To be called in
 `leman-event-hook', so that thread data is kept for every room,
 not only for ones with buffers."
-  (when-let ((root-id (leman-room--thread-root-id event)))
-    (leman-room--add-thread-event event room)
-    (cl-incf leman-threads--tick)
-    (when-let ((buffer (leman-room--thread-buffer root-id room)))
-      (leman-room--render-thread
-       buffer (or (gethash root-id (leman-session-events session))
-                  (make-leman-event :id root-id)))
-      (when (get-buffer-window buffer 'visible)
-        (leman-threads-mark-read room session root-id)))))
+  (if-let ((root-id (leman-room--thread-root-id event)))
+      (progn
+        (leman-room--add-thread-event event room)
+        (cl-incf leman-threads--tick)
+        (leman-room--refresh-thread-buffer root-id room session))
+    (when-let ((root-id (pcase (leman-event-type event)
+                          ("m.reaction"
+                           (leman-room--add-thread-reaction event room session))
+                          ("m.room.redaction"
+                           (leman-room--remove-thread-reaction event room session)))))
+      (leman-room--refresh-thread-buffer root-id room session))))
+
+(defun leman-room--refresh-thread-buffer (root-id room session)
+  "Re-render the open view of thread ROOT-ID in ROOM on SESSION, if any.
+When it is displayed, mark the thread read."
+  (when-let ((buffer (leman-room--thread-buffer root-id room)))
+    (leman-room--render-thread
+     buffer (or (gethash root-id (leman-session-events session))
+                (make-leman-event :id root-id)))
+    (when (get-buffer-window buffer 'visible)
+      (leman-threads-mark-read room session root-id))))
+
+(defun leman-room--thread-reaction-target (event-id room session)
+  "Return (TARGET . ROOT-ID) for thread event EVENT-ID in ROOM, or nil.
+TARGET is the thread reply or root with EVENT-ID, on SESSION, and
+ROOT-ID its thread's root."
+  (if-let ((reply (leman-room--thread-event-for-id event-id room)))
+      (cons reply (leman-room--thread-root-id reply))
+    (when-let (((gethash event-id (leman-room--threads-table room)))
+               (root (gethash event-id (leman-session-events session))))
+      (cons root event-id))))
+
+(defun leman-room--add-thread-reaction (event room session)
+  "Attach reaction EVENT to the thread event it annotates in ROOM.
+On SESSION.  Return the thread's root ID, or nil if EVENT isn't a
+reaction to a thread's event.  (Room buffers attach reactions to
+their events, but thread replies are not in them, and they may
+not be open.)"
+  (pcase-let (((map ('rel_type rel-type) ('event_id related-id))
+               (map-elt (leman-event-content event) 'm.relates_to)))
+    (when-let (((equal "m.annotation" rel-type))
+               (target (leman-room--thread-reaction-target related-id room session)))
+      (cl-pushnew event (map-elt (leman-event-local (car target)) 'reactions)
+                  :key #'leman-event-id :test #'equal)
+      (cdr target))))
+
+(defun leman-room--remove-thread-reaction (event room session)
+  "Detach the reaction that redaction EVENT redacts from its thread event.
+In ROOM on SESSION.  Return the thread's root ID, or nil if the
+redacted event isn't a known reaction to a thread's event."
+  (when-let ((redacted-id (or (map-elt (leman-event-local event) 'redacts)
+                              ;; Room version 11 moved the key into the
+                              ;; content.
+                              (map-elt (leman-event-content event) 'redacts))))
+    (cl-loop for root-id being the hash-keys of (leman-room--threads-table room)
+             using (hash-values replies)
+             for root = (gethash root-id (leman-session-events session))
+             thereis (cl-loop for target in (if root (cons root replies) replies)
+                              for reactions = (map-elt (leman-event-local target) 'reactions)
+                              when (cl-find redacted-id reactions
+                                            :key #'leman-event-id :test #'equal)
+                              do (setf (map-elt (leman-event-local target) 'reactions)
+                                       (cl-remove redacted-id reactions
+                                                  :key #'leman-event-id :test #'equal))
+                              and return root-id))))
 
 (defun leman-room--thread-read (room _session root-id)
   "Update the chip of thread ROOT-ID in ROOM's buffer, after it was read.
@@ -5142,7 +5203,7 @@ when it arrives."
     ;; Replies seen in the room's timeline are only added to its
     ;; thread data when its buffer processes them, which it may not
     ;; have (e.g. a thread opened from the inbox).
-    (leman-room--add-timeline-thread-events room root-id)
+    (leman-room--add-timeline-thread-events room session root-id)
     (with-current-buffer buffer
       (unless (derived-mode-p 'leman-thread-mode)
         (leman-thread-mode))
@@ -5181,25 +5242,41 @@ rendered."
     (leman-room--render-thread buffer root-event)
     t))
 
-(defun leman-room--add-timeline-thread-events (room root-id)
+(defun leman-room--add-timeline-thread-events (room session root-id)
   "Add ROOM's timeline replies to thread ROOT-ID to its thread data.
-Edits of the added replies are applied too."
-  (let* ((known (leman-room--thread-events room root-id))
-         (added (cl-loop for event in (reverse (leman-room-timeline room))
+On SESSION.  Edits of the added replies are applied too, and
+reactions to the thread's events attached."
+  (let* ((timeline (reverse (leman-room-timeline room)))
+         (known (leman-room--thread-events room root-id))
+         (added (cl-loop for event in timeline
                          when (and (equal root-id (leman-room--thread-root-id event))
                                    (not (cl-find (leman-event-id event) known
                                                  :key #'leman-event-id :test #'equal)))
                          do (leman-room--add-thread-event event room)
                          and collect (leman-event-id event))))
     (when added
-      (cl-loop for event in (reverse (leman-room-timeline room))
+      (cl-loop for event in timeline
                when (and (equal "m.replace" (map-nested-elt (leman-event-content event)
                                                             '(m.relates_to rel_type)))
                          (member (map-nested-elt (leman-event-content event)
                                                  '(m.relates_to event_id))
                                  added))
                do (leman-room--replace-thread-event event room))
-      (cl-incf leman-threads--tick))))
+      (cl-incf leman-threads--tick))
+    ;; Reactions to the root are attached by its room's buffer, which
+    ;; may not be open.
+    (let ((redacted (cl-loop for event in timeline
+                             when (equal "m.room.redaction" (leman-event-type event))
+                             collect (or (map-elt (leman-event-local event) 'redacts)
+                                         (map-elt (leman-event-content event) 'redacts)))))
+      (cl-loop for event in timeline
+               when (and (equal "m.reaction" (leman-event-type event))
+                         (not (member (leman-event-id event) redacted))
+                         (let ((related-id (map-nested-elt (leman-event-content event)
+                                                           '(m.relates_to event_id))))
+                           (or (equal root-id related-id)
+                               (member related-id added))))
+               do (leman-room--add-thread-reaction event room session)))))
 
 (defun leman-room--fetch-thread (room session root-id then &optional from)
   "Fetch the replies of thread ROOT-ID in ROOM on SESSION, then call THEN.
@@ -5252,6 +5329,8 @@ pagination token, for the following pages."
                                                  " Reply in thread  "
                                                  (propertize "o" 'face 'help-key-binding)
                                                  " Show in room  "
+                                                 (propertize "s r" 'face 'help-key-binding)
+                                                 " React  "
                                                  (propertize "g" 'face 'help-key-binding)
                                                  " Refresh  "
                                                  (propertize "q" 'face 'help-key-binding)
@@ -5259,9 +5338,12 @@ pagination token, for the following pages."
                           'face 'leman-room-timestamp)))))
 
 (defun leman-room--insert-thread-event (event)
-  "Insert EVENT into the current thread buffer."
+  "Insert EVENT into the current thread buffer.
+Its text has EVENT as property `leman-thread-event' (see
+`leman-room--event-at')."
   (let ((body (or (leman-room--format-message-body event leman-session)
-                  "")))
+                  ""))
+        (start (1+ (point))))
     (insert "\n"
             (leman-room--format-sender-header event leman-session)
             "\n"
@@ -5275,7 +5357,19 @@ pagination token, for the following pages."
                                                             'face body)))))
     (when-let ((reactions (leman-room--format-reactions event leman-room)))
       (unless (string-empty-p reactions)
-        (insert reactions)))))
+        (insert reactions)))
+    (put-text-property start (point) 'leman-thread-event event)))
+
+(defun leman-room--thread-event-bounds (position)
+  "Return (START . END) of the event's text at POSITION in a thread buffer."
+  (let ((event (leman-room--event-at position)))
+    (cons (if (and (> position (point-min))
+                   (eq event (get-text-property (1- position) 'leman-thread-event)))
+              (previous-single-property-change position 'leman-thread-event
+                                               nil (point-min))
+            position)
+          (next-single-property-change position 'leman-thread-event
+                                       nil (point-max)))))
 
 (defvar leman-thread-mode-map
   (let ((map (make-sparse-keymap)))
@@ -5284,6 +5378,7 @@ pagination token, for the following pages."
     (define-key map (kbd "r") #'leman-room-reply-in-thread)
     (define-key map (kbd "g") #'leman-room-refresh-thread)
     (define-key map (kbd "o") #'leman-room-thread-goto-root)
+    (define-key map (kbd "s r") #'leman-room-send-reaction)
     (define-key map (kbd "q") #'quit-window)
     map)
   "Keymap for Leman thread buffers.")

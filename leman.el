@@ -2121,15 +2121,17 @@ sharing the room key)."
                              (url-hexify-string (leman-room-id room))))))
     (hash-table-keys (leman-room-members room))))
 
-(defun leman-e2ee--encrypt-content (session room content)
-  "Encrypt CONTENT for ROOM on SESSION, for sending.
-Return (CONTENT . EVENT-TYPE): the encrypted content with event
-type \"m.room.encrypted\", or the original content with
-\"m.room.message\" when the room is not encrypted.  Signal
+(defun leman-e2ee--encrypt-content (session room content &optional event-type)
+  "Encrypt CONTENT of EVENT-TYPE for ROOM on SESSION, for sending.
+EVENT-TYPE defaults to \"m.room.message\".  Return (CONTENT . TYPE):
+the encrypted content with type \"m.room.encrypted\", or the
+original content with EVENT-TYPE when the room is not encrypted.
+Signal
 `leman-e2ee-error' when the room is encrypted but encryption is
 not possible (failing closed: never send plaintext into an
 encrypted room, even when no agent is running)."
-  (let ((agent (leman-session-e2ee session)))
+  (let ((agent (leman-session-e2ee session))
+        (event-type (or event-type "m.room.message")))
     (cond
      ((and agent (leman-room--encrypted-p room))
       (let ((room-id (leman-room-id room))
@@ -2145,7 +2147,7 @@ encrypted room, even when no agent is running)."
         (let ((response nil))
           (cl-loop for attempt from 1 upto 3
                    do (setf response (leman-e2ee-encrypt-event
-                                      agent room-id "m.room.message" content members))
+                                      agent room-id event-type content members))
                    while (equal (alist-get 'status response) "claims_pending")
                    do (leman-e2ee--process-outgoing-requests-sync session))
           (if (equal (alist-get 'status response) "ok")
@@ -2172,7 +2174,7 @@ encrypted room, even when no agent is running)."
                      :test #'equal :key #'leman-event-type)
         (leman-message "Leman E2EE: WARNING: room %s has encrypted messages, but this message will NOT be encrypted (no agent or room state missing encryption)"
                        (leman-room-id room)))
-      (cons content "m.room.message")))))
+      (cons content event-type)))))
 
 ;;; Functions
 

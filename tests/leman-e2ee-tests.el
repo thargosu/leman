@@ -689,6 +689,75 @@ on the way (its first pump always uploads device keys)."
     (should-error (leman-e2ee--encrypt-content session room (leman-alist "body" "hi"))
                   :type 'leman-e2ee-error)))
 
+(defun leman-e2ee-tests--encrypted-room ()
+  "Return an encrypted room with one member."
+  (let ((room (make-leman-room :id "!room:x.org"
+                               :members (make-hash-table :test #'equal))))
+    (puthash "@alice:x.org" (make-leman-user :id "@alice:x.org")
+             (leman-room-members room))
+    (setf (leman-room-state room)
+          (list (make-leman-event :id "$enc-state" :type "m.room.encryption"
+                                  :content '((algorithm . "m.megolm.v1.aes-sha2")))))
+    room))
+
+(ert-deftest leman-e2ee--encrypt-content-event-type ()
+  ;; The inner event type is encrypted as given (e.g. reactions), and
+  ;; kept when the room is not encrypted.
+  (let* ((fake (leman-e2ee-tests--fake-agent
+                '((encrypt_room_event . ((status . "ok")
+                                         (event . ((type . "m.room.encrypted")
+                                                   (content . ((ciphertext . "opaque"))))))))))
+         (session (make-leman-session :e2ee (car fake)))
+         (content '((m.relates_to . ((rel_type . "m.annotation")
+                                     (event_id . "$target") (key . "👍"))))))
+    (cl-letf (((symbol-function #'leman-api) #'ignore))
+      (should (equal (cons '((ciphertext . "opaque")) "m.room.encrypted")
+                     (leman-e2ee--encrypt-content
+                      session (leman-e2ee-tests--encrypted-room) content "m.reaction"))))
+    (should (cl-some (lambda (line)
+                       (let ((request (leman-e2ee--decode line)))
+                         (and (equal "encrypt_room_event" (alist-get 'cmd request))
+                              (equal "m.reaction"
+                                     (map-nested-elt request '(params event_type))))))
+                     (cdr fake)))
+    (should (equal (cons content "m.reaction")
+                   (leman-e2ee--encrypt-content
+                    (make-leman-session) (make-leman-room :id "!plain:x.org")
+                    content "m.reaction")))))
+
+(ert-deftest leman-room-send-reaction-encrypted ()
+  ;; Reactions never reach an encrypted room in plaintext: they are
+  ;; sent encrypted, or not at all.
+  (let* ((room (leman-e2ee-tests--encrypted-room))
+         (event (make-leman-event :id "$target"))
+         (requests nil))
+    (with-temp-buffer
+      (setq-local leman-room room
+                  leman-session (make-leman-session
+                                 :user (make-leman-user :id "@me:x.org")
+                                 :events (make-hash-table :test #'equal)
+                                 :transaction-id 0))
+      (cl-letf (((symbol-function 'leman-room-highlight-event-at) #'ignore)
+                ((symbol-function #'leman-api)
+                 (lambda (_session endpoint &rest args)
+                   (push (cons endpoint (plist-get args :data)) requests))))
+        ;; With an agent: encrypted as an m.reaction.
+        (let ((leman-encrypt-send-content-function
+               (lambda (_session _room content event-type)
+                 (should (equal "m.reaction" event-type))
+                 (should (equal "$target" (map-nested-elt
+                                           content '("m.relates_to" "event_id"))))
+                 (cons '((ciphertext . "opaque")) "m.room.encrypted"))))
+          (leman-room-send-reaction "👍" (point) event))
+        (should (= 1 (length requests)))
+        (should (string-match-p "/send/m\\.room\\.encrypted/" (caar requests)))
+        (should-not (string-match-p "👍\\|m\\.annotation" (cdar requests)))
+        ;; Without one: nothing is sent.
+        (let ((leman-encrypt-send-content-function #'leman-e2ee--encrypt-content))
+          (should-error (leman-room-send-reaction "👍" (point) event)
+                        :type 'leman-e2ee-error))
+        (should (= 1 (length requests)))))))
+
 (ert-deftest leman-encrypt-content-completes-lazily-loaded-members ()
   ;; The default sync filter lazy-loads members: encryption must
   ;; fetch the joined members when the locally known set is smaller

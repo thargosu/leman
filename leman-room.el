@@ -2766,8 +2766,6 @@ these all require at least version 29 of Emacs):
                  ;; hl-line-mode is enabled, it only returns the hl-line face.
                  ((cl-struct leman-event (id event-id)) event)
                  ((cl-struct leman-room (id room-id)) leman-room)
-                 (endpoint (format "rooms/%s/send/m.reaction/%s" (url-hexify-string room-id)
-                                   (leman--update-transaction-id leman-session)))
                  (shortcode (when (string-prefix-p "mxc://" key)
                               (let ((shortcode (leman-room--reaction-shortcode key leman-room)))
                                 (unless (equal shortcode key)
@@ -2781,8 +2779,21 @@ these all require at least version 29 of Emacs):
                                   ;; e.g. Cinny's key).
                                   (when shortcode
                                     (leman-alist "com.beeper.reaction.shortcode" shortcode
-                                                 "shortcode" shortcode)))))
-      (leman-api leman-session endpoint :method 'put :data (json-encode content)
+                                                 "shortcode" shortcode))))
+                 (event-type "m.reaction"))
+      ;; E2EE: like `leman-send-message', encrypt the reaction when
+      ;; the room requires it, failing closed.  (Its "m.relates_to",
+      ;; with the key, stays in clear for the server to aggregate.)
+      (when leman-encrypt-send-content-function
+        (pcase-let ((`(,encrypted-content . ,encrypted-type)
+                     (funcall leman-encrypt-send-content-function
+                              leman-session leman-room content event-type)))
+          (setf content encrypted-content
+                event-type encrypted-type)))
+      (leman-api leman-session (format "rooms/%s/send/%s/%s" (url-hexify-string room-id)
+                                       event-type
+                                       (leman--update-transaction-id leman-session))
+        :method 'put :data (json-encode content)
         :then (apply-partially #'leman-room-send-event-callback
                                :room leman-room :session leman-session :content content
                                :data)))))

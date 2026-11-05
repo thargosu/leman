@@ -1216,11 +1216,14 @@ suggested room."
     (alist-get selected-name name-to-room-session nil nil #'string=)))
 
 (defvar leman-encrypt-send-content-function nil
-  "Function to encrypt a message's content before sending, or nil.
-Called with (SESSION ROOM CONTENT) by `leman-send-message'; must
-return (CONTENT . EVENT-TYPE), with CONTENT possibly encrypted and
-EVENT-TYPE the type to send it as (e.g. \"m.room.encrypted\").
-Set by the E2EE integration.")
+  "Function to encrypt an event's content before sending, or nil.
+Called with (SESSION ROOM CONTENT &optional EVENT-TYPE) by
+`leman-send-message' and other event-sending functions, with
+EVENT-TYPE \"m.room.message\" when omitted (e.g. \"m.reaction\"
+for reactions); must return (CONTENT . TYPE), with CONTENT
+possibly encrypted and TYPE the type to send it as (e.g.
+\"m.room.encrypted\", or EVENT-TYPE when not encrypted).  Set by
+the E2EE integration.")
 
 (cl-defun leman-send-message (room session
                                    &key body formatted-body replying-to-event filter then

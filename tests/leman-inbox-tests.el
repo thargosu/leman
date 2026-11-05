@@ -759,8 +759,8 @@ are pushed to `receipts' as (EVENT-ID . ROOT-ID)."
      (ignore room receipts)
      (cl-letf (((symbol-function 'leman-threads--schedule-save) #'ignore)
                ((symbol-function 'leman-threads--send-receipt)
-                (lambda (_room _session event root-id)
-                  (push (cons (leman-event-id event) root-id) receipts))))
+                (lambda (_room _session event-id root-id)
+                  (push (cons event-id root-id) receipts))))
        ,@body)))
 
 (ert-deftest leman-threads-unread-from-replies ()
@@ -821,6 +821,26 @@ are pushed to `receipts' as (EVENT-ID . ROOT-ID)."
     (leman-threads-mark-read room session "$root")
     (should-not (leman-threads-unread room session))
     (should (equal '(("$r4" . "$root")) receipts))))
+
+(ert-deftest leman-threads-bridge-resends-lost-receipt ()
+  "A thread read before but still unread per the bridge can be read again."
+  (leman-inbox-tests--with-threads
+      `((threads . (($root . ((unread . 41) (mentions . 0)
+                              (latest_ts . ,(leman-inbox-tests--ts 5))
+                              ;; Not known locally.
+                              (latest_event_id . "$r5"))))))
+    ;; Read in an earlier session, whose receipt the bridge missed.
+    (push (cons leman-threads-read-account-data-type
+                `((type . ,leman-threads-read-account-data-type)
+                  (content . ((threads . (($root . ,(leman-inbox-tests--ts 1))))))))
+          (leman-room-account-data room))
+    (should (leman-threads-unread room session))
+    (leman-threads-mark-read room session "$root")
+    (should-not (leman-threads-unread room session))
+    (should (equal '(("$r5" . "$root")) receipts))
+    ;; Sent once per session, not on each re-render.
+    (leman-threads-mark-read room session "$root")
+    (should (= 1 (length receipts)))))
 
 (ert-deftest leman-threads-latest-main-event ()
   "Main-timeline read markers skip thread replies."

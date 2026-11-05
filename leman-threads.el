@@ -497,25 +497,32 @@ The read position is saved in the room's account data, and, per
                          root-id))
          (ts (max (if latest (leman-event-origin-server-ts latest) 0)
                   (or (map-elt bridge-thread 'latest_ts) 0)))
-         (reads (leman-threads--local-reads room)))
-    (when (and (> ts 0) (> ts (leman-threads-read-ts room session root-id)))
-      (puthash root-id ts reads)
+         (reads (leman-threads--local-reads room))
+         ;; A thread the bridge still lists as unread was not marked
+         ;; read on the bridged network, even if its saved read
+         ;; position says so (e.g. its receipt was lost): only what
+         ;; was read in this session counts, so that the receipt is
+         ;; sent again.
+         (read-ts (if (> (or (map-elt bridge-thread 'unread) 0) 0)
+                      (gethash root-id reads 0)
+                    (leman-threads-read-ts room session root-id))))
+    (when (and (> ts 0) (> ts read-ts))
+      (puthash root-id (max ts (gethash root-id reads 0)) reads)
       (cl-incf leman-threads--tick)
       (leman-threads--schedule-save room session)
-      (when-let ((event (or (when-let ((id (map-elt bridge-thread 'latest_event_id)))
-                              (leman-threads--event session id))
-                            latest)))
+      (when-let ((event-id (or (map-elt bridge-thread 'latest_event_id)
+                               (and latest (leman-event-id latest)))))
         (when (pcase leman-threads-send-receipts
                 ('bridged (leman-threads-bridged-p room))
                 (value value))
-          (leman-threads--send-receipt room session event root-id)))
+          (leman-threads--send-receipt room session event-id root-id)))
       (run-hook-with-args 'leman-threads-read-functions room session root-id))))
 
-(defun leman-threads--send-receipt (room session event root-id)
-  "Send a read receipt for EVENT in thread ROOT-ID of ROOM on SESSION."
+(defun leman-threads--send-receipt (room session event-id root-id)
+  "Send a read receipt for EVENT-ID in thread ROOT-ID of ROOM on SESSION."
   (leman-api session (format "rooms/%s/receipt/m.read/%s"
                              (url-hexify-string (leman-room-id room))
-                             (url-hexify-string (leman-event-id event)))
+                             (url-hexify-string event-id))
     :method 'post :version "v3"
     :data (json-encode (list (cons "thread_id" root-id)))
     :then #'ignore))

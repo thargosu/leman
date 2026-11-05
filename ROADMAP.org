@@ -11,20 +11,27 @@ inherited from upstream.)
 | Spoilers (MSC2014)            | done   | Rendered, toggled with RET or mouse                |
 | Desktop notifications         | done   | D-Bus; predicates for mentions/unread/open buffers |
 | Unread mode-line indicator    | done   | % escaping, RET/mouse-2 keymap                     |
-| Custom-emoji reactions        | done   | mxc:// keys rendered as images; toggling           |
+| Custom-emoji reactions        | done   | mxc:// keys rendered as images; toggling; sending from image packs (MSC2545) |
 | Threads (MSC3440), phase 1    | done   | Aggregation, chips, thread view, replies, edits    |
+| Unread threads                | done   | Inbox section; read positions in account data; bridge-published unreads |
+| Inbox                         | done   | Unread rooms and threads; rooms opened side by side |
 | Threads, phase 2              | next   | See below                                          |
 | E2EE, phase 1 (decrypt)       | done   | Agent + sync integration; verified against a real homeserver |
 | E2EE, phase 2 (encrypt-send)  | done   | Messages and emotes, fail-closed; Element/FluffyChat interop |
 | E2EE, phase 3 (verify)        | done   | Emoji SAS, cross-signing import, shields; QR is a follow-up |
 | E2EE, phase 4 (key backup)    | done   | Megolm backup v1 + SSSS; gossiping; old-version restore |
-| E2EE, closure                  | next   | Encrypt reactions; decrypt fetched encrypted thread events |
-| UI rework                     | next   | Quick wins first, then speed; see plan below       |
+| E2EE, closure                 | now    | Reactions encrypted; next: decrypt fetched encrypted thread events |
+| UI rework                     | next   | Phases 3 and 5 done; see plan below                |
 
 * Threads, phase 2 (polish)
 
 + Room-level thread list (~GET /v1/rooms/{id}/threads~), e.g. ~s T~.
-+ Mark threads read when viewed (threaded read receipts).
+  (Unread threads across rooms are listed in the inbox.)
++ DONE Mark threads read when viewed (threaded read receipts, plus read
+  positions saved in room account data).  Bridged rooms: with servers
+  that don't forward receipts to appservices (Conduit, MSC2409),
+  threads read in Leman stay unread on the bridged network; Leman
+  hides them until a new reply.
 + Org/HTML composition for thread replies (currently single-line minibuffer).
 + Make fetched thread replies use the normal E2EE decryption and retry
   path.  Encrypted replies currently have no visible relation until
@@ -104,12 +111,12 @@ Phasing:
      rooms), warning when a room has encrypted traffic but encryption
      is inactive.  Verified against Element and FluffyChat on a real
      homeserver.
-   + Closure required: reactions are currently sent as plaintext
-     ~m.reaction~ events, exposing their key and target event ID to the
-     homeserver.  Generalize the encrypted-send helper to take the inner
-     event type, encrypt reactions fail-closed, and test that no raw
-     reaction reaches an encrypted room.  Do the same for any future
-     message-like event type.
+   + DONE Closure: reactions are encrypted (fail-closed) in encrypted
+     rooms; the encrypted-send helper takes the inner event type.  As
+     in Element, their ~m.relates_to~ (target event ID and key) stays
+     in clear for server-side aggregation: encryption hides the event
+     type and the custom-emoji shortcode fields.  Use the same helper
+     for any future message-like event type.
 3. *Verification* ("E3"): emoji SAS verification of devices.
    DONE 2026-09-15.
    + Working: the full SAS dance over to-device events —
@@ -188,9 +195,8 @@ Phases:
 Small, additive changes with immediate visible value:
 + Authenticity marker (lock/shield) at the START of the message line,
   before the sender name, not appended at the end.
-+ Complete sender display names: stop truncating senders to the fixed
-  left margin; align them with display properties and let long names
-  show in full.
++ DONE Complete sender display names: the default Elemental layout
+  (sender headers instead of the left margin) never truncates them.
 + Thread pills: render the thread chip as an svg-lib tag (count +
   snippet) instead of the 🧵 glyph.
 + Typing indicator: an EWOC footer already shows "Typing: ..." (the
@@ -204,27 +210,28 @@ then fix the hotspots:
   render, image refresh).
 + Defer work not needed to show the newest messages (old history,
   HTML, images decrypt/render lazily).
++ DONE Server thumbnails for images and avatars (full-size images were
+  rescaled at every draw), and a single throttled animation timer.
 
-** Phase 3: Avatars
-User avatars: the URLs are stored (m.room.member -> leman-user) but
-never fetched or displayed.  Copy the room-avatar precedent (download,
-cache, display property, svg-lib fallback for missing avatars) and
-render the avatar with the sender name; reuse it in the sidebar and
-room lists.
+** Phase 3: Avatars (DONE)
+Speakers' avatars are shown in sender headers and thread headers,
+fetched as 96 px crops and cached on the user struct.  Remaining: reuse
+them in the sidebar.
 
 ** Phase 4: Sidebar
-Side-window ~*Leman Sidebar*~ on the left: magit-section room list
+The inbox (~leman-inbox~: unread rooms and threads, svg-lib badges,
+rooms opened beside it) covers part of this; decide whether a sidebar
+is still needed.  Side-window ~*Leman Sidebar*~ on the left: magit-section room list
 (reusing taxy grouping: favorites, low-priority, DMs, spaces), room
 avatars, svg-lib unread badges (distinct mention badge), topic snippet.
 RET/click to view; auto-follow recent activity.  Dedicated window that
 survives ~delete-other-windows~.
 
-** Phase 5: Custom emoji packs and picker
-Fetch the room's emoji packs (im.ponies.room_emotes state, user packs
-from account data) and offer them in the reaction picker alongside
-unicode emoji.  Strictly additive: the reaction and emoji rendering
-path works today and is pinned by tests; never rework it as part of
-this phase.  Bigger reaction images are a defcustom away
+** Phase 5: Custom emoji packs and picker (DONE)
+~leman-room-emoji-search~ (the default reaction picker) completes the
+custom emoji of the user's, the room's, and globally enabled image
+packs (MSC2545), shown as images, alongside Unicode emoji.  Bigger
+reaction images are a defcustom away
 (leman-room-reaction-emoji-max-size); animated emoji remain a
 carry-over.
 

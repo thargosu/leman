@@ -2597,6 +2597,31 @@ Interactively, to event at point."
     (interactive)
     (set-input-method "emoji")))
 
+(defun leman-room--image-packs (room)
+  "Return the latest version of each of ROOM's image packs (MSC2545).
+Return its \"im.ponies.room_emotes\" state events, one per state
+key, latest first.  Both ROOM's state and its timeline are
+searched: a pack set or changed since the initial sync (e.g. by a
+bridge filling it lazily) arrives in the timeline only."
+  (let ((packs (make-hash-table :test #'equal)))
+    ;; Both lists may hold several versions of a pack, and loading
+    ;; earlier messages appends older ones to the timeline: compare
+    ;; timestamps rather than rely on the lists' order.
+    (dolist (events (list (leman-room-timeline room) (leman-room-state room)))
+      (dolist (event events)
+        (when-let* (((leman-event-p event))
+                    ((equal "im.ponies.room_emotes" (leman-event-type event)))
+                    (state-key (leman-event-state-key event)))
+          (let ((latest (gethash state-key packs)))
+            (when (or (null latest)
+                      (> (or (leman-event-origin-server-ts event) 0)
+                         (or (leman-event-origin-server-ts latest) 0)))
+              (puthash state-key event packs))))))
+    (sort (hash-table-values packs)
+          (lambda (a b)
+            (> (or (leman-event-origin-server-ts a) 0)
+               (or (leman-event-origin-server-ts b) 0))))))
+
 (defun leman-room--custom-emojis (room session)
   "Return the custom emoji usable in ROOM on SESSION.
 Return an alist mapping shortcodes (without colons) to mxc URIs,
@@ -2624,16 +2649,10 @@ Stickers are omitted."
                                        (not (gethash name emojis)))
                              do (puthash name url emojis))))
                 (add-room-packs (room &optional state-keys)
-                  ;; The room's state may hold earlier versions of a
-                  ;; pack: use the latest (the first) only.
-                  (let ((seen nil))
-                    (dolist (event (leman-room-state room))
-                      (let ((state-key (leman-event-state-key event)))
-                        (when (and (equal "im.ponies.room_emotes" (leman-event-type event))
-                                   (not (member state-key seen))
-                                   (or (null state-keys) (member state-key state-keys)))
-                          (push state-key seen)
-                          (add-pack (leman-event-content event))))))))
+                  (dolist (event (leman-room--image-packs room))
+                    (when (or (null state-keys)
+                              (member (leman-event-state-key event) state-keys))
+                      (add-pack (leman-event-content event))))))
       (add-pack (account-data "im.ponies.user_emotes"))
       (add-room-packs room)
       (cl-loop for (room-id . packs) in (alist-get 'rooms (account-data "im.ponies.emote_rooms"))
@@ -4791,15 +4810,19 @@ if it can't be made into an image."
 
 (defun leman-room--reaction-shortcode (key room)
   "Return the shortcode for reaction KEY in ROOM.
-For custom emoji, look up KEY's mxc URI in the room's emoji pack.
-For Unicode emoji, derive a readable shortcode from its Unicode name."
+For custom emoji, look up KEY's mxc URI in the room's emoji pack
+\(in its state or, when changed since the initial sync, its
+timeline).  For Unicode emoji, derive a readable shortcode from its
+Unicode name."
   (or (when (string-prefix-p "mxc://" key)
-        (cl-loop for event in (leman-room-state room)
-                 when (equal (leman-event-type event) "im.ponies.room_emotes")
-                 thereis (cl-loop for (name . image) in
-                                  (alist-get 'images (leman-event-content event))
-                                  when (equal key (alist-get 'url image))
-                                  return (format ":%s:" name))))
+        (cl-loop for events in (list (leman-room-timeline room) (leman-room-state room))
+                 thereis (cl-loop for event in events
+                                  when (and (leman-event-p event)
+                                            (equal (leman-event-type event) "im.ponies.room_emotes"))
+                                  thereis (cl-loop for (name . image) in
+                                                   (alist-get 'images (leman-event-content event))
+                                                   when (equal key (alist-get 'url image))
+                                                   return (format ":%s:" name)))))
       (when-let ((name (and (not (string-prefix-p "mxc://" key))
                             (get-char-code-property (string-to-char key) 'name))))
         (format ":%s:" (replace-regexp-in-string " " "_" (downcase name))))

@@ -1384,6 +1384,30 @@ Only a room pack's latest version counts, and stickers are left out."
                    (sort (leman-room--custom-emojis room session)
                          (lambda (a b) (string< (car a) (car b))))))))
 
+(ert-deftest leman-room--custom-emojis-from-timeline ()
+  "Image packs set or changed since the initial sync are used.
+They arrive in the timeline, and the latest version of a pack
+wins, whichever list it is in."
+  (let* ((room (make-leman-room :id "!dm:example.com"))
+         (session (make-leman-session :rooms (list room))))
+    (cl-flet ((pack (state-key ts images)
+                (let ((event (leman-tests--emote-pack state-key images)))
+                  (setf (leman-event-origin-server-ts event) ts)
+                  event)))
+      (setf (leman-room-state room)
+            (list (pack "" 100 '((old . ((url . "mxc://x/old")))))
+                  (pack "chunk-1" 300 '((kept . ((url . "mxc://x/kept"))))))
+            (leman-room-timeline room)
+            (list (make-leman-event :type "m.room.message" :origin-server-ts 250)
+                  (pack "" 200 '((new . ((url . "mxc://x/new")))))
+                  ;; Older version of a pack, from loading earlier messages.
+                  (pack "chunk-1" 50 '((stale . ((url . "mxc://x/stale"))))))))
+    (should (equal '(("kept" . "mxc://x/kept")
+                     ("new" . "mxc://x/new"))
+                   (sort (leman-room--custom-emojis room session)
+                         (lambda (a b) (string< (car a) (car b))))))
+    (should (equal ":new:" (leman-room--reaction-shortcode "mxc://x/new" room)))))
+
 (ert-deftest leman-room-emoji-search-inserts-custom-emoji-uri ()
   "Choosing a custom emoji inserts its mxc URI, the reaction key."
   (let* ((room (make-leman-room :id "!room:example.com"))

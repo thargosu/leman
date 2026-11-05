@@ -278,6 +278,10 @@ impl Agent {
             }
             None => false,
         };
+        // Dropping the store closes its connections in the background:
+        // SQLite would then delete the -wal/-shm files under our feet
+        // while they are being moved.  Close (and checkpoint) first.
+        store.close().await?;
         drop(store);
         if !migratable {
             return Ok(());
@@ -296,9 +300,13 @@ impl Agent {
             let file_name = entry.file_name();
             let name = file_name.to_string_lossy();
             if name.starts_with("matrix-sdk-crypto.sqlite3") {
-                tokio::fs::rename(entry.path(), path.join(&*file_name))
-                    .await
-                    .context("moving legacy crypto store file")?;
+                match tokio::fs::rename(entry.path(), path.join(&*file_name)).await {
+                    // A -wal/-shm sidecar SQLite removed on close.
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::NotFound
+                            && name != "matrix-sdk-crypto.sqlite3" => {}
+                    result => result.context("moving legacy crypto store file")?,
+                }
             }
         }
         Ok(())

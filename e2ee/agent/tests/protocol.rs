@@ -850,7 +850,7 @@ async fn test_initialize_migrates_legacy_store() {
     assert_eq!(
         initialize["ok"]["identity_keys"],
         identity_keys,
-        "identity keys must survive the migration"
+        "identity keys must survive the migration: {initialize}"
     );
     agent.request("quit", json!({}));
     assert!(

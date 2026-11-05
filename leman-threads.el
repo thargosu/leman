@@ -31,13 +31,20 @@
 ;;   authoritative read state of the bridged network's threads (e.g.
 ;;   Mattermost's collapsed reply threads).  It looks like:
 ;;
-;;     {"main": {"unread": 6, "mentions": 0},
-;;      "threads": {"$root": {"unread": 42, "mentions": 1,
+;;     {"threads": {"$root": {"unread": 42, "mentions": 1,
 ;;                            "latest_ts": 1761818000000,
 ;;                            "latest_event_id": "$reply"}}}
 ;;
-;;   where "main" counts the room's messages outside threads, and
-;;   "threads" lists only the threads with unread replies.
+;;   where "threads" lists only the threads with unread replies.  An
+;;   optional "main" object, with the same "unread" and "mentions"
+;;   keys, counts the room's messages outside threads.
+;;
+;;   Reading a thread in Leman sends a threaded read receipt, for the
+;;   bridge to mark it read on the bridged network.  But some servers
+;;   (like Conduit) don't forward receipts to bridges (MSC2409): the
+;;   thread then stays unread on the bridged network, and listed by
+;;   the bridge.  So Leman hides a listed thread while its read
+;;   position (see below) is at or past its latest reply.
 ;;
 ;; * Otherwise, the thread replies Leman has seen, compared to the
 ;;   threads' read positions, which Leman stores in room account data
@@ -245,6 +252,19 @@ On SESSION.  Return 0 when nothing is known to be read."
             root-id)
            0)))
 
+(defun leman-threads--bridge-read-ts (room root-id)
+  "Return the timestamp up to which thread ROOT-ID in bridged ROOM was read.
+From this session's reads and the saved read positions, but not
+`leman-threads--since': the bridge is authoritative for threads
+not read in Leman."
+  (max (gethash root-id (leman-threads--local-reads room) 0)
+       (or (leman-threads--map-get
+            (map-elt (leman-threads--account-data-content
+                      room leman-threads-read-account-data-type)
+                     'threads)
+            root-id)
+           0)))
+
 (defun leman-threads--save (room session)
   "Save ROOM's threads' read positions in its account data on SESSION."
   (setf (map-elt (leman-room-local room) 'thread-save-timer) nil)
@@ -258,8 +278,18 @@ On SESSION.  Return 0 when nothing is known to be read."
                (when (> ts (gethash root-id reads 0))
                  (puthash root-id ts reads)))
              (leman-threads--local-reads room))
-    (let* ((threads (seq-take (cl-sort (map-pairs reads) #'> :key #'cdr)
-                              leman-threads-max-saved))
+    (let* ((listed (mapcar (lambda (pair) (leman-threads--key-name (car pair)))
+                           (map-elt (leman-threads--account-data-content
+                                     room leman-threads-bridge-account-data-type)
+                                    'threads)))
+           ;; Threads the bridge still lists would be unread again
+           ;; without their read positions: keep them all.
+           (threads (let ((others 0))
+                      (cl-loop for pair in (cl-sort (map-pairs reads) #'> :key #'cdr)
+                               when (or (member (car pair) listed)
+                                        (and (< others leman-threads-max-saved)
+                                             (cl-incf others)))
+                               collect pair)))
            (since (leman-threads--since room session))
            (content (append (when since (list (cons "since" since)))
                             (list (cons "threads" (or threads
@@ -357,9 +387,8 @@ Return a list of `leman-thread' structs."
 (defun leman-threads--from-bridge (room session content)
   "Return ROOM's unread threads on SESSION from bridge CONTENT.
 CONTENT is the bridge's account data (see Commentary).  Threads
-read in this session since it was published are omitted."
-  (let ((reads (leman-threads--local-reads room))
-        (known (leman-threads--known-replies room session)))
+read in Leman up to their latest reply are omitted."
+  (let ((known (leman-threads--known-replies room session)))
     (cl-loop for (key . thread) in (map-elt content 'threads)
              for root-id = (leman-threads--key-name key)
              for count = (or (map-elt thread 'unread) 0)
@@ -373,7 +402,8 @@ read in this session since it was published are omitted."
                                       (leman-event-origin-server-ts latest-event)))
              when (and (> count 0)
                        (not (and latest-ts
-                                 (>= (gethash root-id reads 0) latest-ts))))
+                                 (>= (leman-threads--bridge-read-ts room root-id)
+                                     latest-ts))))
              collect (make-leman-thread
                       :room room :session session :root-id root-id
                       :count count :mentions (or (map-elt thread 'mentions) 0)
@@ -498,16 +528,12 @@ The read position is saved in the room's account data, and, per
          (ts (max (if latest (leman-event-origin-server-ts latest) 0)
                   (or (map-elt bridge-thread 'latest_ts) 0)))
          (reads (leman-threads--local-reads room))
-         ;; A thread the bridge still lists as unread was not marked
-         ;; read on the bridged network, even if its saved read
-         ;; position says so (e.g. its receipt was lost): only what
-         ;; was read in this session counts, so that the receipt is
-         ;; sent again.
-         (read-ts (if (> (or (map-elt bridge-thread 'unread) 0) 0)
-                      (gethash root-id reads 0)
+         ;; As in `leman-threads--from-bridge'.
+         (read-ts (if bridge-thread
+                      (leman-threads--bridge-read-ts room root-id)
                     (leman-threads-read-ts room session root-id))))
     (when (and (> ts 0) (> ts read-ts))
-      (puthash root-id (max ts (gethash root-id reads 0)) reads)
+      (puthash root-id ts reads)
       (cl-incf leman-threads--tick)
       (leman-threads--schedule-save room session)
       (when-let ((event-id (or (map-elt bridge-thread 'latest_event_id)

@@ -823,25 +823,61 @@ are pushed to `receipts' as (EVENT-ID . ROOT-ID)."
     (should-not (leman-threads-unread room session))
     (should (equal '(("$r4" . "$root")) receipts))))
 
-(ert-deftest leman-threads-bridge-resends-lost-receipt ()
-  "A thread read before but still unread per the bridge can be read again."
+(defun leman-inbox-tests--set-saved-read (room root-id ts)
+  "Set the saved read position of thread ROOT-ID in ROOM to TS."
+  (setf (alist-get leman-threads-read-account-data-type
+                   (leman-room-account-data room) nil nil #'equal)
+        `((type . ,leman-threads-read-account-data-type)
+          (content . ((threads . ((,(intern root-id) . ,ts)))))))
+  (cl-incf leman-threads--tick))
+
+(ert-deftest leman-threads-bridge-saved-reads ()
+  "Bridged threads read in Leman stay read until a new reply.
+Even though the bridge still lists them, e.g. on servers that
+don't forward receipts to bridges."
   (leman-inbox-tests--with-threads
       `((threads . (($root . ((unread . 41) (mentions . 0)
                               (latest_ts . ,(leman-inbox-tests--ts 5))
                               ;; Not known locally.
                               (latest_event_id . "$r5"))))))
-    ;; Read in an earlier session, whose receipt the bridge missed.
-    (push (cons leman-threads-read-account-data-type
-                `((type . ,leman-threads-read-account-data-type)
-                  (content . ((threads . (($root . ,(leman-inbox-tests--ts 1))))))))
-          (leman-room-account-data room))
+    ;; Read up to its latest reply in an earlier session.
+    (leman-inbox-tests--set-saved-read room "$root" (leman-inbox-tests--ts 5))
+    (should-not (leman-threads-unread room session))
+    (leman-threads-mark-read room session "$root")
+    (should-not receipts)
+    ;; Read before its latest reply.
+    (leman-inbox-tests--set-saved-read room "$root" (leman-inbox-tests--ts 60))
     (should (leman-threads-unread room session))
     (leman-threads-mark-read room session "$root")
     (should-not (leman-threads-unread room session))
-    (should (equal '(("$r5" . "$root")) receipts))
-    ;; Sent once per session, not on each re-render.
-    (leman-threads-mark-read room session "$root")
-    (should (= 1 (length receipts)))))
+    (should (equal '(("$r5" . "$root")) receipts))))
+
+(ert-deftest leman-threads-bridge-ignores-since ()
+  "Bridged threads older than when Leman started tracking stay unread."
+  (leman-inbox-tests--with-threads
+      ;; Older than the room's read position.
+      `((threads . (($old . ((unread . 2) (mentions . 0)
+                             (latest_ts . ,(leman-inbox-tests--ts 1500)))))))
+    (should (leman-threads--since room session))
+    (should (equal '("$old") (mapcar #'leman-thread-root-id
+                                     (leman-threads-unread room session))))))
+
+(ert-deftest leman-threads-save-keeps-bridge-listed ()
+  "Read positions of threads the bridge lists are kept when trimming."
+  (leman-inbox-tests--with-threads
+      `((threads . (($oldest . ((unread . 1) (mentions . 0)
+                                (latest_ts . ,(leman-inbox-tests--ts 300)))))))
+    (let ((leman-threads-max-saved 1)
+          (reads (leman-threads--local-reads room))
+          saved)
+      (puthash "$newest" (leman-inbox-tests--ts 100) reads)
+      (puthash "$middle" (leman-inbox-tests--ts 200) reads)
+      (puthash "$oldest" (leman-inbox-tests--ts 300) reads)
+      (cl-letf (((symbol-function 'leman-put-account-data)
+                 (lambda (_session _type data &rest _) (setf saved data))))
+        (leman-threads--save room session))
+      (should (equal '("$newest" "$oldest")
+                     (mapcar #'car (map-elt saved "threads")))))))
 
 (ert-deftest leman-room-list-unread-like-inbox ()
   "The room list counts thread replies as the inbox does, not the server."

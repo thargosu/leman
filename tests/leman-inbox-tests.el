@@ -24,6 +24,7 @@
 
 (require 'leman-room)
 (require 'leman-inbox)
+(require 'leman-room-list)
 
 ;;;; Fixtures
 
@@ -841,6 +842,32 @@ are pushed to `receipts' as (EVENT-ID . ROOT-ID)."
     ;; Sent once per session, not on each re-render.
     (leman-threads-mark-read room session "$root")
     (should (= 1 (length receipts)))))
+
+(ert-deftest leman-room-list-unread-like-inbox ()
+  "The room list counts thread replies as the inbox does, not the server."
+  (cl-flet ((read-main-timeline (room session)
+              ;; Track the room's threads first, as in
+              ;; `leman-threads-reading-main-timeline-keeps-threads-unread'.
+              (leman-threads-unread room session)
+              (cl-incf leman-threads--tick)
+              ;; Only thread replies are left in the server's counts.
+              (setf (alist-get "m.fully_read" (leman-room-account-data room)
+                               nil nil #'equal)
+                    (list (cons 'content (list (cons 'event_id "$main"))))
+                    (leman-room-unread-notifications room)
+                    '((notification_count . 3) (highlight_count . 1)))))
+    ;; The bridge has the thread read.
+    (leman-inbox-tests--with-threads '((threads))
+      (read-main-timeline room session)
+      (should-not (leman-inbox--unread-p room session))
+      (should-not (leman-room-list--unread-p room session))
+      (should (equal '(0 . 0) (leman-room-list--unread-counts room session))))
+    ;; Unbridged, the thread is unread.
+    (leman-inbox-tests--with-threads nil
+      (read-main-timeline room session)
+      (should-not (leman-inbox--unread-p room session))
+      (should (leman-room-list--unread-p room session))
+      (should (equal '(3 . 1) (leman-room-list--unread-counts room session))))))
 
 (ert-deftest leman-threads-latest-main-event ()
   "Main-timeline read markers skip thread replies."

@@ -29,6 +29,7 @@
 (require 'taxy-magit-section)
 
 (require 'leman-lib)
+(require 'leman-threads)
 
 ;;;; Mouse commands
 
@@ -348,7 +349,7 @@ from recent to non-recent for rooms updated in the past hour."
 
 (leman-room-list-define-key unread ()
   (pcase-let ((`[,room ,session] item))
-    (when (leman--room-unread-p room session)
+    (when (leman-room-list--unread-p room session)
       "Unread")))
 
 (leman-room-list-define-key favourite ()
@@ -446,7 +447,7 @@ from recent to non-recent for rooms updated in the past hour."
           (setf face (cl-copy-list '(:inherit (leman-room-list-name))))
           ;; In concert with the "Unread" column, this is roughly equivalent to the
           ;; "red/gray/bold/idle" states listed in <https://github.com/matrix-org/matrix-react-sdk/blob/b0af163002e8252d99b6d7075c83aadd91866735/docs/room-list-store.md#list-ordering-algorithm-importance>.
-          (when (leman--room-unread-p room session)
+          (when (leman-room-list--unread-p room session)
             ;; For some reason, `push' doesn't work with `map-elt'...or does it?
             (push 'leman-room-list-unread (map-elt face :inherit)))
           (when (equal "m.space" type)
@@ -468,12 +469,11 @@ from recent to non-recent for rooms updated in the past hour."
             'keymap leman-room-list-button-map))
         "")))
 
-(leman-room-list-define-column #("Unread" 0 6 (help-echo "Unread events (Notifications:Highlights)")) (:align 'right)
-  (pcase-let* ((`[,(cl-struct leman-room unread-notifications) ,_session] item)
-               ((map notification_count highlight_count) unread-notifications))
-    (if (or (not unread-notifications)
-            (and (equal 0 notification_count)
-                 (equal 0 highlight_count)))
+(leman-room-list-define-column #("Unread" 0 6 (help-echo "Unread messages, threads included (Messages:Mentions)")) (:align 'right)
+  (pcase-let* ((`[,room ,session] item)
+               (`(,notification_count . ,highlight_count)
+                (leman-room-list--unread-counts room session)))
+    (if (and (zerop notification_count) (zerop highlight_count))
         ""
       (concat (leman-propertize (number-to-string notification_count)
                 'face (if (zerop highlight_count)
@@ -613,7 +613,7 @@ FORMAT-FN is used to format each item."
                     0))
               (item-unread-p (item)
                 (pcase-let ((`[,room ,session] item))
-                  (leman--room-unread-p room session)))
+                  (leman-room-list--unread-p room session)))
               (item-left-p (item)
                 (pcase-let ((`[,(cl-struct leman-room status) ,_session] item))
                   (equal 'leave status)))
@@ -807,7 +807,7 @@ left."
   (unless (cl-loop with starting-line = (line-number-at-pos)
                    for value = (oref (magit-current-section) value)
                    if (and (vectorp value)
-                           (leman--room-unread-p (elt value 0) (elt value 1)))
+                           (leman-room-list--unread-p (elt value 0) (elt value 1)))
                    do (progn
                         (leman-view-room (elt value 0)  (elt value 1))
                         (leman-room-goto-fully-read-marker)
@@ -825,6 +825,28 @@ left."
               leman-room-list-timestamp-colors (leman-room-list--timestamp-colors)))
 
 ;;;; Functions
+
+(defun leman-room-list--unread-p (room session)
+  "Return non-nil if ROOM on SESSION is unread.
+That is, if its buffer is modified, or it has unread messages
+outside threads or unread threads, as in `leman-inbox'.  Unlike
+in the server's counts, thread replies already read (e.g. per a
+bridge) don't make the room unread."
+  (or (when-let ((buffer (map-elt (leman-room-local room) 'buffer)))
+        (buffer-modified-p buffer))
+      (leman-threads-room-unread-p room session)
+      (and (leman-threads-unread room session) t)))
+
+(defun leman-room-list--unread-counts (room session)
+  "Return (COUNT . MENTIONS) of unread messages in ROOM on SESSION.
+Messages outside threads per `leman-threads-main-counts', plus
+those of unread threads."
+  (let ((main (or (leman-threads-main-counts room session) '(0 . 0))))
+    (cl-loop for thread in (leman-threads-unread room session)
+             sum (leman-thread-count thread) into count
+             sum (leman-thread-mentions thread) into mentions
+             finally return (cons (+ (car main) count)
+                                  (+ (cdr main) mentions)))))
 
 (defun leman-room-list--cache-visibility ()
   "Save visibility cache.

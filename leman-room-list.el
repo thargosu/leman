@@ -828,13 +828,11 @@ left."
 
 (defun leman-room-list--unread-p (room session)
   "Return non-nil if ROOM on SESSION is unread.
-That is, if its buffer is modified, or it has unread messages
-outside threads or unread threads, as in `leman-inbox'.  Unlike
+That is, if it has unread messages outside threads or unread
+threads, as in `leman-inbox'.  Unlike
 in the server's counts, thread replies already read (e.g. per a
 bridge) don't make the room unread."
-  (or (when-let ((buffer (map-elt (leman-room-local room) 'buffer)))
-        (buffer-modified-p buffer))
-      (leman-threads-room-unread-p room session)
+  (or (leman-threads-room-unread-p room session)
       (and (leman-threads-unread room session) t)))
 
 (defun leman-room-list--unread-counts (room session)

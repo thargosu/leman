@@ -1831,24 +1831,21 @@ event, if known."
 
 (defun leman--room-unread-p (room session)
   "Return non-nil if ROOM is considered unread for SESSION.
-The room is unread if it has a modified, live buffer; if it has
-non-zero unread notification counts; or if its fully-read marker
-is not at the latest known message event."
+The room is unread if it has non-zero unread notification counts;
+or, unless `leman-room-unread-only-counts-notifications', if its
+fully-read marker is not at the latest known message event."
   ;; Roughly equivalent to the "red/gray/bold/idle" states listed in
   ;; <https://github.com/matrix-org/matrix-react-sdk/blob/b0af163002e8252d99b6d7075c83aadd91866735/docs/room-list-store.md#list-ordering-algorithm-importance>.
-  (pcase-let* (((cl-struct leman-room timeline account-data unread-notifications receipts
-                           (local (map buffer)))
+  (pcase-let* (((cl-struct leman-room timeline account-data unread-notifications receipts)
                 room)
                ((cl-struct leman-session user) session)
                ((cl-struct leman-user (id our-id)) user)
                ((map notification_count highlight_count) unread-notifications)
                (fully-read-event-id (map-nested-elt (alist-get "m.fully_read" account-data nil nil #'equal)
                                                     '(content event_id))))
-    ;; MAYBE: Ignore whether the buffer is modified.  Since we have a better handle on how
-    ;; Matrix does notifications/unreads/highlights, maybe that's not needed, and it would
-    ;; be more consistent to ignore it.
-    (or (and buffer (buffer-modified-p buffer))
-        (and unread-notifications
+    ;; NOTE: Whether the room's buffer is modified is ignored: any
+    ;; event inserted modifies it, even a membership change.
+    (or (and unread-notifications
              (or (not (zerop notification_count))
                  (not (zerop highlight_count))))
         (and (not leman-room-unread-only-counts-notifications)

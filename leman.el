@@ -2565,12 +2565,6 @@ Also used for left rooms, in which case STATUS should be set to
                (latest-timestamp))
     (setf (leman-room-status room) status
           (leman-room-unread-notifications room) unread-notifications)
-    ;; The server caught up on unread notifications: client-side
-    ;; ping state is stale when the room is fully read.
-    (when (and unread-notifications
-               (equal 0 (map-elt unread-notifications 'notification_count 0))
-               (equal 0 (map-elt unread-notifications 'highlight_count 0)))
-      (map-delete (leman-room-local room) 'pings))
     ;; NOTE: The idea is that, assuming that events in the sync response are in
     ;; chronological order, we push them to the lists in the room slots in that order,
     ;; leaving the head of each list as the most recent event of that type.  That means

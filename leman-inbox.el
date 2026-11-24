@@ -717,26 +717,17 @@ reactions; the latest message is shown instead."
 (defun leman-inbox--unread-p (room session)
   "Return non-nil if ROOM on SESSION is unread, as shown in the inbox.
 That is, if its main timeline is unread per
-`leman-threads-room-unread-p' (unread threads are listed apart),
-or it has pings detected client-side (shown in its badge)."
-  (let ((pings (map-elt (leman-room-local room) 'pings)))
-    (or (and pings (not (zerop pings)))
-        (leman-threads-room-unread-p room session))))
+`leman-threads-room-unread-p' (unread threads are listed apart)."
+  (leman-threads-room-unread-p room session))
 
 (defun leman-inbox--badge (room session)
   "Return the unread badge string for ROOM on SESSION.
 The string is empty when the room has no unread messages.  Only
 messages outside threads are counted: unread threads have their
 own rows."
-  (pcase-let* ((`(,count . ,mentions) (leman-threads-main-counts room session))
-               ;; Pings detected client-side (bridges often don't
-               ;; trigger server-side highlights).
-               (pings (map-elt (leman-room-local room) 'pings)))
+  (pcase-let ((`(,count . ,mentions) (leman-threads-main-counts room session)))
     (cond ((and mentions (not (zerop mentions)))
            (leman-inbox--badge-pill (format "@%d" mentions)
-                                    'leman-inbox-badge-mention))
-          ((and pings (not (zerop pings)))
-           (leman-inbox--badge-pill (format "@%d" pings)
                                     'leman-inbox-badge-mention))
           ((and count (not (zerop count)))
            (leman-inbox--badge-pill (number-to-string count)

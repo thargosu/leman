@@ -2902,8 +2902,6 @@ Uses action `leman-view-room-display-buffer-action', which see."
                  :predicate (lambda (room)
                               (not (leman--space-p room)))))
   (pcase-let* (((cl-struct leman-room (local (map buffer))) room))
-    ;; Viewing the room consumes its pings.
-    (map-delete (leman-room-local room) 'pings)
     (unless (buffer-live-p buffer)
       (setf buffer (leman-room--buffer session room (leman-room--buffer-name room))
             (alist-get 'buffer (leman-room-local room))  buffer))
@@ -3746,10 +3744,7 @@ function to `leman-room-event-fns', which see."
                ;; The previous own message's seen marker moves to this
                ;; one: re-render its header.
                (leman-room--refresh-seen-marker leman-room))
-             (leman-room--insert-event event)
-             (when (leman-room--event-ping-p event leman-room leman-session)
-               ;; Record the ping for the inbox's badge.
-               (cl-incf (map-elt (leman-room-local leman-room) 'pings 0)))))))
+             (leman-room--insert-event event)))))
 
 (leman-room-defevent "m.room.tombstone"
   (pcase-let* (((cl-struct leman-event content) event)
@@ -6552,21 +6547,11 @@ remain."
             (matches-body-p (leman--user-displayname-in room user))
             (matches-body-p (leman-user-id user)))))))
 
-(defcustom leman-room-ping-text-fallback t
-  "Detect pings by matching the user's names in message bodies.
-Servers report pings via \\+`unread_notifications.highlight_count\\+`,
-which requires \\+`m.mentions\\+` and server-side push rules;
-bridges often set neither.  When this is non-nil, a message whose
-body matches the user's username, display name, or ID, or
-mentions \"@room\", also counts as a ping."
-  :type 'boolean)
-
-(defun leman-room--event-ping-p (event room session)
-  "Return non-nil when EVENT in ROOM pings SESSION's user.
-An event pings the user when its \\+`m.mentions\\+` names the
-user or the room, or -- with `leman-room-ping-text-fallback' --
-when its body matches the user's username, display name, or ID,
-or mentions \"@room\"."
+(defun leman-room--event-ping-p (event _room session)
+  "Return non-nil when EVENT pings SESSION's user.
+That is, when its \\+`m.mentions\\+` names the user or the room.
+Messages from bridges and clients that predate \\+`m.mentions\\+`
+don't ping."
   (unless (equal (leman-user-id (leman-session-user session))
                  (leman-user-id (leman-event-sender event)))
     (pcase-let* (((cl-struct leman-event content) event)
@@ -6576,11 +6561,7 @@ or mentions \"@room\"."
       (or (and user-ids
                (member (leman-user-id (leman-session-user session))
                        (append user-ids nil)))
-          (eq room-mention t)
-          (and leman-room-ping-text-fallback
-               (or (leman-room--event-mentions-user-p
-                    event (leman-session-user session) room)
-                   (leman--event-mentions-room-p event)))))))
+          (eq room-mention t)))))
 
 (defun leman-room--linkify-urls (string)
   "Return STRING with URLs in it made clickable."

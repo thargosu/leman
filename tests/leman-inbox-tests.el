@@ -76,8 +76,7 @@
          (pinged-unread
           (make-leman-room
            :id "!pinged:example.org" :status 'join :display-name "Pinged Room"
-           ;; Client-side pings: no server-side highlight.
-           :local '((pings . 2))
+           :unread-notifications '((notification_count . 2) (highlight_count . 2))
            :timeline (list (leman-inbox-tests--msg "$pinged-msg" bob
                                                    "hey @me:example.org look" 90))
            :latest-ts (leman-inbox-tests--ts 90)))
@@ -172,7 +171,7 @@ All rooms are shown, not only unread ones."
                    '("!invite:example.org"  ; Invites group.
                      "!fav:example.org"     ; Pinned group.
                      "!mention:example.org" ; Unread, most recent first.
-                     "!pinged:example.org"  ; Client-side pings count as unread.
+                     "!pinged:example.org"
                      "!group:example.org"
                      "!enc:example.org"
                      "!edited:example.org"  ; Read, most recent first.
@@ -217,8 +216,7 @@ All rooms are shown, not only unread ones."
 
 (ert-deftest leman-inbox-ping-badge ()
   (leman-inbox-tests--with-inbox
-    ;; The client-side-pinged room shows an @-badge without any
-    ;; server-side highlight.
+    ;; A room with highlights shows an @-badge counting them.
     (let* ((text (buffer-substring-no-properties (point-min) (point-max)))
            (start (string-match "Pinged Room" text)))
       (should (string-match-p "@2"
@@ -588,10 +586,7 @@ All rooms are shown, not only unread ones."
         (let ((leman-room-unread-only-counts-notifications t))
           (cl-loop for (_id . session) in leman-sessions
                    do (cl-loop for room in (leman-session-rooms session)
-                               do (setf (leman-room-unread-notifications room) nil
-                                        ;; No client-side pings either (the
-                                        ;; fixture's alist is a constant).
-                                        (leman-room-local room) nil)))
+                               do (setf (leman-room-unread-notifications room) nil)))
           (leman-inbox--render)
           (goto-char (point-min))
           (leman-inbox-next-unread)
@@ -698,10 +693,17 @@ never used."
 ;;;; Threads
 
 (defun leman-inbox-tests--reply (id sender body root-id seconds-ago)
-  "Return a reply event with ID, SENDER, and BODY in thread ROOT-ID."
+  "Return a reply event with ID, SENDER, and BODY in thread ROOT-ID.
+User IDs in BODY are listed in its \\+`m.mentions\\+`."
   (make-leman-event :id id :type "m.room.message" :sender sender
                     :origin-server-ts (leman-inbox-tests--ts seconds-ago)
                     :content `((body . ,body) (msgtype . "m.text")
+                               (m.mentions
+                                . ((user_ids
+                                    . ,(vconcat
+                                        (seq-filter (lambda (word)
+                                                      (string-prefix-p "@" word))
+                                                    (split-string body))))))
                                (m.relates_to . ((rel_type . "m.thread")
                                                 (event_id . ,root-id))))))
 
@@ -755,8 +757,7 @@ are pushed to `receipts' as (EVENT-ID . ROOT-ID)."
   (declare (indent 1))
   `(let* ((session (leman-inbox-tests--threads-session ,bridge-content))
           (room (car (leman-session-rooms session)))
-          (receipts nil)
-          (leman-room-ping-text-fallback t))
+          (receipts nil))
      (ignore room receipts)
      (cl-letf (((symbol-function 'leman-threads--schedule-save) #'ignore)
                ((symbol-function 'leman-threads--send-receipt)

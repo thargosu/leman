@@ -895,7 +895,7 @@ thread views).  Fallback quotes in the bodies are still stripped."
                         (and (listp face) (memq 'leman-room-mention face))))))))
 
 (ert-deftest leman-room--event-ping-p ()
-  "Events ping the user via m.mentions, or via body text as fallback.
+  "Events ping the user via m.mentions only.
 The user's own messages never ping."
   (let* ((room (make-leman-room :id "!room:example.com"))
          (leman-room room)
@@ -914,16 +914,10 @@ The user's own messages never ping."
              (funcall mk '((msgtype . "m.text") (body . "hey all")
                            (m.mentions . ((room . t)))))
              room session))
-    ;; Text fallback: the user's ID in the body.
-    (let ((leman-room-ping-text-fallback t))
-      (should (leman-room--event-ping-p
-               (funcall mk '((msgtype . "m.text") (body . "ping @me:x.org please")))
-               room session))
-      ;; Fallback disabled: no m.mentions, no ping.
-      (let ((leman-room-ping-text-fallback nil))
-        (should-not (leman-room--event-ping-p
-                     (funcall mk '((msgtype . "m.text") (body . "ping @me:x.org please")))
-                     room session))))
+    ;; Without m.mentions, the user's ID in the body doesn't ping.
+    (should-not (leman-room--event-ping-p
+                 (funcall mk '((msgtype . "m.text") (body . "ping @me:x.org please")))
+                 room session))
     ;; The user's own messages never ping, even self-mentioning.
     (should-not (leman-room--event-ping-p
                  (make-leman-event :id "$own" :type "m.room.message"

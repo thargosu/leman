@@ -494,7 +494,7 @@ All rooms are shown, not only unread ones."
   "By default, only unread rooms and invites are shown."
   (leman-inbox-tests--with-inbox
     (setf leman-inbox-unread-only t)
-    (leman-inbox--render)
+    (leman-inbox--render t)
     (should (equal (leman-inbox-tests--room-ids)
                    '("!invite:example.org"
                      "!mention:example.org"
@@ -531,6 +531,89 @@ All rooms are shown, not only unread ones."
           (should (equal marked-room "!mention:example.org"))
           ;; The read receipt is up to the room's latest event.
           (should (equal (leman-event-id marked-event) "$mention-msg")))))))
+
+(defun leman-inbox-tests--unread-room-ids ()
+  "Return the IDs of the unread rooms shown in the current inbox buffer."
+  (cl-loop for room in (leman-session-rooms (cdar leman-sessions))
+           when (leman-inbox--unread-p room (cdar leman-sessions))
+           collect (leman-room-id room)))
+
+(ert-deftest leman-inbox-mark-read-shows-read-at-once ()
+  "A room marked read shows read before the server's next sync."
+  (leman-inbox-tests--with-inbox
+    (cl-letf (((symbol-function 'leman-room-mark-read) #'ignore))
+      (leman-inbox-tests--at-row 2  ; The mention room.
+        (leman-inbox-mark-read))
+      (should-not (member "!mention:example.org" (leman-inbox-tests--unread-room-ids)))
+      ;; Now read, the mention room stays in place.
+      (leman-inbox-tests--at-row 3
+        (should (equal "!pinged:example.org"
+                       (leman-room-id (aref (leman-inbox--item-at-point) 0))))
+        (leman-inbox-mark-read))
+      (should-not (member "!pinged:example.org" (leman-inbox-tests--unread-room-ids))))))
+
+(ert-deftest leman-inbox-mark-read-region ()
+  "With an active region, every row it covers is marked read."
+  (leman-inbox-tests--with-inbox
+    (let ((transient-mark-mode t)
+          (marked nil))
+      (cl-letf (((symbol-function 'leman-room-mark-read)
+                 (lambda (room &rest _) (push (leman-room-id room) marked))))
+        ;; From the middle of the mention room's row to the start of
+        ;; the group room's: the group room is not covered.
+        (leman-inbox-tests--at-row 4
+          (let ((end (point)))
+            (leman-inbox-tests--at-row 2
+              (forward-char 2)
+              (push-mark (point) t t)
+              (goto-char end)
+              (call-interactively #'leman-inbox-mark-read))))
+        (should (equal '("!pinged:example.org" "!mention:example.org") marked))
+        (should-not (region-active-p))
+        (should (equal '("!group:example.org" "!enc:example.org")
+                       (leman-inbox-tests--unread-room-ids)))))))
+
+(ert-deftest leman-inbox-keeps-rows-in-place ()
+  "Rows read since the inbox was refreshed stay listed, in place."
+  (leman-inbox-tests--with-inbox
+    (let ((leman-inbox-unread-only t))
+      (leman-inbox--render t)
+      (leman-inbox-tests--at-row 1  ; The mention room.
+        (should (equal "!mention:example.org"
+                       (leman-room-id (aref (leman-inbox--item-at-point) 0))))
+        ;; Viewing the room reads it.
+        (setf (leman-room-unread-notifications (aref (leman-inbox--item-at-point) 0))
+              '((notification_count . 0) (highlight_count . 0))))
+      (leman-inbox-tests--at-row 3
+        (leman-inbox--render)
+        (should (equal '("!invite:example.org" "!mention:example.org"
+                         "!pinged:example.org" "!group:example.org" "!enc:example.org")
+                       (leman-inbox-tests--room-ids)))
+        ;; Point stays on its row.
+        (should (equal "!group:example.org"
+                       (leman-room-id (aref (leman-inbox--item-at-point) 0)))))
+      ;; Refreshing drops the read room.
+      (leman-inbox-revert)
+      (should-not (member "!mention:example.org" (leman-inbox-tests--room-ids))))))
+
+(ert-deftest leman-inbox-render-keeps-window-point ()
+  "Re-rendering keeps the inbox window on its row, even unselected."
+  (leman-inbox-tests--with-inbox
+    (save-window-excursion
+      (delete-other-windows)
+      (switch-to-buffer (current-buffer))
+      (leman-inbox-tests--at-row 3
+        (let ((inbox-window (selected-window))
+              (item (leman-inbox--item-at-point)))
+          ;; As when a room is opened beside the inbox.
+          (select-window (split-window))
+          (switch-to-buffer (get-buffer-create "*leman-inbox-tests-room*"))
+          (with-current-buffer leman-inbox-buffer-name
+            (leman-inbox--render))
+          (should (leman-inbox--same-item-p
+                   item (with-current-buffer leman-inbox-buffer-name
+                          (leman-inbox--item-at-point (window-point inbox-window)))))
+          (kill-buffer "*leman-inbox-tests-room*"))))))
 
 (ert-deftest leman-inbox-open ()
   (leman-inbox-tests--with-inbox
@@ -955,8 +1038,35 @@ don't forward receipts to bridges."
         ;; "m" on the thread row marks the thread read, not the room.
         (leman-inbox-tests--at-row 1
           (leman-inbox-mark-read))
+        (should-not (leman-threads-unread room session))
+        ;; The read thread's row stays until the inbox is refreshed.
+        (should (string-match-p " Threads\n" (buffer-string)))
+        (leman-inbox-revert)
         (should-not (string-match-p " Threads\n" (buffer-string)))
         (should (string-match-p "unrelated news" (buffer-string)))))))
+
+(ert-deftest leman-inbox-keeps-read-thread-row ()
+  "A thread row opened, which reads the thread, stays listed without a badge."
+  (leman-inbox-tests--with-threads nil
+    (let ((leman-inbox-buffer-name "*leman-inbox-tests*")
+          (leman-inbox-unread-only t))
+      (setf leman-sessions (list (cons "@me:example.org" session)))
+      (leman-inbox :display-buffer-action nil)
+      (with-current-buffer leman-inbox-buffer-name
+        (cl-letf (((symbol-function 'leman-room--view-thread)
+                   (lambda (root-id &rest _)
+                     (leman-threads-mark-read room session root-id))))
+          (leman-inbox-tests--at-row 1
+            (leman-inbox-open)))
+        (should-not (leman-threads-unread room session))
+        (leman-inbox--render)
+        (should (string-match-p " Threads\n" (buffer-string)))
+        (leman-inbox-tests--at-row 1
+          (should (leman-inbox--item-thread (leman-inbox--item-at-point)))
+          (should-not (string-match-p
+                       "[0-9]+ *$"
+                       (buffer-substring-no-properties
+                        (line-beginning-position 2) (line-end-position 2)))))))))
 
 (ert-deftest leman-inbox-thread-only-room-not-unread ()
   "A room whose only new messages are thread replies is not listed as unread."

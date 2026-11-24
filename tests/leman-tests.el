@@ -2710,6 +2710,42 @@ re-rendered."
       (when (timerp leman-room--arrived-avatars-timer)
         (cancel-timer leman-room--arrived-avatars-timer)))))
 
+(ert-deftest leman-membership-notifications-p ()
+  (cl-flet ((session-with (rule)
+              (make-leman-session
+               :account-data
+               `(((type . "m.push_rules")
+                  (content (global (override . [,rule]))))))))
+    (should (leman-membership-notifications-p
+             (session-with '((rule_id . ".m.rule.member_event") (enabled . t)
+                             (actions . ["notify" ((set_tweak . "highlight")
+                                                   (value . :json-false))])))))
+    (should-not (leman-membership-notifications-p
+                 (session-with '((rule_id . ".m.rule.member_event") (enabled . t)
+                                 (actions . [])))))
+    (should-not (leman-membership-notifications-p
+                 (session-with '((rule_id . ".m.rule.member_event") (enabled . :json-false)
+                                 (actions . ["notify"])))))
+    (should-not (leman-membership-notifications-p (make-leman-session)))))
+
+(ert-deftest leman-set-membership-notifications ()
+  ;; Sets the rule's actions, then enables it.
+  (let ((requests nil))
+    (cl-letf (((symbol-function #'leman-api)
+               (lambda (_session endpoint &rest args)
+                 (push (list endpoint (plist-get args :method)
+                             (json-read-from-string (plist-get args :data)))
+                       requests)
+                 (when-let ((then (plist-get args :then)))
+                   (funcall then nil))))
+              ((symbol-function #'message) #'ignore))
+      (leman-set-membership-notifications nil (make-leman-session)))
+    (should (equal (reverse requests)
+                   '(("pushrules/global/override/.m.rule.member_event/actions" put
+                      ((actions . [])))
+                     ("pushrules/global/override/.m.rule.member_event/enabled" put
+                      ((enabled . t))))))))
+
 (provide 'leman-tests)
 
 ;;; leman-tests.el ends here

@@ -770,6 +770,52 @@ default, `all', `mentions-and-keywords', or `none'."
                for (kind . state) in kinds-and-rules
                do (set-rule kind state queue message-fn)))))
 
+(defun leman-membership-notifications-p (session)
+  "Return non-nil if SESSION's user is notified of membership changes.
+That is, if the \".m.rule.member_event\" push rule is enabled and
+notifies, so that people joining, leaving or being invited to a
+room count as unread notifications, as Element's \"People join or
+leave\" setting does."
+  (let* ((push-rules (cl-find-if (lambda (alist)
+                                   (equal "m.push_rules" (alist-get 'type alist)))
+                                 (leman-session-account-data session)))
+         (rule (cl-find ".m.rule.member_event"
+                        (map-nested-elt push-rules '(content global override))
+                        :key (lambda (rule) (alist-get 'rule_id rule))
+                        :test #'equal)))
+    (and rule
+         (eq t (alist-get 'enabled rule))
+         (seq-contains-p (alist-get 'actions rule) "notify"))))
+
+(defun leman-set-membership-notifications (notify-p session)
+  "Set whether SESSION's user is notified of membership changes.
+If NOTIFY-P, people joining, leaving or being invited to a room
+count as unread notifications; otherwise they do not (the default
+of the Matrix spec).  Invitations of the user to rooms are not
+affected.  Interactively, prompt for NOTIFY-P."
+  (interactive
+   (let ((session (leman-complete-session)))
+     (list (y-or-n-p (format "Notify of people joining or leaving rooms (currently %s)? "
+                             (if (leman-membership-notifications-p session) "on" "off")))
+           session)))
+  ;; Like Element, set the rule's actions, then make sure it is enabled
+  ;; so that they apply.
+  (let ((endpoint "pushrules/global/override/.m.rule.member_event")
+        (queue (make-plz-queue :limit 1)))
+    (leman-api session (concat endpoint "/actions") :queue queue :method 'put
+      :version "v3"
+      :data (json-encode (leman-alist 'actions (if notify-p
+                                                   (vector "notify"
+                                                           (leman-alist 'set_tweak "highlight"
+                                                                        'value :json-false))
+                                                 (vector))))
+      :then (lambda (_data)
+              (leman-api session (concat endpoint "/enabled") :queue queue :method 'put
+                :version "v3" :data (json-encode (leman-alist 'enabled t))
+                :then (lambda (_data)
+                        (leman-message "Membership changes %s"
+                                       (if notify-p "now notify" "no longer notify"))))))))
+
 ;;;;; Public functions
 
 ;; These functions could reasonably be called by code in other packages.

@@ -3078,6 +3078,7 @@ To be called after initial sync."
               ("n" "Notifications" leman-notifications)
               ("M" "Mentions" leman-notify-switch-to-mentions-buffer)
               ("B" "Notifications buffer" leman-notify-switch-to-notifications-buffer)
+              ("J" "Joins and leaves notify" leman-set-membership-notifications)
               ("u" "Ignore user" leman-ignore-user)]]
   [:pad-keys t
              ["Misc"

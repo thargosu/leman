@@ -4937,9 +4937,22 @@ first time a speaker is displayed, and shown once they arrive."
 (defvar leman-room--fetching-user-avatars (make-hash-table :test #'equal)
   "Hash table of user IDs whose avatar is being fetched.")
 
-(defun leman-room--user-avatar-size ()
-  "Return the side, in pixels, of user avatars in room buffers."
-  (round (* 2 (window-font-height))))
+(defun leman-room--user-avatar-ems ()
+  "Return the side of user avatars in room buffers, in ems.
+Avatars are two lines high.  They are sized in ems, i.e. in
+multiples of the font size where they are displayed, so that they
+scale with the text, e.g. with `text-scale-adjust'."
+  (let ((info (and (display-graphic-p)
+                   (font-info (face-font 'default)))))
+    (if info
+        ;; Two font heights, in multiples of the font's size.
+        (/ (* 2.0 (aref info 3)) (aref info 2))
+      2.5)))
+
+(defvar-keymap leman-room-user-avatar-map
+  :doc "Keymap for user avatars in room buffers."
+  "<mouse-1>" #'leman-room-user-avatar-show
+  "RET" #'leman-room-user-avatar-show)
 
 (defun leman-room--avatar-content-type (data)
   "Return the media type of avatar image DATA, or nil if unknown."
@@ -4951,12 +4964,14 @@ first time a speaker is displayed, and shown once they arrive."
               (equal (substring data 8 12) "WEBP"))
          "image/webp")))
 
-(defun leman-room--crop-avatar (data content-type size)
+(defun leman-room--crop-avatar (data content-type size &optional ems)
   "Return a circular image spec of avatar image DATA.
 CONTENT-TYPE is the image's media type, and SIZE the side, in
 pixels, of the resulting image (larger avatars are center-cropped
-to fit)."
-  (svg-image
+to fit).  If EMS, the image is displayed EMS ems high instead (see
+`leman-room--user-avatar-ems')."
+  (apply
+   #'svg-image
    (concat
     (format "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"%d\" height=\"%d\" viewBox=\"0 0 %d %d\">"
             size size size size)
@@ -4971,23 +4986,55 @@ to fit)."
    ;; baseline, so the image's ascent must be 0.3 + half its height
    ;; (0.3 + 1.0 of a 2-line image = 65%).  With `center' the
    ;; baseline lands at (font + image) / 2 and the text sags low.
-   :ascent 65))
+   :ascent 65
+   (when ems
+     (list :height (cons ems 'em)))))
 
 (defun leman-room--user-avatar-image (user)
   "Return the circular avatar image of USER, if available.
 The image is cached in `leman-room--user-avatar-images', keyed by
-its visual parameters."
+its visual parameters.  Clicking it shows the avatar at full size
+\(see `leman-room-user-avatar-show')."
   (when-let* ((data (leman-user-avatar user))
               ((not (equal data "")))
               (content-type (leman-room--avatar-content-type data))
-              (size (leman-room--user-avatar-size))
-              (key (list (leman-user-avatar-url user) size)))
+              (ems (leman-room--user-avatar-ems))
+              (key (list (leman-user-id user) (leman-user-avatar-url user) ems)))
     (or (gethash key leman-room--user-avatar-images)
         (puthash key (concat (propertize " "
+                                         ;; Drawn at the thumbnail's size
+                                         ;; (see `leman--avatar-thumbnail'),
+                                         ;; so that it stays sharp when
+                                         ;; scaled up.
                                          'display (leman-room--crop-avatar
-                                                   data content-type size))
+                                                   data content-type
+                                                   (car leman--avatar-thumbnail) ems)
+                                         'leman-user user
+                                         'keymap leman-room-user-avatar-map
+                                         'mouse-face 'highlight
+                                         'help-echo "mouse-1: show avatar at full size")
                              " ")
                  leman-room--user-avatar-images))))
+
+(defun leman-room-user-avatar-show (&optional event)
+  "Show the full-size avatar of the user at point, or at mouse EVENT."
+  (interactive (list (and (mouse-event-p last-command-event) last-command-event)))
+  (let* ((start (and event (event-start event)))
+         (pos (if start (posn-point start) (point)))
+         (buffer (if start (window-buffer (posn-window start)) (current-buffer)))
+         (user (or (get-text-property pos 'leman-user buffer)
+                   (user-error "No avatar at point")))
+         (session (buffer-local-value 'leman-session buffer))
+         (buffer-name (format "*Leman avatar: %s*" (leman-user-id user))))
+    (message "Leman: Downloading avatar...")
+    (leman--media-request (leman-user-avatar-url user) session
+      :queue leman-images-queue
+      :then (lambda (data)
+              (message nil)
+              (leman-room--pop-to-image-buffer
+               buffer-name (create-image data nil 'data-p)))
+      :else (lambda (_plz-error)
+              (message "Leman: Failed to download the avatar")))))
 
 (defun leman-room--fetch-user-avatar (user session)
   "Fetch USER's avatar from its mxc URI on SESSION in the background.
@@ -5077,9 +5124,8 @@ avatar arrives and senders' names stay aligned."
 
 (defun leman-room--user-avatar-placeholder ()
   "Return a blank string occupying an avatar's width in the header."
-  (concat (propertize " " 'display
-                      `(space :width ,(/ (leman-room--user-avatar-size)
-                                         (float (frame-char-width)))))
+  ;; Two font heights, as the avatar (see `leman-room--user-avatar-ems').
+  (concat (propertize " " 'display '(space :width (2.0 . height)))
           " "))
 
 (defun leman-room--avatar-gutter-indent ()
@@ -5095,9 +5141,9 @@ message body aligns with the sender's name in the header above."
              (or (null leman-room--format-spec-active)
                  (not (string-match-p (rx (or "%S" "%s" "%L" "%W"))
                                       leman-room--format-spec-active))))
-    (propertize " " 'display
-                `(space :width ,(+ 1.0 (/ (leman-room--user-avatar-size)
-                                          (float (frame-char-width))))))))
+    ;; In font units, so that it scales with the text, as the avatar
+    ;; (see `leman-room--user-avatar-ems').
+    (propertize " " 'display '(space :width (+ (2.0 . height) width)))))
 
 (defun leman-room--indent (string)
   "Return STRING indented past the sender avatar, when applicable.

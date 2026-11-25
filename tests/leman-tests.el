@@ -2321,12 +2321,17 @@ Restoring it lets E2EE skip its whoami call."
   (let* ((data "\x89PNG\r\n\x1a\npixels")
          (image (cdr (leman-room--crop-avatar data "image/png" 27)))
          (svg (plist-get image :data)))
+    (should-not (plist-get image :height))
     (should (string-prefix-p "<svg" svg))
     (should (string-match-p "clip-path=\"url(#c)\"" svg))
     (should (string-match-p "preserveAspectRatio=\"xMidYMid slice\"" svg))
     (should (string-match-p (regexp-quote
                              (base64-encode-string data :nolinebreak))
-                            svg))))
+                            svg))
+    ;; Sized in ems, it scales with the text.
+    (should (equal (plist-get (cdr (leman-room--crop-avatar data "image/png" 96 2.5))
+                              :height)
+                   '(2.5 . em)))))
 
 (ert-deftest leman-room--user-avatar ()
   "User avatars are fetched once, shown once available, never re-fetched.
@@ -2379,7 +2384,10 @@ duplicate requests (as in `leman-room--fetch-html-image')."
         (should-not (equal avatar ""))
         (should (string-match-p "<svg" (plist-get (cdr (get-text-property
                                                    0 'display avatar))
-                                                  :data))))
+                                                  :data)))
+        ;; Clicking it shows the user's avatar at full size.
+        (should (eq (get-text-property 0 'leman-user avatar) user))
+        (should (eq (get-text-property 0 'keymap avatar) leman-room-user-avatar-map)))
       ;; A failed thumbnail request falls back to the original.
       (funcall (cdar callbacks) 'error)
       (should (= fetches 2))
@@ -2393,6 +2401,36 @@ duplicate requests (as in `leman-room--fetch-html-image')."
         (should (equal avatar "  "))
         (should (eq (car-safe (get-text-property 0 'display avatar)) 'space)))
       (should (= fetches 2)))))
+
+(ert-deftest leman-room-user-avatar-show ()
+  "Clicking an avatar downloads the original and shows it."
+  (let* ((leman-room-user-avatars t)
+         (leman-room--user-avatar-images (make-hash-table :test #'equal))
+         (user (make-leman-user :id "@vv:x.org"
+                                :avatar-url "mxc://x.org/avatar"
+                                :avatar "\x89PNG\r\n\x1a\npixels"))
+         (requested nil)
+         (shown nil))
+    (cl-letf (((symbol-function #'leman--media-request)
+               (lambda (mxc _session &rest args)
+                 ;; The original, not a thumbnail.
+                 (should-not (plist-get args :thumbnail))
+                 (setf requested mxc)
+                 (funcall (plist-get args :then) "full")))
+              ((symbol-function #'create-image)
+               (lambda (data &rest _) (list 'image :data data)))
+              ((symbol-function #'leman-room--pop-to-image-buffer)
+               (lambda (name image) (setf shown (list name image)))))
+      (with-temp-buffer
+        (setq-local leman-session nil)
+        (insert (leman-room--user-avatar-image user))
+        (goto-char (point-min))
+        (leman-room-user-avatar-show)
+        (should (equal requested "mxc://x.org/avatar"))
+        (should (equal shown '("*Leman avatar: @vv:x.org*" (image :data "full"))))
+        ;; Elsewhere, there is no avatar to show.
+        (goto-char (point-max))
+        (should-error (leman-room-user-avatar-show) :type 'user-error)))))
 
 (ert-deftest leman-room--user-avatar-disabled ()
   "When user avatars are disabled, nothing is displayed or fetched."
@@ -2421,22 +2459,20 @@ avatars are disabled."
                                   :origin-server-ts 1694000000000
                                   :content '((msgtype . "m.text")
                                              (body . "hello world")))))
-    (cl-letf (((symbol-function #'display-images-p) (lambda (&optional _) t))
-              ((symbol-function #'window-font-height) (lambda (&optional _ _face) 20))
-              ((symbol-function #'frame-char-width) (lambda (&optional _frame) 10)))
+    (cl-letf (((symbol-function #'display-images-p) (lambda (&optional _) t)))
       (let ((leman-room-sender-headers t)
             (leman-room-sender-in-headers t)
             (leman-room-user-avatars t))
         ;; Header-style layout: both line and wrap prefixes indent by
-        ;; the avatar's width (2 lines of 20px at 10px per column)
-        ;; plus the space following it.
+        ;; the avatar's width (2 font heights) plus the space
+        ;; following it, in font units, to scale with the text.
         (let ((body (leman-room--format-message-body event leman-session)))
           (should (equal body "hello world"))
           (dolist (property '(line-prefix wrap-prefix))
             (let ((prefix (get-text-property 0 property body)))
               (should (equal prefix " "))
               (should (equal (get-text-property 0 'display prefix)
-                             '(space :width 5.0))))))
+                             '(space :width (+ (2.0 . height) width)))))))
         ;; An inline sender disables the indent.
         (let ((leman-room--format-spec-active "%S> %B"))
           (let ((body (leman-room--format-message-body event leman-session)))

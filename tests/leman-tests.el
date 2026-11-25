@@ -680,6 +680,26 @@ text property for toggling."
                                           'leman-reaction-key string)
                        "mxc://example.com/emoji"))))))
 
+(ert-deftest leman-room--insert-thread-event-animates-images ()
+  "Images in thread buffers are animated, as in room buffers."
+  (let ((leman-session (make-leman-session :user (make-leman-user :id "@me:example.com")))
+        (leman-room (make-leman-room :id "!room:example.com"))
+        (animated nil))
+    (cl-letf (((symbol-function 'leman-room--format-message-body)
+               (lambda (&rest _) "body"))
+              ((symbol-function 'leman-room--format-sender-header)
+               (lambda (&rest _) "Alice"))
+              ((symbol-function 'leman-room--format-reactions)
+               (lambda (&rest _) "👍 1\n"))
+              ((symbol-function 'leman-room--animate-images)
+               (lambda (beg end) (push (buffer-substring-no-properties beg end) animated))))
+      (with-temp-buffer
+        (leman-room--insert-thread-event
+         (make-leman-event :id "$e" :type "m.room.message"
+                           :sender (make-leman-user :id "@alice:example.com")))
+        ;; Both the body and the reactions.
+        (should (equal '("\nAlice\nbody\n👍 1\n") animated))))))
+
 (ert-deftest leman-room--format-reactions-custom-emoji-pack-shortcode ()
   "Custom-emoji reactions without an image show the pack's shortcode."
   (let ((leman-session (make-leman-session

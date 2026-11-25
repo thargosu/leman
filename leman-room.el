@@ -5565,6 +5565,7 @@ Its text has EVENT as property `leman-thread-event' (see
 `leman-room--event-at')."
   (let ((body (or (leman-room--format-message-body event leman-session)
                   ""))
+        (beg (point))
         (start (1+ (point))))
     (insert "\n"
             (leman-room--format-sender-header event leman-session)
@@ -5580,7 +5581,9 @@ Its text has EVENT as property `leman-thread-event' (see
     (when-let ((reactions (leman-room--format-reactions event leman-room)))
       (unless (string-empty-p reactions)
         (insert reactions)))
-    (put-text-property start (point) 'leman-thread-event event)))
+    (put-text-property start (point) 'leman-thread-event event)
+    ;; As in room buffers (see `leman-room--pp-thing').
+    (leman-room--animate-images beg (point))))
 
 (defun leman-room--thread-event-bounds (position)
   "Return (START . END) of the event's text at POSITION in a thread buffer."

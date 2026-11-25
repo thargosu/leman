@@ -381,6 +381,12 @@ mxc:// URIs as their keys; the images are downloaded through the
 session's authenticated media endpoint and shown at this size."
   :type 'natnum)
 
+(defcustom leman-room-message-emoji-size 26
+  "Height in pixels of custom-emoji images shown in messages.
+Custom emoji are images sent with a shortcode as their text, e.g.
+\":party:\".  See also `leman-room-reaction-emoji-max-size'."
+  :type 'natnum)
+
 (defcustom leman-room-hide-redacted-message-content t
   "Hide content in redacted messages.
 If nil, redacted messages' content will remain visible with a
@@ -6282,10 +6288,11 @@ no rows fall back to shr's rendering."
   "Return rendered version of HTML STRING from SESSION.
 HTML is rendered to Emacs text using `shr-insert-document'."
   ;; NOTE: libxml's parser drops valueless attributes, so normalize
-  ;; the valueless spoiler form (e.g. as sent by Element's /spoiler
-  ;; command) to the empty-valued form, which is preserved.
+  ;; the valueless spoiler and emoticon forms (e.g. as sent by
+  ;; Element's /spoiler command) to the empty-valued form, which is
+  ;; preserved.
   (setq string (replace-regexp-in-string
-                "data-mx-spoiler\\([ \t\r\n>]\\)" "data-mx-spoiler=\"\"\\1" string))
+                "data-mx-\\(spoiler\\|emoticon\\)\\([ \t\r\n/>]\\)" "data-mx-\\1=\"\"\\2" string))
   (with-current-buffer
       (or (get-buffer " *leman-room--render-html*")
           ;; TODO: Kill this buffer when disconnecting from all sessions.
@@ -6325,6 +6332,11 @@ HTML is rendered to Emacs text using `shr-insert-document'."
                   ((symbol-function 'shr-tag-img)
                    (lambda (dom &optional _url)
                      (let* ((alt (or (dom-attr dom 'alt) ""))
+                            (beg (point))
+                            ;; Custom emoji, per MSC2545, or as the
+                            ;; kChat bridge sends them: alt ":name:".
+                            (emoji-p (or (dom-attr dom 'data-mx-emoticon)
+                                         (string-match-p "\\`:[^: ]+:\\'" alt)))
                             (src (and dom (or (dom-attr dom 'src)
                                               (dom-attr dom 'srcset))))
                             (url (and src (not (string-empty-p src))
@@ -6345,26 +6357,40 @@ HTML is rendered to Emacs text using `shr-insert-document'."
                             (put-image (when image
                                          (funcall shr-put-image-function
                                                   image alt
-                                                  (list :width (shr-string-number (dom-attr dom 'width))
-                                                        :height (shr-string-number (dom-attr dom 'height)))))))
-                       (if (imagep put-image)
-                           (progn
-                             ;; Cap the displayed size: shr's own
-                             ;; rescaling does not run here, because
-                             ;; the render buffer is never displayed.
-                             (setf (image-property put-image :max-width)
-                                   (round (* shr-max-image-proportion (frame-pixel-width)))
-                                   (image-property put-image :max-height)
-                                   (round (* shr-max-image-proportion (frame-pixel-height))))
-                             (when-let ((height (shr-string-number (dom-attr dom 'height))))
-                               (setf (image-property put-image :max-height) height))
-                             (when-let ((width (shr-string-number (dom-attr dom 'width))))
-                               (setf (image-property put-image :max-width) width)))
-                         (when (display-graphic-p)
-                           ;; Non-graphic displays: `shr-put-image'
-                           ;; already inserted the alt text.
-                           (shr-insert (if (string-empty-p (string-trim alt))
-                                           "*" (string-trim alt))))))))
+                                                  (if emoji-p
+                                                      (list :height leman-room-message-emoji-size)
+                                                    (list :width (shr-string-number (dom-attr dom 'width))
+                                                          :height (shr-string-number (dom-attr dom 'height))))))))
+                       (cond ((and (imagep put-image) emoji-p)
+                              ;; Sized after the message's text, not
+                              ;; the sender's height attribute.
+                              (setf (image-property put-image :ascent) 'center
+                                    (image-property put-image :max-height)
+                                    leman-room-message-emoji-size
+                                    (image-property put-image :max-width)
+                                    (* 2 leman-room-message-emoji-size)))
+                             ((imagep put-image)
+                              ;; Cap the displayed size: shr's own
+                              ;; rescaling does not run here, because
+                              ;; the render buffer is never displayed.
+                              (setf (image-property put-image :max-width)
+                                    (round (* shr-max-image-proportion (frame-pixel-width)))
+                                    (image-property put-image :max-height)
+                                    (round (* shr-max-image-proportion (frame-pixel-height))))
+                              (when-let ((height (shr-string-number (dom-attr dom 'height))))
+                                (setf (image-property put-image :max-height) height))
+                              (when-let ((width (shr-string-number (dom-attr dom 'width))))
+                                (setf (image-property put-image :max-width) width)))
+                             ((display-graphic-p)
+                              ;; Non-graphic displays: `shr-put-image'
+                              ;; already inserted the alt text.
+                              (shr-insert (if (string-empty-p (string-trim alt))
+                                              "*" (string-trim alt)))))
+                       ;; E.g. a custom emoji's shortcode.
+                       (when-let ((tooltip (or (dom-attr dom 'title)
+                                               (and emoji-p alt))))
+                         (unless (string-empty-p tooltip)
+                           (put-text-property beg (point) 'help-echo tooltip))))))
                   ((symbol-function 'shr-tag-blockquote)
                    (lambda (dom)
                      (let ((beg (point-marker)))

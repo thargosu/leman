@@ -680,6 +680,46 @@ text property for toggling."
                                           'leman-reaction-key string)
                        "mxc://example.com/emoji"))))))
 
+(ert-deftest leman-room--render-html-custom-emoji ()
+  "Custom emoji in messages are sized as such and show their shortcode."
+  (let* ((session (make-leman-session :user (make-leman-user :id "@me:example.com")))
+         (leman-room-message-emoji-size 26)
+         (flags nil)
+         (render
+          (lambda (html)
+            (cl-letf (((symbol-function 'leman-room--shr-image-data)
+                       (lambda (_url) "mock-image-data"))
+                      ((symbol-function 'leman--mxc-to-authenticated-url)
+                       (lambda (mxc _session) mxc))
+                      ;; Without a graphic display, no image is valid.
+                      ((symbol-function 'imagep)
+                       (lambda (object) (eq 'image (car-safe object))))
+                      (shr-put-image-function
+                       (lambda (_spec alt &optional image-flags)
+                         (push image-flags flags)
+                         (let ((image (create-image (make-bool-vector 1 t) 'xbm t
+                                                    :width 1 :height 1)))
+                           (insert (propertize alt 'display image))
+                           image))))
+              (leman-room--render-html html session)))))
+    ;; As sent by the kChat bridge: no data-mx-emoticon, but an alt
+    ;; shortcode, and a height smaller than wanted.
+    (let* ((string (funcall render "hi <img src=\"mxc://example.com/hammer\" alt=\":hammer:\" title=\":hammer:\" height=\"20\">"))
+           (position (next-single-property-change 0 'display string))
+           (image (get-text-property position 'display string)))
+      (should (equal ":hammer:" (get-text-property position 'help-echo string)))
+      (should (equal '(:height 26) (pop flags)))
+      (should (eq 'center (image-property image :ascent)))
+      (should (= 26 (image-property image :max-height))))
+    ;; Per MSC2545, valueless data-mx-emoticon; no title.
+    (let* ((string (funcall render "<img data-mx-emoticon src=\"mxc://example.com/yeux\" alt=\"yeux\" height=\"32\"/>"))
+           (position (text-property-not-all 0 (length string) 'display nil string)))
+      (should (equal '(:height 26) (pop flags)))
+      (should (equal "yeux" (get-text-property position 'help-echo string))))
+    ;; Other images keep their own size.
+    (funcall render "<img src=\"mxc://example.com/photo\" alt=\"photo\" height=\"200\">")
+    (should (equal '(:width nil :height 200) (pop flags)))))
+
 (ert-deftest leman-room--insert-thread-event-animates-images ()
   "Images in thread buffers are animated, as in room buffers."
   (let ((leman-session (make-leman-session :user (make-leman-user :id "@me:example.com")))

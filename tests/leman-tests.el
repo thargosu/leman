@@ -1698,6 +1698,130 @@ re-created); each re-render must not start another download."
       (should (equal (buffer-string)
                      "HEADER\n$monday\nDAY\nHEADER\n$tuesday\n")))))
 
+(ert-deftest leman-room--day-separators-kept-in-place ()
+  "A rescan leaves dividers in place untouched, unless their label is stale."
+  (let* ((sender (make-leman-user :id "@vv:x.org"))
+         (day (* 24 60 60 1000))
+         (leman-room-day-separators t)
+         (label nil)
+         (printer (lambda (data)
+                    (cond ((leman-room-day-separator-p data)
+                           (insert "DAY " (or label (leman-room--day-separator-label
+                                                     (leman-room-day-separator-ts data)))
+                                   "\n"))
+                          ((leman-event-p data) (insert (leman-event-id data) "\n"))
+                          (t ""))))
+         (event (lambda (id ts)
+                  (make-leman-event :id id :type "m.room.message"
+                                    :sender sender :origin-server-ts ts))))
+    (with-temp-buffer
+      (setf leman-ewoc (ewoc-create printer nil nil 'nosep))
+      (ewoc-enter-last leman-ewoc (funcall event "$monday" (* 3 day)))
+      (ewoc-enter-last leman-ewoc (funcall event "$tuesday" (* 4 day)))
+      (leman-room--insert-day-separators leman-ewoc)
+      (let ((tuesday-label (leman-room--day-separator-label (* 4 day)))
+            ;; Inside the divider's text: deleting and re-inserting the
+            ;; text would move it to the text's start.
+            (marker (copy-marker (+ 2 (let ((case-fold-search nil))
+                                        (string-match "DAY" (buffer-string)))))))
+        ;; An earlier event on another day: a divider is added above,
+        ;; and the existing one is not re-inserted.
+        (ewoc-enter-first leman-ewoc (funcall event "$early" day))
+        (leman-room--insert-day-separators leman-ewoc)
+        (should (equal (buffer-string)
+                       (format "$early\nDAY %s\n$monday\nDAY %s\n$tuesday\n"
+                               (leman-room--day-separator-label (* 3 day))
+                               tuesday-label)))
+        (should (equal "AY" (buffer-substring marker (+ marker 2))))
+        ;; A divider whose label went stale (e.g. "Today" at midnight)
+        ;; is re-printed.
+        (setf label "Stale")
+        (ewoc-refresh leman-ewoc)
+        (setf label nil)
+        (leman-room--insert-day-separators leman-ewoc)
+        (should (string-match-p (concat "DAY " (regexp-quote tuesday-label))
+                                (buffer-string)))
+        (should-not (string-match-p "Stale" (buffer-string)))))))
+
+(ert-deftest leman-room--keeping-window-positions ()
+  "Text inserted above a window's start doesn't move what it shows."
+  (with-temp-buffer
+    (setf leman-ewoc (ewoc-create (lambda (data) (insert data "\n")) "HEADER" nil 'nosep))
+    (dotimes (i 50)
+      (ewoc-enter-last leman-ewoc (format "message %d" i)))
+    (save-window-excursion
+      (delete-other-windows)
+      (switch-to-buffer (current-buffer))
+      ;; Scrolled to the top, as when loading earlier messages.
+      (set-window-start nil (point-min))
+      (goto-char (point-min))
+      (leman-room--keeping-window-positions
+        (dotimes (i 20)
+          (ewoc-enter-first leman-ewoc (format "earlier %d" i))))
+      ;; The window still shows the header's height of earlier text,
+      ;; then the message it showed first.
+      (should (equal "message 0"
+                     (save-excursion
+                       (goto-char (window-start))
+                       (forward-line 1)
+                       (buffer-substring (point) (line-end-position)))))
+      (should (equal "message 0" (buffer-substring (point) (line-end-position)))))))
+
+(ert-deftest leman-room--prefetch ()
+  "Earlier messages load when less than a window of text is above."
+  (let ((room (make-leman-room :id "!room:example.com"))
+        (loaded 0))
+    (cl-letf (((symbol-function 'leman-room-retro)
+               (lambda (&rest _) (cl-incf loaded))))
+      (with-temp-buffer
+        (setq-local leman-room room)
+        (dotimes (i 200)
+          (insert (format "line %d\n" i)))
+        (save-window-excursion
+          (delete-other-windows)
+          (switch-to-buffer (current-buffer))
+          (let ((window (selected-window)))
+            ;; Far from the top: nothing to load.
+            (set-window-start window (save-excursion
+                                       (goto-char (point-min))
+                                       (forward-line 150)
+                                       (point)))
+            (leman-room--prefetch (current-buffer) window)
+            (should (= 0 loaded))
+            ;; Less than a window's height above: load.
+            (set-window-start window (save-excursion
+                                       (goto-char (point-min))
+                                       (forward-line 2)
+                                       (point)))
+            (leman-room--prefetch (current-buffer) window)
+            (should (= 1 loaded))
+            ;; Not while loading.
+            (let ((leman-room-retro-loading t))
+              (leman-room--prefetch (current-buffer) window))
+            (should (= 1 loaded))
+            ;; Nor once the room's history is complete.
+            (setf (map-elt (leman-room-local room) 'history-complete) t)
+            (leman-room--prefetch (current-buffer) window)
+            (should (= 1 loaded))))))))
+
+(ert-deftest leman-room--insert-retro-events-history-complete ()
+  "A batch without an \"end\" token marks the room's history complete."
+  (let ((room (make-leman-room :id "!room:example.com" :prev-batch "t1")))
+    (cl-letf (((symbol-function 'leman-room--process-events) #'ignore)
+              ((symbol-function 'leman-room--insert-day-separators) #'ignore))
+      (with-temp-buffer
+        (setf leman-ewoc (ewoc-create #'ignore nil nil 'nosep))
+        (leman-room--insert-retro-events room (current-buffer) nil t "t2")
+        (should (equal "t2" (leman-room-prev-batch room)))
+        (should-not (map-elt (leman-room-local room) 'history-complete))
+        (leman-room--insert-retro-events room (current-buffer) nil t nil)
+        (should (equal "t2" (leman-room-prev-batch room)))
+        (should (map-elt (leman-room-local room) 'history-complete))
+        ;; Then loading earlier messages does nothing.
+        (cl-letf (((symbol-function 'leman-api)
+                   (lambda (&rest _) (error "Should not be called"))))
+          (leman-room-retro room nil 30 :buffer (current-buffer)))))))
+
 (ert-deftest leman-room--day-separators-self-heal ()
   "Stale dividers are removed by the rescan on the next event.
 A divider inserted before a member event becomes stale when the

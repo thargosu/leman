@@ -101,9 +101,18 @@ property of that frame, not of Emacs as a whole.")
 
 ;; TODO: Convert some of these buffer-local variables into keys in one buffer-local map variable.
 
+(defvar leman-room--defer-day-separators nil
+  "Non-nil while day dividers are to be updated once, afterward.
+Bound when inserting a batch of events, so that
+`leman-room--insert-event' does not rescan the buffer for each.")
+
 (defvar-local leman-room-retro-loading nil
   "Non-nil when earlier messages are being loaded.
 Used to avoid overlapping requests.")
+
+(defvar-local leman-room--prefetch-timer nil
+  "Timer to check whether to load earlier messages, or nil.
+See `leman-room-retro-prefetch'.")
 
 (defvar-local leman-room-editing-event nil
   "When non-nil, the user is editing this event.
@@ -1067,6 +1076,13 @@ otherwise be set manually with `leman-room-left-margin-width' and
 (defcustom leman-room-retro-messages-number 30
   "Number of messages to retrieve when loading earlier messages."
   :type 'integer)
+
+(defcustom leman-room-retro-prefetch t
+  "Load earlier messages before scrolling reaches a room's top.
+When non-nil, earlier messages are loaded whenever less than a
+window's height of text remains above a room window's start, so
+that they are usually there by the time one scrolls up to them."
+  :type 'boolean)
 
 (defcustom leman-room-goto-event-limit 2000
   "Maximum number of earlier messages to load when looking for an event.
@@ -2183,7 +2199,11 @@ see."
                        (list (read-number "Number of messages: "))
                        (number current-prefix-arg))
                      :buffer (current-buffer)))
-  (unless leman-room-retro-loading
+  (cond
+   (leman-room-retro-loading)
+   ((map-elt (leman-room-local room) 'history-complete)
+    (message "Leman: No earlier messages"))
+   (t
     (pcase-let* (((cl-struct leman-room id prev-batch) room)
                  (endpoint (format "rooms/%s/messages" (url-hexify-string id))))
       ;; We use a timeout of 30, because sometimes the server can take a while to
@@ -2203,7 +2223,35 @@ see."
                 (signal 'leman-api-error (list (format "Loading %s earlier messages failed" number)
                                                plz-error))))
       (message "Loading %s earlier messages..." number)
-      (setf leman-room-retro-loading t))))
+      (setf leman-room-retro-loading t)))))
+
+(defun leman-room--prefetch-maybe (window _start)
+  "Load earlier messages soon, if WINDOW's start is near its room's top.
+See `leman-room-retro-prefetch'.  To be called in
+`window-scroll-functions'."
+  (let ((buffer (window-buffer window)))
+    (when (and leman-room-retro-prefetch
+               (not (buffer-local-value 'leman-room--prefetch-timer buffer)))
+      (with-current-buffer buffer
+        ;; Not from redisplay, which runs this function.
+        (setf leman-room--prefetch-timer
+              (run-with-timer 0.05 nil #'leman-room--prefetch buffer window))))))
+
+(defun leman-room--prefetch (buffer window)
+  "Load earlier messages in BUFFER, if WINDOW's start is near its top.
+That is, if less than WINDOW's height of text is above its start."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setf leman-room--prefetch-timer nil)
+      (when (and leman-room
+                 (window-live-p window)
+                 (eq buffer (window-buffer window))
+                 (not leman-room-retro-loading)
+                 (not (map-elt (leman-room-local leman-room) 'history-complete))
+                 (< (count-lines (point-min) (window-start window))
+                    (window-body-height window)))
+        (leman-room-retro leman-room leman-session leman-room-retro-messages-number
+                          :buffer buffer)))))
 
 (cl-defun leman-room-retro-to (room session event-id &key then (batch-size 100) (limit 1000))
   "Retrieve messages in ROOM on SESSION back to EVENT-ID.
@@ -2990,6 +3038,41 @@ already known to SESSION, and return the new events as a list."
            finally do (setf chunk (seq-remove #'null chunk))
            finally return chunk))
 
+(defmacro leman-room--keeping-window-positions (&rest body)
+  "Run BODY, keeping the windows showing the current buffer in place.
+That is, each window keeps showing, at the same height, the text
+it showed at its start, and point, when BODY inserts text before
+them, e.g. earlier events.  (Otherwise, text inserted at a window's
+start shows at the window's top.)"
+  (declare (indent 0) (debug t))
+  (let ((windows (gensym "windows")))
+    `(let ((,windows
+            (cl-loop for window in (get-buffer-window-list nil nil t)
+                     for start = (window-start window)
+                     ;; The first event's text, below the ewoc header.
+                     for anchor = (max start
+                                       (or (when-let ((node (ewoc-nth leman-ewoc 0)))
+                                             (ewoc-location node))
+                                           start))
+                     collect (list window
+                                   (copy-marker anchor t)
+                                   (count-lines start anchor)
+                                   ;; Not above the anchor, where the
+                                   ;; window would scroll back to.
+                                   (copy-marker (max (window-point window) anchor) t)))))
+       (unwind-protect
+           (progn ,@body)
+         (pcase-dolist (`(,window ,anchor ,lines ,point) ,windows)
+           (when (window-live-p window)
+             (set-window-point window point)
+             (set-window-start window (save-excursion
+                                        (goto-char anchor)
+                                        (forward-line (- lines))
+                                        (point))
+                               t))
+           (set-marker anchor nil)
+           (set-marker point nil))))))
+
 (defun leman-room--insert-retro-events (room buffer chunk set-prev-batch end)
   "Insert earlier CHUNK events into ROOM's BUFFER.
 If SET-PREV-BATCH and END, set ROOM's prev-batch slot to END."
@@ -3004,13 +3087,21 @@ If SET-PREV-BATCH and END, set ROOM's prev-batch slot to END."
       (unwind-protect
           (progn
             ;; FIXME: Use retro-loading in event handlers, or in --handle-events, anyway.
-            (leman-room--process-events chunk)
+            (leman-room--keeping-window-positions
+              ;; Update the buffer at once, not event by event.
+              (let ((inhibit-redisplay t)
+                    (leman-room--defer-day-separators t))
+                (leman-room--process-events chunk))
+              (leman-room--insert-day-separators leman-ewoc))
             ;; Don't set the slot if the response doesn't include an "end" token (that
             ;; would cause subsequent retro requests to fetch events from the end of the
             ;; timeline, as if we had just joined).
             (when (and set-prev-batch end)
               ;; This feels a little hacky, but maybe not too bad.
-              (setf (leman-room-prev-batch room) end)))
+              (setf (leman-room-prev-batch room) end))
+            (when (and set-prev-batch (not end))
+              ;; No "end" token: the start of the room's history.
+              (setf (map-elt (leman-room-local room) 'history-complete) t)))
         (setf leman-room-retro-loading nil)))))
 
 (cl-defun leman-room-retro-callback (room session data
@@ -3134,6 +3225,7 @@ and erases the buffer.
                                (list (cons "." browse-url-browser-function))))))))
   (setq-local completion-at-point-functions
               '(leman-room--complete-members-at-point leman-room--complete-rooms-at-point))
+  (add-hook 'window-scroll-functions #'leman-room--prefetch-maybe nil t)
   (setq-local dnd-protocol-alist (append '(("^file:///" . leman-room-dnd-upload-file)
                                            ("^file:" . leman-room-dnd-upload-file))
                                          dnd-protocol-alist)))
@@ -4283,9 +4375,9 @@ Return absorbing node if coalesced."
         (leman-room--insert-sender-headers ewoc new-node new-node))
       ;; NOTE: A full rescan: coalescing may have deleted nodes a
       ;; divider preceded, leaving it stale; rescanning the whole
-      ;; buffer removes such dividers and re-inserts them correctly,
-      ;; whatever the arrival order was.
-      (leman-room--insert-day-separators ewoc)
+      ;; buffer fixes such dividers, whatever the arrival order was.
+      (unless leman-room--defer-day-separators
+        (leman-room--insert-day-separators ewoc))
       ;; Return new node.
       new-node)))
 
@@ -4370,58 +4462,61 @@ DATA may be an event or a membership-events node."
     (1 "Yesterday")
     (_ (format-time-string "%A %d %B" (/ ts 1000)))))
 
-(cl-defun leman-room--insert-day-separators
-    (ewoc &optional (start-node (ewoc-nth ewoc 0)) (end-node (ewoc-nth ewoc -1)))
-  "Insert day divider nodes into EWOC between START-NODE and END-NODE.
-A divider is inserted before the first event of each day.  Any
-existing dividers in the range are removed first, so the pass is
-idempotent."
-  (when (and leman-room-day-separators start-node)
+(defun leman-room--insert-day-separators (ewoc)
+  "Make EWOC's day dividers precede the first event of each day.
+Dividers already in place are kept, their text untouched (so that,
+e.g. a window's start on one stays put); stale ones are removed,
+and missing ones inserted.  The pass is idempotent."
+  (when leman-room-day-separators
     ;; The buffer is read-only, and `ewoc-delete' below removes text
     ;; without inhibiting that itself.
-    (let ((inhibit-read-only t))
-      ;; Remove existing dividers in the range; they are re-inserted
-      ;; where the dates still differ.
-      (let ((node start-node) stale)
-        (while (and node (not (eq node end-node)))
-          (when (leman-room-day-separator-p (ewoc-data node))
-            (push node stale))
-          (setf node (ewoc-next ewoc node)))
-        (dolist (node stale)
-          (ewoc-delete ewoc node)))
-      (when end-node
-        ;; Set end node to the first event after it, so the loop runs
-        ;; through the next event (mirroring
-        ;; `leman-room--insert-sender-headers').
-        (setf end-node (leman-room--ewoc-next-matching ewoc end-node #'leman-event-p)))
-      (let ((node start-node) last-day)
-        ;; The day of the last timestamped node before the range, so a
-        ;; new event inserted into an older or newer day gets its
-        ;; divider.
-        (setf last-day
-              (cl-block nil
-                (cl-loop for node = (ewoc-prev ewoc start-node) then (ewoc-prev ewoc node)
-                         while node
-                         for data = (ewoc-data node)
-                         when (leman-room--timestamped-node-p data)
-                         do (cl-return (leman-room--node-day data)))))
-        (while (and node (not (eq node end-node)))
-          (when (leman-room--timestamped-node-p (ewoc-data node))
-            (let ((day (leman-room--node-day (ewoc-data node))))
-              (when (and last-day (/= day last-day))
-                ;; Insert above the event's sender header (if any), so
-                ;; the divider does not come between a header and its
-                ;; message.
-                (let ((insert-at node))
-                  (cl-loop for prev = (ewoc-prev ewoc insert-at)
-                           while (and prev (or (leman-room-sender-header-p (ewoc-data prev))
-                                               (leman-user-p (ewoc-data prev))))
-                           do (setf insert-at prev))
-                  (ewoc-enter-before ewoc insert-at
-                                     (leman-room--make-day-separator
-                                      (leman-room--node-ts (ewoc-data node))))))
-              (setf last-day day)))
-          (setf node (ewoc-next ewoc node)))))))
+    (let ((inhibit-read-only t)
+          (node (ewoc-nth ewoc 0))
+          last-day separators)
+      (cl-flet ((separator-day (node)
+                  (time-to-days (/ (leman-room-day-separator-ts (ewoc-data node)) 1000))))
+        (while node
+          (let ((data (ewoc-data node))
+                (next (ewoc-next ewoc node)))
+            (cond ((leman-room-day-separator-p data)
+                   (push node separators))
+                  ((leman-room--timestamped-node-p data)
+                   (let ((day (leman-room--node-day data))
+                         (keep nil))
+                     (when (and last-day (/= day last-day))
+                       ;; The divider goes above the event's sender
+                       ;; header (if any), not between the header and
+                       ;; its message.
+                       (let ((insert-at node))
+                         (cl-loop for prev = (ewoc-prev ewoc insert-at)
+                                  while (and prev (or (leman-room-sender-header-p (ewoc-data prev))
+                                                      (leman-user-p (ewoc-data prev))))
+                                  do (setf insert-at prev))
+                         (setf keep (cl-find-if (lambda (separator)
+                                                  (and (eq separator (ewoc-prev ewoc insert-at))
+                                                       (= day (separator-day separator))))
+                                                separators))
+                         (if keep
+                             ;; E.g. "Today" has become "Yesterday".
+                             (unless (save-excursion
+                                       (goto-char (ewoc-location keep))
+                                       (search-forward (leman-room--day-separator-label
+                                                        (leman-room-day-separator-ts
+                                                         (ewoc-data keep)))
+                                                       (line-end-position) t))
+                               (ewoc-invalidate ewoc keep))
+                           (ewoc-enter-before ewoc insert-at
+                                              (leman-room--make-day-separator
+                                               (leman-room--node-ts data))))))
+                     (dolist (separator separators)
+                       (unless (eq separator keep)
+                         (ewoc-delete ewoc separator)))
+                     (setf last-day day
+                           separators nil))))
+            (setf node next)))
+        ;; Dividers after the last event.
+        (dolist (separator separators)
+          (ewoc-delete ewoc separator))))))
 
 (defun leman-room--display-width (string)
   "Return the display width of STRING in columns.

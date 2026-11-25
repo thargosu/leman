@@ -894,6 +894,30 @@ thread views).  Fallback quotes in the bodies are still stripped."
         (should-not (or (eq face 'leman-room-mention)
                         (and (listp face) (memq 'leman-room-mention face))))))))
 
+(ert-deftest leman-room--highlight-mentions ()
+  "Literal mentions of people and groups get the mention face."
+  (cl-flet ((mentions (string)
+              ;; The runs of STRING highlighted as mentions.
+              (let ((body (copy-sequence string)))
+                (leman-room--highlight-mentions body)
+                (split-string
+                 (apply #'string
+                        (cl-loop for i below (length body)
+                                 collect (if (memq 'leman-room-mention
+                                                   (ensure-list
+                                                    (get-text-property i 'face body)))
+                                             (aref body i)
+                                           ?\s)))))))
+    (should (equal (mentions "hi @team-engineering-cloud-platforms, see @vv.")
+                   '("@team-engineering-cloud-platforms" "@vv")))
+    (should (equal (mentions "@room: ping @a and @me:x.org")
+                   '("@room" "@a" "@me:x.org")))
+    ;; E-mail addresses, URL paths and a lone @ are not mentions.
+    (should-not (mentions "mail me@x.org, see https://x.org/@vv, or @ alone"))
+    ;; Nor is code, or link text.
+    (should-not (mentions (propertize "@vv" 'face 'leman-room-code-block)))
+    (should-not (mentions (propertize "@vv" 'shr-url "https://x.org")))))
+
 (ert-deftest leman-room--event-ping-p ()
   "Events ping the user via m.mentions only.
 The user's own messages never ping."

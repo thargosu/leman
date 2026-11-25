@@ -5864,6 +5864,34 @@ users).  Room-ID links are plain links: nil."
         (append '(:inherit leman-room-mention) user-face)
       'leman-room-mention)))
 
+(defconst leman-room--literal-mention-regexp
+  (rx (or bos (not (any alnum "_.@/-")))
+      (group "@" (any alnum "_")
+             (? (* (any alnum "_.:-"))
+                (any alnum "_"))))
+  "Regexp matching literal mentions, e.g. \"@room\" or \"@some-team\".
+Group 1 is the mention.  Not matched: e-mail addresses and URL
+paths (preceded by a word character or slash), and trailing
+punctuation.")
+
+(defun leman-room--highlight-mentions (body)
+  "Apply `leman-room-mention' to literal mentions in BODY.
+That is, to \"@room\", and to people's and groups' handles typed
+as plain text, e.g. \"@team-engineering\" (as bridges and some
+clients send them), rather than as matrix.to links (which shr
+already highlights, see `leman-room--mention-face').  Mentions in
+code and in links are left alone.  BODY is modified."
+  (let ((start 0))
+    (while (string-match leman-room--literal-mention-regexp body start)
+      (let ((beg (match-beginning 1))
+            (end (match-end 1)))
+        (unless (or (get-text-property beg 'shr-url body)
+                    (let ((face (get-text-property beg 'face body)))
+                      (cl-intersection (ensure-list face)
+                                       '(leman-room-code-block leman-room-mention))))
+          (add-face-text-property beg end 'leman-room-mention 'append body))
+        (setf start end)))))
+
 (defun leman-room--shr-face-region (fn dom face)
   "Call shr's original tag handler FN on DOM, applying FACE.
 The face is appended to the text FN inserts, so any faces FN
@@ -6071,12 +6099,7 @@ If FORMATTED-P, return the formatted body content, when available."
       ;; Reply context: our own quote box, above the message.
       (setf body (concat (leman-room--format-reply-quote in-reply-to-id leman-room reply-anchor)
                          "\n" body)))
-    ;; Highlight literal @room mentions.
-    (let ((start 0))
-      (while (string-match "\\(?:\\`\\|[^[:alnum:]_]\\)\\(@room\\)\\>" body start)
-        (add-face-text-property (match-beginning 1) (match-end 1)
-                                'leman-room-mention 'append body)
-        (setf start (match-end 1))))
+    (leman-room--highlight-mentions body)
     ;; Hanging indent.  When the body is displayed beneath a sender
     ;; header with an avatar, both the first line and wrapped lines
     ;; are indented past the avatar, so nothing appears below it.
